@@ -1,0 +1,26 @@
+# Real Kafka broker for `pixi run test-broker`.
+#
+#   pixi run broker-up      # start and wait for healthy
+#   pixi run test-broker
+#   pixi run broker-down    # stop and delete the volume
+#
+# The mock-broker suite (`pixi run test-mock`) needs none of this.
+#
+# KAFKA_VERSION overrides the image tag (default 3.7.0).
+
+services:
+  kafka:
+    image: apache/kafka:${KAFKA_VERSION:-3.7.0}
+    container_name: mojo-kafka-broker
+    ports:
+      # Must stay 9092:9092. The image advertises localhost:9092, and clients
+      # use the advertised address for produce/fetch — a different host port
+      # bootstraps fine and then times out.
+      - "9092:9092"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s

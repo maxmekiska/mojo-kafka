@@ -30,15 +30,17 @@ jobs:
 
       - name: Format check
         run: |
-          pixi run -- mojo format src/ examples/ tests/
+          pixi run lint
           if ! git diff --quiet; then
-            echo "::error::Formatting drift — run 'pixi run -- mojo format src/ examples/ tests/' locally and commit."
+            echo "::error::Formatting drift — run 'pixi run lint' locally and commit."
             git --no-pager diff
             exit 1
           fi
 
-  env-check:
-    name: Env (${{ matrix.os }})
+  test:
+    # The mock broker is in-process, so the full integration suite runs here
+    # too — including on macOS, where GitHub-hosted runners have no Docker.
+    name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -58,7 +60,54 @@ jobs:
       - name: Mojo version
         run: pixi run -- mojo --version
 
-      - name: librdkafka headers present
+      - name: Build package
+        run: pixi run package
+
+      - name: Build examples
         run: |
-          test -f "$(pixi run -- bash -c 'echo $CONDA_PREFIX')/include/librdkafka/rdkafka.h"
-          echo "✓ rdkafka.h resolves inside the pixi env"
+          for f in examples/*.mojo; do
+            echo "building $f"
+            pixi run -- mojo build -I src "$f" -o "$RUNNER_TEMP/$(basename "$f" .mojo)"
+          done
+
+      - name: Smoke tests
+        run: pixi run test
+
+      - name: Integration tests (mock broker)
+        run: pixi run test-mock
+
+  broker:
+    # Covers what the mock cannot: the Topic Admin API, and real metadata
+    # propagation timing. Linux only — macOS runners have no Docker.
+    name: Real broker (Kafka ${{ matrix.kafka }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kafka: ["3.7.0"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pixi
+        run: |
+          curl -fsSL https://pixi.sh/install.sh | bash
+          echo "$HOME/.pixi/bin" >> $GITHUB_PATH
+
+      - name: Resolve env
+        run: pixi install
+
+      - name: Start Kafka
+        run: pixi run broker-up
+        env:
+          KAFKA_VERSION: ${{ matrix.kafka }}
+
+      - name: Broker tests
+        run: pixi run test-broker
+
+      - name: Broker logs on failure
+        if: failure()
+        run: docker logs mojo-kafka-broker
+
+      - name: Stop Kafka
+        if: always()
+        run: pixi run broker-down

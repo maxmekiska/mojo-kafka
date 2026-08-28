@@ -1,123 +1,145 @@
-"""Admin client — create / delete / list topics.
-
-Built on the same conf+rk machinery as Producer; uses librdkafka's
-NewTopic_t and rd_kafka_CreateTopics under the hood.
-"""
-
-from sys.ffi import external_call, OpaquePointer
-from memory import UnsafePointer
-from collections import List
+"""Admin client -- create and list topics."""
 
 from ._ffi import (
+    Lib,
+    META_TOPICS,
+    META_TOPIC_CNT,
+    META_TOPIC_STRIDE,
+    PTR_STRIDE,
     RD_KAFKA_PRODUCER,
-    err,
-    rd_kafka_conf_new,
-    rd_kafka_conf_set,
-    rd_kafka_destroy,
-    rd_kafka_new,
-    rd_kafka_poll,
+    RD_KAFKA_RESP_ERR_NO_ERROR,
+    _load_i32,
+    _load_word,
+    cstr,
 )
 
 
 struct AdminClient:
-    var _rk: OpaquePointer
+    var _lib: Lib
+    var _rk: Int
 
-    fn __init__(out self, bootstrap_servers: String) raises:
-        var conf = rd_kafka_conf_new()
-        rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap_servers)
-        self._rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf)
+    def __init__(out self, bootstrap_servers: String) raises:
+        self._lib = Lib()
+        var conf = self._lib.conf_new()
+        try:
+            self._lib.conf_set(conf, "bootstrap.servers", bootstrap_servers)
+        except e:
+            self._lib.conf_destroy(conf)
+            raise e
+        self._rk = self._lib.new_client(RD_KAFKA_PRODUCER, conf)
 
-    fn __del__(owned self):
-        if self._rk:
-            rd_kafka_destroy(self._rk)
+    def __deinit__(deinit self):
+        # Destructors cannot raise.
+        if self._rk != 0:
+            try:
+                self._lib.destroy(self._rk)
+            except:
+                pass
 
-    fn create_topic(
+    def create_topic(
         self,
         name: String,
         num_partitions: Int32 = 1,
         replication_factor: Int32 = 1,
         timeout_ms: Int32 = 10000,
     ) raises:
-        var errbuf = UnsafePointer[Int8].alloc(512)
-        var new_topic = external_call[
-            "rd_kafka_NewTopic_new",
-            OpaquePointer,
-            UnsafePointer[Int8],
-            Int32,
-            Int32,
-            UnsafePointer[Int8],
-            Int,
-        ](
-            name.unsafe_cstr_ptr(),
-            num_partitions,
-            replication_factor,
-            errbuf,
-            512,
+        """Create a topic and wait for the broker's verdict.
+
+        `rd_kafka_CreateTopics` is asynchronous and delivers its result to a
+        queue, which is not optional -- passing NULL for it faults inside
+        librdkafka. We make a queue, wait on it, and surface whatever the
+        broker said rather than assuming success.
+
+        The verdict has **two** levels, and checking only the outer one is a
+        silent lie: `rd_kafka_event_error` reports whether the *request*
+        failed, while a topic the broker refused -- already exists, invalid
+        replication factor -- comes back with `RD_KAFKA_RESP_ERR_NO_ERROR` at
+        the request level and the real error attached per topic inside the
+        result.
+        """
+        var new_topic = self._lib.new_topic_new(
+            name, num_partitions, replication_factor
         )
-        if not new_topic:
-            var msg = String(errbuf)
-            errbuf.free()
-            raise Error("rd_kafka_NewTopic_new: " + msg)
-        errbuf.free()
+        var topics = Array[Int, 1](fill=new_topic)
+        var queue = self._lib.queue_new(self._rk)
 
-        # rd_kafka_CreateTopics(rk, &new_topic, 1, options=NULL, queue=NULL)
-        var arr = UnsafePointer[OpaquePointer].alloc(1)
-        arr[0] = new_topic
-        external_call[
-            "rd_kafka_CreateTopics",
-            NoneType,
-            OpaquePointer,
-            UnsafePointer[OpaquePointer],
-            Int,
-            OpaquePointer,
-            OpaquePointer,
-        ](self._rk, arr, 1, OpaquePointer(), OpaquePointer())
+        self._lib.create_topics(self._rk, Int(topics.unsafe_ptr()), 1, queue)
+        _ = topics^
 
-        _ = rd_kafka_poll(self._rk, timeout_ms)
+        var event = self._lib.queue_poll(queue, timeout_ms)
+        var failure: String
+        if event == 0:
+            failure = "CreateTopics(" + name + "): timed out"
+        else:
+            try:
+                failure = self._verdict(event, name)
+            except e:
+                self._lib.event_destroy(event)
+                self._lib.queue_destroy(queue)
+                self._lib.new_topic_destroy(new_topic)
+                raise e
+            self._lib.event_destroy(event)
 
-        external_call["rd_kafka_NewTopic_destroy", NoneType, OpaquePointer](
-            new_topic
+        self._lib.queue_destroy(queue)
+        self._lib.new_topic_destroy(new_topic)
+        if failure != "":
+            raise Error(failure)
+
+    def _verdict(self, event: Int, name: String) raises -> String:
+        """Empty if the broker created the topic, otherwise why it did not."""
+        var code = self._lib.event_error(event)
+        if code != RD_KAFKA_RESP_ERR_NO_ERROR:
+            return (
+                "CreateTopics("
+                + name
+                + "): "
+                + self._lib.event_error_string(event)
+            )
+
+        var result = self._lib.event_create_topics_result(event)
+        if result == 0:
+            return "CreateTopics(" + name + "): reply was not a topic result"
+
+        var cnt_out = Array[Int, 1](fill=0)
+        var arr = self._lib.create_topics_result_topics(
+            result, Int(cnt_out.unsafe_ptr())
         )
-        arr.free()
+        var cnt = cnt_out[0]
+        if arr == 0 or cnt == 0:
+            return "CreateTopics(" + name + "): broker returned no verdict"
 
-    fn list_topics(self, timeout_ms: Int32 = 5000) raises -> List[String]:
-        """Return topic names visible to this client."""
-        var meta_out = UnsafePointer[OpaquePointer].alloc(1)
-        var rc = external_call[
-            "rd_kafka_metadata",
-            Int32,
-            OpaquePointer,
-            Int32,
-            OpaquePointer,
-            UnsafePointer[OpaquePointer],
-            Int32,
-        ](self._rk, Int32(1), OpaquePointer(), meta_out, timeout_ms)
-        if rc != 0:
-            meta_out.free()
-            raise Error(String(err(rc)))
+        for i in range(cnt):
+            var tr = _load_word(arr + i * PTR_STRIDE)
+            if tr == 0:
+                continue
+            if self._lib.topic_result_error(tr) != RD_KAFKA_RESP_ERR_NO_ERROR:
+                return (
+                    "CreateTopics("
+                    + self._lib.topic_result_name(tr)
+                    + "): "
+                    + self._lib.topic_result_error_string(tr)
+                )
+        return String("")
+
+    def list_topics(self, timeout_ms: Int32 = 5000) raises -> List[String]:
+        """Return the topic names this client can see."""
+        var meta_out = Array[Int, 1](fill=0)
+        var rc = self._lib.metadata(
+            self._rk, 1, Int(meta_out.unsafe_ptr()), timeout_ms
+        )
+        self._lib.raise_if(rc, "metadata")
 
         var meta = meta_out[0]
-        # struct rd_kafka_metadata { int broker_cnt; void*; int topic_cnt; rd_kafka_metadata_topic_t *topics; ... }
-        var base = meta.bitcast[UInt8]()
-        var topic_cnt = base.offset(16).bitcast[Int32]().load()
-        var topics_ptr = base.offset(24).bitcast[UnsafePointer[UInt8]]().load()
+        var topic_cnt = _load_i32(meta + META_TOPIC_CNT)
+        var topics = _load_word(meta + META_TOPICS)
 
         var out = List[String]()
-        # sizeof(rd_kafka_metadata_topic_t) layout begins with `char *topic; int partition_cnt; ...`
-        # On 64-bit, char* is 8 bytes, then 4 bytes partition_cnt, padding... the next struct
-        # alignment in librdkafka is 24 bytes per topic entry on 64-bit systems.
-        var stride = 24
         for i in range(Int(topic_cnt)):
-            var name_ptr = (
-                topics_ptr.offset(i * stride)
-                .bitcast[UnsafePointer[Int8]]()
-                .load()
-            )
-            if name_ptr:
-                out.append(String(name_ptr))
+            # Each rd_kafka_metadata_topic_t is 32 bytes and starts with
+            # `char *topic`.
+            var name_ptr = _load_word(topics + i * META_TOPIC_STRIDE)
+            if name_ptr != 0:
+                out.append(cstr(name_ptr))
 
-        external_call["rd_kafka_metadata_destroy", NoneType, OpaquePointer](
-            meta
-        )
-        meta_out.free()
-        return out
+        self._lib.metadata_destroy(meta)
+        return out^

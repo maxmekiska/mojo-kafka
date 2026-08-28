@@ -23,10 +23,10 @@ jobs:
       - name: Resolve env
         run: pixi install
 
-      - name: Build .mojopkg
+      - name: Build .mojoc
         run: |
           mkdir -p dist
-          pixi run -- mojo package src/kafka -o dist/kafka-${{ github.ref_name }}.mojopkg
+          pixi run -- mojo precompile src/kafka -o dist/kafka-${{ github.ref_name }}.mojoc
 
       - name: Generate release notes
         id: notes
@@ -45,6 +45,6 @@ jobs:
           name: ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.BODY }}
           files: |
-            dist/*.mojopkg
+            dist/*.mojoc
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

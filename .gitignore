@@ -3,7 +3,9 @@
 .mojocache/
 .DS_Store
 build/
+dist/
 *.mojopkg
+*.mojoc
 *.so
 *.dylib
 *.dll

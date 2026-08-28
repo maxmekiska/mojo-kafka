@@ -6,13 +6,13 @@ Run a local Kafka first:
 
 Then:
 
-    mojo run examples/producer_basic.mojo
+    pixi run example-producer
 """
 
 from kafka import Producer, ProducerConfig
 
 
-fn main() raises:
+def main() raises:
     var cfg = ProducerConfig(
         bootstrap_servers="localhost:9092",
         client_id="mojo-kafka-example",

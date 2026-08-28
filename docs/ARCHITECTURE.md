@@ -12,8 +12,7 @@ This is the longer write-up on how `mojo-kafka` is layered. Read [`README.md`](.
 │  Pythonic Mojo API                                     │
 │     src/kafka/__init__.mojo                            │
 │     src/kafka/{producer,consumer,admin,config}.mojo    │
-│     src/kafka/error.mojo                               │
-├────────────────────────────────────────────────────────┤  ← `external_call`
+├────────────────────────────────────────────────────────┤  ← `OwnedDLHandle`
 │  raw FFI surface                                       │
 │     src/kafka/_ffi.mojo                                │
 ├────────────────────────────────────────────────────────┤  ← C ABI
@@ -21,7 +20,7 @@ This is the longer write-up on how `mojo-kafka` is layered. Read [`README.md`](.
 └────────────────────────────────────────────────────────┘
 ```
 
-Each arrow is a contract. The Mojo layer hides everything underneath — users see typed `struct`s and Mojo exceptions, not `OpaquePointer`s or `rd_kafka_resp_err_t` ints.
+Each arrow is a contract. The Mojo layer hides everything underneath — users see typed `struct`s and Mojo exceptions, not raw addresses or `rd_kafka_resp_err_t` ints.
 
 ## Why `librdkafka`
 
@@ -42,44 +41,73 @@ Mojo's superpower is being Python-like. Two consequences:
 
 We diverge from `confluent-kafka-python` only where:
 - Mojo's lack of `**kwargs` would make a Python-style call awkward (we use explicit fields on `ProducerConfig` / `ConsumerConfig`).
-- Mojo's resource management (`__del__`) lets us drop the explicit `del consumer` dance.
+- Mojo's resource management (`__deinit__`) lets us drop the explicit `del consumer` dance.
 
 ## FFI design: `_ffi.mojo`
 
-This file declares every `librdkafka` symbol we call. Each declaration looks like:
+This file declares every `librdkafka` symbol we call, and it is the only
+file that touches C.
 
-```mojo
-alias rd_kafka_new_t = fn (
-    type: Int32,
-    conf: OpaquePointer,
-    errstr: UnsafePointer[UInt8],
-    errstr_size: Int,
-) -> OpaquePointer
+### Loading, not linking
 
-@always_inline
-fn rd_kafka_new(
-    type: Int32,
-    conf: OpaquePointer,
-    errstr: UnsafePointer[UInt8],
-    errstr_size: Int,
-) -> OpaquePointer:
-    return external_call["rd_kafka_new", OpaquePointer](type, conf, errstr, errstr_size)
+We load `librdkafka` with `OwnedDLHandle` rather than calling it through bare
+`external_call`. That is not a style preference. `external_call` resolves its
+symbols when the JIT materialises the program, which happens before anything
+has had a chance to load the library, so under `mojo run` every call fails
+with:
+
+```
+JIT session error: Symbols not found: [ rd_kafka_version ]
 ```
 
-Two rules we follow rigidly:
+`LD_PRELOAD` does not help — the JIT does not consult preloaded objects. An
+AOT build with `mojo build -Xlinker -lrdkafka` does work, but that pushes
+link configuration onto every downstream user and gives up the REPL and
+`mojo run` entirely. `OwnedDLHandle` works under both.
 
-1. **One `external_call` per symbol.** No higher-level conveniences here. The point of this layer is auditability — anyone tracing `librdkafka` documentation should be able to find the corresponding declaration verbatim.
-2. **Mojo types only.** No `__init__`, no methods. Lifetime is the caller's problem at this layer. The `Producer` / `Consumer` structs above own the lifetimes.
+The library is found by soname (`librdkafka.so.1`, `librdkafka.so`, and the
+macOS equivalents), and `MOJO_KAFKA_LIBRDKAFKA` overrides the search with an
+explicit path.
+
+### Three conventions
+
+1. **C pointers cross the boundary as `Int` addresses, never as `Pointer`.**
+   Mojo 1.0's `Pointer` is non-nullable by design, but nearly every
+   `librdkafka` handle-returning call uses NULL to signal failure. The null
+   check has to happen while the value is still an integer.
+
+2. **Foreign memory is read through `ImmutAnyOrigin`.** `ImmStaticOrigin`
+   looks right and faults at runtime: it lets the optimiser assume the data
+   lives in this module's own static storage, and loads from another shared
+   object's rodata then miscompile.
+
+3. **No variadic C calls.** Calling a C variadic through a fixed prototype is
+   undefined on both SysV and AAPCS — the `%al` vector-register count is
+   never set. `rd_kafka_producev` is variadic, so we bind the older
+   non-variadic `rd_kafka_produce` instead and manage `rd_kafka_topic_t`
+   handles ourselves (they are cached per topic name on the `Producer`).
 
 ## Lifetime story
 
 Every `librdkafka` resource has a paired `_new` / `_destroy` (or `_free`). The Mojo wrappers tie that to Mojo's RAII:
 
-- `Producer.__init__` calls `rd_kafka_new(RD_KAFKA_PRODUCER, …)` and stores the resulting `rd_kafka_t*` as `OpaquePointer`.
-- `Producer.__del__` calls `rd_kafka_flush(timeout=10s)` then `rd_kafka_destroy`.
+- `Producer.__init__` calls `rd_kafka_new(RD_KAFKA_PRODUCER, …)` and stores the resulting `rd_kafka_t*` as an `Int` address.
+- `Producer.__deinit__` drains outstanding delivery reports, destroys its
+  cached topic handles and its main-queue reference, then calls
+  `rd_kafka_destroy`.
 - Same pattern for `Consumer` (with an explicit `close()` for graceful rebalance), and for `AdminClient`.
 
-`ProducerConfig._build()` returns the `rd_kafka_conf_t*` and **transfers ownership** to `rd_kafka_new` — which is what `librdkafka` expects. If `rd_kafka_new` fails, we still need to `rd_kafka_conf_destroy`; the wrapper does that in the error path.
+`ProducerConfig._build()` returns the `rd_kafka_conf_t*` and **transfers
+ownership** to `rd_kafka_new` — but only on success. `librdkafka` does not
+adopt the conf when it fails, so `Lib.new_client` destroys it on the error
+path, and `_build` destroys it if any `conf_set` is rejected part-way
+through.
+
+The library handle itself is the outermost lifetime: each client owns an
+`OwnedDLHandle`, and because `dlopen` refcounts, `librdkafka` stays mapped
+as long as any client is alive. Destructors call `rd_kafka_destroy` in the
+body, which runs before fields are released, so the library is never
+unloaded out from under a live broker thread.
 
 ## Error mapping
 
@@ -106,18 +134,60 @@ The roadmap is to expose a typed `KafkaErrorKind` enum so users can `match` on s
 | `key_len` |    48 | size_t (Int)     |
 | `offset` |     56 | int64            |
 
-This is fragile — if `librdkafka` ever re-orders the public struct (it won't; it's ABI-stable), every consumer breaks. We pin `librdkafka >= 2.3.0` to lock the layout we tested against.
+These are verified against the installed headers with `offsetof`, and the
+integration suite round-trips real messages, so a layout change shows up as a
+test failure rather than as garbage in someone's pipeline.
+
+The same technique applies to metadata, where the stride matters as much as
+the offsets: `sizeof(rd_kafka_metadata_topic_t)` is **32** bytes on 64-bit
+(`char *topic; int partition_cnt; <pad>; partitions*; err; <pad>`). A 24-byte
+stride reads a plausible-looking name for the first topic and then walks into
+unmapped memory. `integration/test_mock.mojo` creates enough topics to catch
+that.
 
 ## What we do *not* do
 
 - We don't ship `librdkafka` itself. We dynamic-link against whatever the user provides (system package, conda-forge, or vendored).
 - We don't implement transactions / exactly-once / Schema Registry yet — those are explicit v0.2 / v0.3 work in [Roadmap](../README.md#roadmap).
-- We don't expose `librdkafka`'s callback-driven API. The Mojo idiom is a polling loop; we lean into that.
+- We don't expose `librdkafka`'s callback-driven API. The Mojo idiom is a
+  polling loop, and Mojo cannot hand C a function pointer anyway. Delivery
+  reports therefore use **event sourcing** rather than a `dr_msg_cb`:
+  `rd_kafka_conf_set_events(conf, RD_KAFKA_EVENT_DR)` routes each report to
+  the client's main queue, and `Producer.poll()` / `flush()` drain it with
+  `rd_kafka_queue_poll` and tally rejections.
+
+  This is also why `Producer` does not call `rd_kafka_flush`. With
+  `RD_KAFKA_EVENT_DR` enabled that function expects a second thread to be
+  serving the queue, and `rd_kafka_outq_len` counts undrained events as
+  outstanding — so it would block until its timeout. `flush()` runs the
+  drain loop itself and then raises if any report carried an error.
 
 ## Testing strategy
 
-- **Smoke tests** (`tests/test_smoke.mojo`) — instantiate every type with sane configs and tear them down. No broker required; catches FFI breakage and obvious memory issues.
-- **Integration tests** — run smoke + a few real produce/consume round-trips against a real `apache/kafka:3.7.0` broker spun up as a CI service container.
-- **Lint** — `mojo format --check` over `src/`, `examples/`, `tests/`.
+- **Smoke tests** (`tests/test_smoke.mojo`) — load `librdkafka`, call into it,
+  and build every config type. No broker required. `pixi run test`.
+- **Integration tests on the mock broker** (`integration/test_mock.mojo`) —
+  `librdkafka` ships an in-process broker that speaks the real wire protocol
+  over a real socket, so clients under test are ordinary clients. No Docker,
+  which means this suite also runs on macOS CI. `pixi run test-mock`.
+- **Integration tests on a real broker** (`integration/test_broker.mojo`) —
+  `pixi run broker-up && pixi run test-broker`. Not redundant with the mock:
+  the mock does **not** implement the Topic Admin API, so
+  `AdminClient.create_topic()` is only reachable here, and real metadata
+  propagation timing only shows up against a real cluster.
+- **Lint** — `mojo format` over `src/`, `examples/`, `tests/`, with CI failing
+  on drift.
 
-All three gate every PR. See `.github/workflows/ci.yml`.
+Two of the mock tests exist specifically as regression guards:
+
+- `test_round_trip_preserves_key_and_value` asserts on **both** halves of every
+  message. A test that only checks the payload passes even when the
+  `rd_kafka_vtype_t` constants are transposed, which is exactly the bug that
+  shipped in `v0.1.0`.
+- `test_list_topics_walks_every_entry` creates enough topics that a wrong
+  metadata stride crashes instead of quietly returning junk.
+
+All three jobs gate every PR. See `.github/workflows/ci.yml`.
+
+`kafka.testing.MockCluster` is public API, not test-only scaffolding — users
+testing their own Kafka code get the same Docker-free broker.

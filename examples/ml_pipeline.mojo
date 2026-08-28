@@ -1,40 +1,44 @@
 """Hero example: a streaming ML feature pipeline.
 
-Consumes JSON events off Kafka, parses out a numeric feature vector, runs a
-toy "inference" step over them, and prints the prediction. Replace the
-`run_inference` body with a real MAX/Mojo model — the streaming layer
-above it doesn't change.
+Consumes events off Kafka, pulls a numeric feature out of each one, runs
+a toy "inference" step, and prints the prediction. Replace the body of
+`run_inference` with a real MAX/Mojo model -- the streaming layer above
+it does not change.
 
-This is the whole reason `mojo-kafka` exists: keep the data-path in Mojo
-end-to-end so you don't pay a Python hop per message.
+This is the whole reason `mojo-kafka` exists: keep the data path in Mojo
+end to end so you do not pay a Python hop per message.
 """
+
+from std.math import exp
 
 from kafka import Consumer, ConsumerConfig
 
 
-fn parse_feature(value: String) -> Float64:
-    """Toy parser — pulls the first numeric token out of `value`."""
+def parse_feature(value: String) -> Float64:
+    """Pull the first numeric token out of `value`."""
     var acc = String("")
     var seen_digit = False
-    for ch in value:
-        if ch[].isdigit() or ch[] == "." or (not seen_digit and ch[] == "-"):
-            acc += ch[]
+    for ch in value.codepoints():
+        var c = String(ch)
+        if ch.is_ascii_digit() or c == "." or (not seen_digit and c == "-"):
+            acc += c
             seen_digit = True
         elif seen_digit:
             break
-    if len(acc) == 0:
+    if acc.byte_length() == 0:
         return 0.0
-    return Float64(atof(acc))
+    try:
+        return Float64(acc)
+    except:
+        return 0.0
 
 
-fn run_inference(feature: Float64) -> Float64:
-    """Stand-in for a real model. Logistic-ish over a single input."""
-    var x = feature
-    var s = 1.0 / (1.0 + (-x).exp())
-    return s
+def run_inference(feature: Float64) -> Float64:
+    """Stand-in for a real model. Logistic over a single input."""
+    return 1.0 / (1.0 + exp(-feature))
 
 
-fn main() raises:
+def main() raises:
     var c = Consumer(
         ConsumerConfig(
             bootstrap_servers="localhost:9092",
@@ -44,7 +48,7 @@ fn main() raises:
     )
     c.subscribe(["features"])
 
-    print("Listening on 'features' — Ctrl-C to stop.")
+    print("Listening on 'features' -- Ctrl-C to stop.")
     while True:
         var maybe = c.poll(timeout_ms=1000)
         if not maybe:

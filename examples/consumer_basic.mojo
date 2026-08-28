@@ -1,12 +1,13 @@
 """Minimal consumer example.
 
-Pair this with `examples/producer_basic.mojo` to see messages flow end-to-end.
+Pair this with `examples/producer_basic.mojo` to see messages flow
+end-to-end.
 """
 
 from kafka import Consumer, ConsumerConfig
 
 
-fn main() raises:
+def main() raises:
     var cfg = ConsumerConfig(
         bootstrap_servers="localhost:9092",
         group_id="mojo-kafka-example",
@@ -21,7 +22,9 @@ fn main() raises:
         if maybe:
             var m = maybe.value()
             print(
-                "partition=",
+                "topic=",
+                m.topic,
+                " partition=",
                 m.partition,
                 " offset=",
                 m.offset,

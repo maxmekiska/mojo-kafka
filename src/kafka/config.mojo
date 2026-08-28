@@ -1,24 +1,19 @@
 """Typed configuration objects.
 
-These are thin builders that emit a `rd_kafka_conf_t*` on demand. The
-type-level field names match librdkafka's documented keys exactly, with
-underscores instead of dots (`bootstrap_servers` -> `bootstrap.servers`)
-to stay Mojo-idiomatic.
+Thin builders that emit a `rd_kafka_conf_t*` on demand. The named fields are
+Mojo-idiomatic -- `bootstrap_servers` for `bootstrap.servers` -- and map onto
+librdkafka's documented keys explicitly, one at a time, in `_build`.
+
+Keys given to `set()` are passed to librdkafka **verbatim**. An earlier
+version rewrote `_` to `.` there, which put librdkafka's real `log_level`
+property permanently out of reach as an invalid `log.level`.
 """
 
-from sys.ffi import OpaquePointer
-from collections import Dict
-from ._ffi import rd_kafka_conf_new, rd_kafka_conf_set
+from ._ffi import Lib
 
 
-fn _key_to_librdkafka(name: String) -> String:
-    """Map `bootstrap_servers` -> `bootstrap.servers`. librdkafka keys use dots.
-    """
-    return name.replace("_", ".")
-
-
-@value
-struct ProducerConfig:
+@fieldwise_init
+struct ProducerConfig(Copyable, Movable):
     var bootstrap_servers: String
     var client_id: String
     var compression_type: String
@@ -26,7 +21,7 @@ struct ProducerConfig:
     var acks: String
     var extra: Dict[String, String]
 
-    fn __init__(
+    def __init__(
         out self,
         bootstrap_servers: String,
         client_id: String = "mojo-kafka",
@@ -41,26 +36,34 @@ struct ProducerConfig:
         self.acks = acks
         self.extra = Dict[String, String]()
 
-    fn set(mut self, key: String, value: String):
-        """Escape hatch for any librdkafka key we don't expose as a field."""
+    def set(mut self, key: String, value: String):
+        """Escape hatch for any librdkafka key not exposed as a field.
+
+        `key` is the librdkafka property name exactly as documented --
+        `"message.max.bytes"`, `"log_level"` -- and is passed through
+        unchanged.
+        """
         self.extra[key] = value
 
-    fn _build(self) raises -> OpaquePointer:
-        var conf = rd_kafka_conf_new()
-        rd_kafka_conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
-        rd_kafka_conf_set(conf, "client.id", self.client_id)
-        rd_kafka_conf_set(conf, "compression.type", self.compression_type)
-        rd_kafka_conf_set(conf, "linger.ms", String(self.linger_ms))
-        rd_kafka_conf_set(conf, "acks", self.acks)
-        for item in self.extra.items():
-            rd_kafka_conf_set(
-                conf, _key_to_librdkafka(item[].key), item[].value
-            )
+    def _build(self, lib: Lib) raises -> Int:
+        var conf = lib.conf_new()
+        try:
+            lib.conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
+            lib.conf_set(conf, "client.id", self.client_id)
+            lib.conf_set(conf, "compression.type", self.compression_type)
+            lib.conf_set(conf, "linger.ms", String(self.linger_ms))
+            lib.conf_set(conf, "acks", self.acks)
+            for entry in self.extra.items():
+                lib.conf_set(conf, entry.key, entry.value)
+        except e:
+            # We still own the conf until rd_kafka_new adopts it.
+            lib.conf_destroy(conf)
+            raise e
         return conf
 
 
-@value
-struct ConsumerConfig:
+@fieldwise_init
+struct ConsumerConfig(Copyable, Movable):
     var bootstrap_servers: String
     var group_id: String
     var client_id: String
@@ -68,7 +71,7 @@ struct ConsumerConfig:
     var enable_auto_commit: Bool
     var extra: Dict[String, String]
 
-    fn __init__(
+    def __init__(
         out self,
         bootstrap_servers: String,
         group_id: String,
@@ -83,22 +86,25 @@ struct ConsumerConfig:
         self.enable_auto_commit = enable_auto_commit
         self.extra = Dict[String, String]()
 
-    fn set(mut self, key: String, value: String):
+    def set(mut self, key: String, value: String):
+        """Escape hatch for any librdkafka key, passed through verbatim."""
         self.extra[key] = value
 
-    fn _build(self) raises -> OpaquePointer:
-        var conf = rd_kafka_conf_new()
-        rd_kafka_conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
-        rd_kafka_conf_set(conf, "group.id", self.group_id)
-        rd_kafka_conf_set(conf, "client.id", self.client_id)
-        rd_kafka_conf_set(conf, "auto.offset.reset", self.auto_offset_reset)
-        rd_kafka_conf_set(
-            conf,
-            "enable.auto.commit",
-            "true" if self.enable_auto_commit else "false",
-        )
-        for item in self.extra.items():
-            rd_kafka_conf_set(
-                conf, _key_to_librdkafka(item[].key), item[].value
+    def _build(self, lib: Lib) raises -> Int:
+        var conf = lib.conf_new()
+        try:
+            lib.conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
+            lib.conf_set(conf, "group.id", self.group_id)
+            lib.conf_set(conf, "client.id", self.client_id)
+            lib.conf_set(conf, "auto.offset.reset", self.auto_offset_reset)
+            lib.conf_set(
+                conf,
+                "enable.auto.commit",
+                "true" if self.enable_auto_commit else "false",
             )
+            for entry in self.extra.items():
+                lib.conf_set(conf, entry.key, entry.value)
+        except e:
+            lib.conf_destroy(conf)
+            raise e
         return conf
