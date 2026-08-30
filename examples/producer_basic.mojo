@@ -23,7 +23,7 @@ def main() raises:
     for i in range(10):
         var key = "user-" + String(i)
         var value = '{"event":"login","seq":' + String(i) + "}"
-        p.produce(topic="events", value=value, key=key)
+        _ = p.produce(topic="events", value=value, key=key)
         _ = p.poll(0)
 
     p.flush(5000)

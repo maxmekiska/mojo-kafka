@@ -17,7 +17,7 @@ This suite exists for what the mock cannot do:
 """
 
 from std.os import getenv
-from std.testing import assert_equal, assert_true
+from std.testing import TestSuite, assert_equal, assert_true
 from std.time import perf_counter_ns, sleep
 
 from kafka import (
@@ -113,7 +113,7 @@ def test_round_trip_preserves_key_and_value() raises:
         ProducerConfig(bootstrap_servers=bootstrap(), linger_ms=5)
     )
     for i in range(5):
-        producer.produce(
+        _ = producer.produce(
             topic=topic,
             key="key-" + String(i),
             value="value-" + String(i),
@@ -136,10 +136,10 @@ def test_round_trip_preserves_key_and_value() raises:
         var maybe = consumer.poll(timeout_ms=1000)
         if not maybe:
             continue
-        var m = maybe.value()
+        ref m = maybe.value()
         assert_equal(m.topic, topic)
-        assert_equal(m.key, "key-" + String(seen))
-        assert_equal(m.value, "value-" + String(seen))
+        assert_equal(m.key_text(), "key-" + String(seen))
+        assert_equal(m.value_text(), "value-" + String(seen))
         assert_equal(m.offset, Int64(seen))
         seen += 1
 
@@ -188,12 +188,4 @@ def test_create_topic_reports_rejection() raises:
 
 def main() raises:
     print("broker:", bootstrap())
-    print("test_admin_create_and_list")
-    test_admin_create_and_list()
-    print("test_list_topics_walks_every_entry")
-    test_list_topics_walks_every_entry()
-    print("test_round_trip_preserves_key_and_value")
-    test_round_trip_preserves_key_and_value()
-    print("test_create_topic_reports_rejection")
-    test_create_topic_reports_rejection()
-    print("integration tests passed")
+    TestSuite.discover_tests[__functions_in_module()]().run()

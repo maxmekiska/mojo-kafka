@@ -57,29 +57,37 @@ struct AdminClient:
         the request level and the real error attached per topic inside the
         result.
         """
+        # `new_topic` is owned from here on, and every call below can raise:
+        # `queue_new`, `create_topics` and `queue_poll` as much as the decode.
+        # One guard covers them all rather than a destroy per exit.
         var new_topic = self._lib.new_topic_new(
             name, num_partitions, replication_factor
         )
-        var topics = Array[Int, 1](fill=new_topic)
-        var queue = self._lib.queue_new(self._rk)
-
-        self._lib.create_topics(self._rk, Int(topics.unsafe_ptr()), 1, queue)
-        _ = topics^
-
-        var event = self._lib.queue_poll(queue, timeout_ms)
+        var queue = 0
+        var event = 0
         var failure: String
-        if event == 0:
-            failure = "CreateTopics(" + name + "): timed out"
-        else:
-            try:
-                failure = self._verdict(event, name)
-            except e:
-                self._lib.event_destroy(event)
-                self._lib.queue_destroy(queue)
-                self._lib.new_topic_destroy(new_topic)
-                raise e
-            self._lib.event_destroy(event)
+        try:
+            var topics = Array[Int, 1](fill=new_topic)
+            queue = self._lib.queue_new(self._rk)
+            self._lib.create_topics(
+                self._rk, Int(topics.unsafe_ptr()), 1, queue
+            )
+            _ = topics^
 
+            event = self._lib.queue_poll(queue, timeout_ms)
+            failure = self._verdict(event, name) if event != 0 else String(
+                "CreateTopics(" + name + "): timed out"
+            )
+        except e:
+            if event != 0:
+                self._lib.event_destroy(event)
+            if queue != 0:
+                self._lib.queue_destroy(queue)
+            self._lib.new_topic_destroy(new_topic)
+            raise e
+
+        if event != 0:
+            self._lib.event_destroy(event)
         self._lib.queue_destroy(queue)
         self._lib.new_topic_destroy(new_topic)
         if failure != "":
@@ -133,13 +141,18 @@ struct AdminClient:
         var topic_cnt = _load_i32(meta + META_TOPIC_CNT)
         var topics = _load_word(meta + META_TOPICS)
 
+        # The walk decodes C strings and can raise, so every exit from here
+        # has to release the metadata -- including the raising ones.
         var out = List[String]()
-        for i in range(Int(topic_cnt)):
-            # Each rd_kafka_metadata_topic_t is 32 bytes and starts with
-            # `char *topic`.
-            var name_ptr = _load_word(topics + i * META_TOPIC_STRIDE)
-            if name_ptr != 0:
-                out.append(cstr(name_ptr))
-
+        try:
+            for i in range(Int(topic_cnt)):
+                # Each rd_kafka_metadata_topic_t is 32 bytes and starts with
+                # `char *topic`.
+                var name_ptr = _load_word(topics + i * META_TOPIC_STRIDE)
+                if name_ptr != 0:
+                    out.append(cstr(name_ptr))
+        except e:
+            self._lib.metadata_destroy(meta)
+            raise e
         self._lib.metadata_destroy(meta)
         return out^

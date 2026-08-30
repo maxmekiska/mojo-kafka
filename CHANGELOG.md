@@ -7,7 +7,238 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **Typed `KafkaErrorKind`.** `kind_of(code)` classifies a librdkafka error
+  into one of eight branchable tags, read from `KafkaError.kind()`,
+  `DeliveryReport.kind()` and `Producer.last_error_kind()`. Backpressure is
+  the case it exists for: a `produce()` refused because the local queue is
+  full now reports `KIND_QUEUE_FULL`, so a caller can drain and retry instead
+  of matching on error text.
+
+  The kind is exposed on **values** rather than on raised exceptions because
+  Mojo 1.0's `Error` carries only text — `except` has no type to match on.
+  That is why the producer records the kind of the rejection it just raised.
+
+  The set is deliberately small, and several codes collapse onto one tag: a
+  caller retrying a transient failure does not care whether librdkafka said
+  `__TRANSPORT` or `__ALL_BROKERS_DOWN`. The exact value stays on
+  `KafkaError.code` and `DeliveryReport.error_code`.
+
+- **Per-message delivery reports.** `produce()` and `produce_bytes()` return a
+  sequence token, carried to librdkafka as `RD_KAFKA_VTYPE_OPAQUE` and read
+  back from the delivery report, so a rejection is addressable instead of
+  being one entry in a tally. `Producer.failures()` returns a `DeliveryReport`
+  per rejection — sequence, topic, partition, offset, error code and text —
+  and `take_failures()` acknowledges them.
+
+  This needed no C function pointer, despite the design note that said
+  otherwise: librdkafka stores the opaque without ever dereferencing it, so a
+  plain integer token is a legitimate `void *`.
+
+  Only failures are retained. A report per delivered message would grow
+  without bound in a long-running producer that never reads them, and after a
+  `flush()` that does not raise, everything produced before it was delivered.
+
+- **Record headers, on both sides.** `produce()` / `produce_bytes()` take
+  `headers=[Header(...), ...]` and `Message.headers` carries what came back,
+  with `Message.header(name)` / `header_text(name)` for the common lookup.
+
+  Headers are a **list of pairs, not a `Dict`**. Kafka permits the same header
+  name more than once and preserves the order they were written in, and a map
+  drops both properties silently — which is how conventions like tracing
+  baggage are carried.
+
+  A header value is `Optional[List[UInt8]]`, for the same reason
+  `Message.value` is: librdkafka reads its presence from the **pointer**, so a
+  null header value and a present-but-empty one are different records. The
+  produce side reuses the same `_Field` encoder as keys and payloads and the
+  consume side the same `copy_bytes`, so that rule is expressed once.
+
+- **`produce(..., partition=)`**, defaulting to `PARTITION_UNASSIGNED`, which
+  leaves the choice to the topic's partitioner as before. Message timestamps
+  were deliberately left out: `Message` has no `timestamp` field yet, so a
+  produce-side timestamp could not be verified end to end.
+
+- Mock suite: `test_headers_round_trip_in_order_with_duplicates` writes the
+  same header name twice and asserts on position, so a map-backed
+  implementation fails rather than silently keeping one;
+  `test_header_values_keep_null_and_empty_apart` walks the null / empty /
+  present truth table for header values, asserting on `value` rather than
+  `value_text()`; and `test_explicit_partition_is_honoured` writes one key to
+  three partitions, which only lands spread if `partition=` is respected.
+- Interop: `fixtures.HEADERS` adds eight cases — order, duplicate names,
+  binary and unicode values, empty and null values, and headers on a
+  tombstone — run one per cell across every pairing. The wire contract
+  grew a third field for them; see `integration/interop/README.md`.
+
+  These are not ceremony. Breaking the produce side (a null header value
+  written as empty) and the consume side (an empty one read back as null)
+  *together* leaves `mojo -> mojo` green on `null-header-value` while
+  `mojo -> confluent` fails on it and `confluent -> mojo` fails on
+  `empty-header-value` — the same shape as the `empty-key` bug, measured
+  rather than assumed.
+- Interop: `fixtures.unsupported_by_producer`, which is **not**
+  `expected_failure`. It names a case a peer's own API cannot construct, and
+  those cells are skipped rather than failed, so a peer's limitation is never
+  filed as our bug. It names nothing today — `confluent-kafka` can express
+  every case in the set — and the hook is kept for the distinction it draws.
+- `Message.key_text()` / `Message.value_text()` — decode a field as UTF-8,
+  with a `default` for the null case (`""` unless given). `Message.is_tombstone()`.
+- `_ffi.copy_bytes()` — copies a length-delimited C buffer into
+  `Optional[List[UInt8]]`, returning `None` for a NULL pointer.
+- `test_null_and_empty_fields_are_distinct` (mock) — the full truth table:
+  tombstone, empty key, null key, empty value. It asserts on the raw optional
+  fields, not the text helpers, because the helpers collapse null onto their
+  default.
+- Interop: `fixtures.NULLABILITY` replaces `fixtures.GAPS`, adding `null-key`
+  and `empty-value` alongside `tombstone` and `empty-key`, and every one of
+  them now passes in every client pairing. The suite carried strict xfails
+  for this item and carries none.
+  `test_mojo_consumer_conflates_null_and_empty_key`, which pinned the
+  conflation, is now `test_mojo_consumer_distinguishes_null_and_empty_key`
+  and asserts the two are told apart.
+
+### Changed
+- **`KafkaError` and `DeliveryReport` are `Writable`.** `String(err)` and
+  `print(report)` work directly, the way they do for any other Mojo value.
+  Their bespoke `describe()` methods are gone — that was the pre-1.0
+  `Stringable` idiom under a different name.
+
+- **`flush()` no longer discards rejection reports when it raises.** It keeps
+  raising while any rejection is unacknowledged, and `take_failures()` is how
+  a caller acknowledges them. Previously the reports were cleared as the error
+  was raised, leaving nothing to inspect.
+
+- **Producing goes through `rd_kafka_produceva` rather than
+  `rd_kafka_produce`.** Not `rd_kafka_producev` — that one is variadic, and
+  calling a C variadic through a fixed prototype is undefined on the SysV and
+  AAPCS ABIs. `produceva` takes an **array** of `rd_kafka_vu_t` instead and is
+  an ordinary fixed-arity call, which is what makes headers reachable at all:
+  `rd_kafka_produce` has nowhere to attach them.
+
+  It also names the topic **by string**, which retired the per-topic
+  `rd_kafka_topic_t` cache on `Producer`. That unsynchronised `Dict` was the
+  headline reason a `Producer` could not be shared across threads when
+  librdkafka's own handle can be; the delivery-failure counters are still
+  unsynchronised, so this narrows the gap rather than closing it.
+  `rd_kafka_topic_new` / `rd_kafka_topic_destroy` are no longer bound.
+
+  `produceva` reports failure as a `rd_kafka_error_t*` that is **NULL on
+  success** — the opposite polarity to the handle-returning calls elsewhere —
+  and the object is caller-owned, so `Lib.take_error` reads and destroys it.
+  Error messages are now `rd_kafka_error_string`'s, which says what actually
+  went wrong, rather than `err2str`'s category name.
+
+  No behaviour changed for existing calls: the whole prior suite, including
+  the null/empty truth table, passes unmodified.
+
+- **BREAKING: `Message.key` and `Message.value` are `Optional[List[UInt8]]`,
+  and `Producer.produce()` / `produce_bytes()` take `Optional` in both
+  halves.** Kafka keys and values are opaque byte arrays and either half may
+  be *absent*, which the broker treats as distinct from present-and-empty.
+  Modelling them as `String` was a category error, and it left two things
+  unreachable rather than merely untested:
+
+  - **Tombstones could not be written.** A compaction tombstone is a non-null
+    key with a null value; `produce()` took `value: String` and
+    `produce_bytes()` took `value: List[UInt8]`, neither with a null path.
+  - **An empty-but-present key was unreachable.** `_enqueue` set the key
+    pointer only when the length was non-zero, so `key=""` went on the wire as
+    a *null* key. `confluent-kafka-python` distinguishes `None` from `b""`;
+    this did not.
+
+  A third symptom was type-level only: a non-UTF-8 payload came back in a
+  `String` whose bytes were intact but whose `codepoints()` yielded silent
+  nonsense. That one was never a data problem — the interop suite measured
+  embedded NULs and invalid sequences such as `0xC0 0xC1` round-tripping
+  byte-exact in every client pairing — which is why it is listed last.
+
+  Presence now travels as the pointer, which is how librdkafka signals it:
+  NULL is null, and non-NULL with length 0 is present and empty.
+
+  **Migration.** On the consume side, `key` / `value` are optional bytes:
+
+  ```mojo
+  # before
+  ref m = maybe.value()
+  print(m.key, m.value)
+  var raw = m.value.as_bytes()
+
+  # after
+  ref m = maybe.value()
+  print(m.key_text(), m.value_text())        # "" for a null field
+  print(m.key_text(default="<null>"))        # or say so explicitly
+  if m.value:
+      ref raw = m.value.value()              # List[UInt8], present only
+  if m.is_tombstone():
+      ...
+  ```
+
+  `Message` no longer conforms to `ImplicitlyCopyable` (a `List` field cannot),
+  so bind it with `ref m = maybe.value()` rather than `var m = ...`, or take an
+  explicit `.copy()`.
+
+  On the produce side, the previous default `key=""` meant *no key*, and
+  `key=None` means that now — so existing calls that pass a non-empty key, or
+  no key at all, are unchanged and produce identical bytes. Calls that passed
+  an explicit `key=""` expecting it to be dropped now write a present, empty
+  key:
+
+  ```mojo
+  p.produce("t", "hello")                 # unchanged: null key
+  p.produce("t", "hello", key="k")        # unchanged
+  p.produce("t", "hello", key="")         # now an empty *present* key
+  p.produce("t", None, key="k")           # new: a tombstone
+  p.produce("t", "", key="k")             # new: an empty present value
+
+  var payload = load()                    # List[UInt8]
+  p.produce_bytes("t", value=payload^)    # Mojo will not copy a List
+  p.produce_bytes("t", value=payload.copy(), key=k.copy())
+  p.produce_bytes("t", value=None, key=k^) # binary tombstone
+  ```
+
+- Each `librdkafka` symbol is resolved **once**, when a client is built,
+  instead of on every call. Every wrapper in `Lib` used to call
+  `get_function[...]("name")(...)`, so each FFI crossing paid a `dlsym` by
+  string, and that lookup cost more than the C call it wrapped. Measured
+  against librdkafka 2.15: 45–55 ns/call resolving per call against
+  1.2–1.5 ns/call resolving once, and through the wrappers an idle
+  `Producer.poll(0)` — one crossing and nothing else — went from 97–110 ns to
+  54–56 ns. `Consumer.poll()` crosses three times per message.
+
+  The 44 hot symbols are bound in `Lib.__init__`. The four `rd_kafka_mock_*`
+  ones stay lazy on purpose: they are cold, and binding them eagerly would
+  make every client fail to construct against a `librdkafka` built without
+  the mock broker rather than only `MockCluster`.
+
+  No API change. `Lib` now keeps its `OwnedDLHandle` in a one-element `List`
+  so the handle's address survives a move of the `Lib`.
+
+### Removed
+- **`kafka-python-ng` as an interop peer.** The cross-client suite now runs
+  against `confluent-kafka` alone — the client this API is measured against —
+  which takes the matrix from nine cells to four and the interop environment
+  from two client libraries to one.
+
+  The argument for keeping a pure-Python peer was that it shares no code with
+  us and so is the only one that can prove our *bytes on the wire*. That is
+  true and it is not the property the suite needs. This package reimplements
+  no part of the Kafka protocol: the encoder is librdkafka's, so a wire-format
+  bug would be a bug in librdkafka, reportable upstream rather than fixable
+  here. What the suite has to catch is a bug in the **binding** layer, which is
+  what this package is — and `confluent-kafka` is an independent binding layer
+  over the same C library. Every bug this suite has caught lived there.
+
+  Re-measured before removing it, not assumed: with the produce side (a null
+  header value written as empty) and the consume side (an empty one read back
+  as null) both broken, `mojo -> mojo` still passes `null-header-value` while
+  `mojo -> confluent` fails it and `confluent -> mojo` fails
+  `empty-header-value`. The symmetric-bug argument survives the peer.
+
+  One thing genuinely improved: the suite now runs with **no skips**.
+  `kafka-python-ng` asserts a header value is bytes and so could not produce a
+  null one, which skipped three cells; `confluent-kafka` expresses every case
+  in the set.
 
 ## [0.2.0] — 2026-08-28
 

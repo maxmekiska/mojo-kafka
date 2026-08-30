@@ -20,7 +20,7 @@ def main() raises:
     while seen < 10:
         var maybe = c.poll(timeout_ms=1000)
         if maybe:
-            var m = maybe.value()
+            ref m = maybe.value()
             print(
                 "topic=",
                 m.topic,
@@ -29,9 +29,9 @@ def main() raises:
                 " offset=",
                 m.offset,
                 " key=",
-                m.key,
+                m.key_text(default="<null>"),
                 " value=",
-                m.value,
+                m.value_text(default="<null>"),
             )
             seen += 1
 

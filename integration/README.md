@@ -1,11 +1,19 @@
 # Integration tests
 
-Two suites, covering the same client against two different brokers.
+Three suites. The first two run this client against a broker; the third runs it
+against another client.
 
-| | Broker | Docker | Runs on |
+| | Broker | Docker | Where it runs |
 |---|---|---|---|
-| `test_mock.mojo` | librdkafka's in-process mock | no | everywhere, incl. macOS |
-| `test_broker.mojo` | real `apache/kafka:3.7.0` | yes | Linux CI, local |
+| `test_mock.mojo` | librdkafka's in-process mock | no | CI and local, incl. macOS |
+| `test_broker.mojo` | real `apache/kafka:3.7.0` | yes | local only |
+| `interop/` | real `apache/kafka:3.7.0` | yes | local only |
+
+**Docker is a local tool in this project.** CI runs only the mock suite, which
+needs no daemon and therefore also runs on macOS. The two Docker-backed suites
+are yours to run before pushing anything they cover — see the note under each
+for what that is. Nothing gates them but you, so the mock suite is deliberately
+carrying as much of the regression coverage as it can.
 
 ## Mock suite — the default
 
@@ -25,6 +33,14 @@ This is where the regression guards live:
   transposed — the bug that shipped in `v0.1.0`.
 - `test_list_topics_walks_every_entry` creates enough topics that a wrong
   metadata stride crashes instead of quietly returning junk.
+- `test_null_and_empty_fields_are_distinct` walks the whole null/empty truth
+  table and asserts on `key` / `value`, not the `*_text()` helpers — those
+  collapse null onto their default, which is the conflation being guarded.
+- `test_headers_round_trip_in_order_with_duplicates` writes one header name
+  twice and asserts on position, so a `Dict`-backed implementation fails
+  instead of quietly keeping one of them.
+- `test_header_values_keep_null_and_empty_apart` applies the same null/empty
+  rule one level down, to header values.
 
 ### Keeping the cluster alive
 
@@ -52,3 +68,31 @@ Topic Admin API**, so `AdminClient.create_topic()` can only be exercised
 against a real broker — and that call was a segfault as recently as `v0.1.0`.
 The broker suite also covers metadata propagation timing, which the mock
 resolves instantly and a real cluster does not.
+
+## Interop suite — against `confluent-kafka`
+
+```bash
+pixi run broker-up
+pixi run -e interop test-interop
+```
+
+Produces with one client and consumes with the other, across this package and
+`confluent-kafka`, asserting byte-identical round trips in every direction.
+
+This answers a question neither suite above can. Both of those check us against
+a broker using only our own code on both ends, so a bug that is symmetric —
+one where produce and consume are wrong in matching ways — round-trips cleanly
+and looks correct. The `empty-key` case is exactly that shape: it passes
+`mojo -> mojo` and fails against any independent client. Record headers were
+measured to behave the same way — break the produce and consume halves
+together and `mojo -> mojo` stays green on `null-header-value` while the two
+crossing cells fail.
+
+`confluent-kafka` is the client this package's API is measured against. It
+wraps the same librdkafka we bind, so it cannot catch a bug in librdkafka's
+encoder — but it is an independent *binding* layer, which is the layer this
+package is and where every bug this suite has caught has lived. See
+`interop/README.md`.
+
+Python and `confluent-kafka` live in a separate pixi environment, so the
+default one stays just the compiler plus librdkafka.

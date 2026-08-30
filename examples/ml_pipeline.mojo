@@ -53,7 +53,7 @@ def main() raises:
         var maybe = c.poll(timeout_ms=1000)
         if not maybe:
             continue
-        var m = maybe.value()
-        var x = parse_feature(m.value)
+        ref m = maybe.value()
+        var x = parse_feature(m.value_text())
         var y = run_inference(x)
         print("offset=", m.offset, " x=", x, " y_hat=", y)

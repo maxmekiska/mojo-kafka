@@ -12,6 +12,32 @@ property permanently out of reach as an invalid `log.level`.
 from ._ffi import Lib
 
 
+def _build_conf(
+    lib: Lib, named: List[Tuple[String, String]], extra: Dict[String, String]
+) raises -> Int:
+    """Apply `named` then `extra` to a fresh `rd_kafka_conf_t`.
+
+    Shared by both config types so that librdkafka's ownership rule is
+    written once: the conf is **ours** until `rd_kafka_new` adopts it, and it
+    adopts it only on success -- so a `conf_set` rejected partway through has
+    to destroy it here or it leaks. `Lib.new_client` covers the other half.
+
+    `extra` is applied after the named fields, which is the order both config
+    types used before this was factored out. Keys given to `set()` are passed
+    to librdkafka verbatim -- see the module docstring for why.
+    """
+    var conf = lib.conf_new()
+    try:
+        for pair in named:
+            lib.conf_set(conf, pair[0], pair[1])
+        for entry in extra.items():
+            lib.conf_set(conf, entry.key, entry.value)
+    except e:
+        lib.conf_destroy(conf)
+        raise e
+    return conf
+
+
 @fieldwise_init
 struct ProducerConfig(Copyable, Movable):
     var bootstrap_servers: String
@@ -46,20 +72,17 @@ struct ProducerConfig(Copyable, Movable):
         self.extra[key] = value
 
     def _build(self, lib: Lib) raises -> Int:
-        var conf = lib.conf_new()
-        try:
-            lib.conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
-            lib.conf_set(conf, "client.id", self.client_id)
-            lib.conf_set(conf, "compression.type", self.compression_type)
-            lib.conf_set(conf, "linger.ms", String(self.linger_ms))
-            lib.conf_set(conf, "acks", self.acks)
-            for entry in self.extra.items():
-                lib.conf_set(conf, entry.key, entry.value)
-        except e:
-            # We still own the conf until rd_kafka_new adopts it.
-            lib.conf_destroy(conf)
-            raise e
-        return conf
+        return _build_conf(
+            lib,
+            [
+                ("bootstrap.servers", self.bootstrap_servers),
+                ("client.id", self.client_id),
+                ("compression.type", self.compression_type),
+                ("linger.ms", String(self.linger_ms)),
+                ("acks", self.acks),
+            ],
+            self.extra,
+        )
 
 
 @fieldwise_init
@@ -91,20 +114,19 @@ struct ConsumerConfig(Copyable, Movable):
         self.extra[key] = value
 
     def _build(self, lib: Lib) raises -> Int:
-        var conf = lib.conf_new()
-        try:
-            lib.conf_set(conf, "bootstrap.servers", self.bootstrap_servers)
-            lib.conf_set(conf, "group.id", self.group_id)
-            lib.conf_set(conf, "client.id", self.client_id)
-            lib.conf_set(conf, "auto.offset.reset", self.auto_offset_reset)
-            lib.conf_set(
-                conf,
-                "enable.auto.commit",
-                "true" if self.enable_auto_commit else "false",
-            )
-            for entry in self.extra.items():
-                lib.conf_set(conf, entry.key, entry.value)
-        except e:
-            lib.conf_destroy(conf)
-            raise e
-        return conf
+        return _build_conf(
+            lib,
+            [
+                ("bootstrap.servers", self.bootstrap_servers),
+                ("group.id", self.group_id),
+                ("client.id", self.client_id),
+                ("auto.offset.reset", self.auto_offset_reset),
+                (
+                    "enable.auto.commit",
+                    String("true") if self.enable_auto_commit else String(
+                        "false"
+                    ),
+                ),
+            ],
+            self.extra,
+        )

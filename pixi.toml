@@ -24,3 +24,28 @@ broker-down = "docker compose -f integration/docker-compose.yml down -v"
 [dependencies]
 mojo = "==1.0.0"
 librdkafka = ">=2.3.0,<3"
+
+# The cross-client interop suite (integration/interop) needs Python and a
+# mainstream Kafka client to test against. That is a heavier dependency set
+# than the rest of the project, so it lives in its own environment and the
+# default one stays just the compiler plus librdkafka.
+#
+#   pixi run -e interop test-interop
+#
+[feature.interop.dependencies]
+python = ">=3.11,<3.14"
+
+[feature.interop.pypi-dependencies]
+# confluent-kafka is the client this package's API is measured against, and
+# the independent end of every crossing cell in the matrix. It wraps the same
+# librdkafka src/kafka/_ffi.mojo binds, through a binding layer that shares no
+# code with ours -- which is the layer this package is, and where every bug
+# the suite has caught has lived.
+confluent-kafka = ">=2.3,<3"
+pytest = ">=8,<9"
+
+[feature.interop.tasks]
+test-interop = "pytest integration/interop -q"
+
+[environments]
+interop = ["interop"]

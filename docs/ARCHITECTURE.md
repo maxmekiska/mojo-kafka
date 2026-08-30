@@ -69,7 +69,7 @@ The library is found by soname (`librdkafka.so.1`, `librdkafka.so`, and the
 macOS equivalents), and `MOJO_KAFKA_LIBRDKAFKA` overrides the search with an
 explicit path.
 
-### Three conventions
+### Four conventions
 
 1. **C pointers cross the boundary as `Int` addresses, never as `Pointer`.**
    Mojo 1.0's `Pointer` is non-nullable by design, but nearly every
@@ -83,9 +83,41 @@ explicit path.
 
 3. **No variadic C calls.** Calling a C variadic through a fixed prototype is
    undefined on both SysV and AAPCS — the `%al` vector-register count is
-   never set. `rd_kafka_producev` is variadic, so we bind the older
-   non-variadic `rd_kafka_produce` instead and manage `rd_kafka_topic_t`
-   handles ourselves (they are cached per topic name on the `Producer`).
+   never set. `rd_kafka_producev` is variadic, so producing goes through
+   `rd_kafka_produceva`, which takes an **array** of `rd_kafka_vu_t` and is an
+   ordinary fixed-arity function. `_VuArray` lays that array out; its stride
+   is 72 and not the 24 the live union members would suggest, because
+   `rd_kafka_vu_t` ends in a `char _pad[64]`.
+
+   Two consequences are easy to undo by accident. `produceva` returns a
+   `rd_kafka_error_t*` that is **NULL on success** — the opposite polarity to
+   every handle-returning call here — and it is caller-owned, so it goes
+   through `Lib.take_error`, which reads it and destroys it. And a header list
+   passed as `RD_KAFKA_VTYPE_HEADERS` is adopted by the message **only if the
+   call succeeds**; on every other path it is still ours to destroy.
+
+   Taking the topic by name is also what retired the per-topic
+   `rd_kafka_topic_t` cache on `Producer`, and with it the unsynchronised
+   `Dict` that was the headline reason a `Producer` could not be shared
+   across threads.
+
+4. **Every symbol is resolved once, in `Lib.__init__`.**
+   `OwnedDLHandle.get_function` does a `dlsym` by string on each call, and
+   that lookup costs more than the C call it wraps — 45–55 ns/call against
+   1.2–1.5 ns/call once resolved, measured against librdkafka 2.15. The
+   resolved callables are held as fields on `Lib`.
+
+   Two mechanics make that work. `get_function` returns a callable whose
+   origin is borrowed from the handle, and Mojo will not let a struct field
+   name the origin of one of its own fields, so the symbol is re-wrapped with
+   `ImmUntrackedOrigin` — the lifetime argument moves out of the type system
+   and into `_bind`'s docstring: a callable is only ever a field of the `Lib`
+   that resolved it. And `Lib` is movable, so the handle lives in a
+   one-element `List` whose heap address survives the move.
+
+   The four `rd_kafka_mock_*` symbols stay lazily resolved. They are cold, and
+   binding them eagerly would make every client fail to construct against a
+   `librdkafka` built without the mock broker rather than only `MockCluster`.
 
 ## Lifetime story
 
@@ -93,8 +125,8 @@ Every `librdkafka` resource has a paired `_new` / `_destroy` (or `_free`). The M
 
 - `Producer.__init__` calls `rd_kafka_new(RD_KAFKA_PRODUCER, …)` and stores the resulting `rd_kafka_t*` as an `Int` address.
 - `Producer.__deinit__` drains outstanding delivery reports, destroys its
-  cached topic handles and its main-queue reference, then calls
-  `rd_kafka_destroy`.
+  main-queue reference, then calls `rd_kafka_destroy`. There are no topic
+  handles left to release — `rd_kafka_produceva` takes the topic by name.
 - Same pattern for `Consumer` (with an explicit `close()` for graceful rebalance), and for `AdminClient`.
 
 `ProducerConfig._build()` returns the `rd_kafka_conf_t*` and **transfers
@@ -138,6 +170,15 @@ These are verified against the installed headers with `offsetof`, and the
 integration suite round-trips real messages, so a layout change shows up as a
 test failure rather than as garbage in someone's pipeline.
 
+`payload` and `key` are read for **presence** as well as content: a NULL
+pointer is a null field and a non-NULL one with length 0 is a field that is
+present and empty, and Kafka treats those as different. `_ffi.copy_bytes`
+therefore returns `Optional[List[UInt8]]` and never collapses NULL into an
+empty list — that pointer is the whole mechanism behind compaction
+tombstones. The produce path reads the same rule in reverse: `_enqueue` hands
+`rd_kafka_produceva` address 0 for an absent field and a real address,
+possibly to a zero-length buffer, for a present one.
+
 The same technique applies to metadata, where the stride matters as much as
 the offsets: `sizeof(rd_kafka_metadata_topic_t)` is **32** bytes on 64-bit
 (`char *topic; int partition_cnt; <pad>; partitions*; err; <pad>`). A 24-byte
@@ -174,11 +215,17 @@ that.
   `pixi run broker-up && pixi run test-broker`. Not redundant with the mock:
   the mock does **not** implement the Topic Admin API, so
   `AdminClient.create_topic()` is only reachable here, and real metadata
-  propagation timing only shows up against a real cluster.
+  propagation timing only shows up against a real cluster. **Local only** —
+  it needs Docker, and Docker is a local tool in this project.
+- **Interop against `confluent-kafka`** (`integration/interop/`) —
+  `pixi run broker-up && pixi run -e interop test-interop`. The only suite
+  with an independent client on one end, so it is the only one that can catch
+  a bug that is symmetric across produce and consume. Local only, same
+  reason.
 - **Lint** — `mojo format` over `src/`, `examples/`, `tests/`, with CI failing
   on drift.
 
-Two of the mock tests exist specifically as regression guards:
+Three of the mock tests exist specifically as regression guards:
 
 - `test_round_trip_preserves_key_and_value` asserts on **both** halves of every
   message. A test that only checks the payload passes even when the
@@ -186,8 +233,15 @@ Two of the mock tests exist specifically as regression guards:
   shipped in `v0.1.0`.
 - `test_list_topics_walks_every_entry` creates enough topics that a wrong
   metadata stride crashes instead of quietly returning junk.
+- `test_null_and_empty_fields_are_distinct` walks the whole null/empty truth
+  table — tombstone, empty key, null key, empty value — asserting on `key` and
+  `value` rather than the `*_text()` helpers, which collapse null onto their
+  default and would hide exactly the conflation being guarded.
 
-All three jobs gate every PR. See `.github/workflows/ci.yml`.
+**CI runs only what needs no Docker daemon** — lint, and the build plus the
+smoke and mock suites on Linux and macOS. Both jobs gate every PR. The
+Docker-backed suites above are run locally, by whoever is touching the code
+they cover. See `.github/workflows/ci.yml` and `integration/README.md`.
 
 `kafka.testing.MockCluster` is public API, not test-only scaffolding — users
 testing their own Kafka code get the same Docker-free broker.
