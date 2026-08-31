@@ -134,6 +134,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `test_a_handler_survives_the_round_trip_through_its_slot` guard the
   shape and the round trip, and both fail when broken.
 
+### Changed
+- **Examples rewritten.** `producer_basic` / `consumer_basic` / `ml_pipeline`
+  are replaced by `produce.mojo`, `pipeline.mojo` and `consume.mojo`, which
+  chain into one story: a sensor emits packed `Float32` batches, a pipeline
+  reduces them with SIMD over `consume_borrowed()` spans without copying a
+  byte, and a reader consumes the summaries. Pixi tasks are now
+  `example-produce`, `example-pipeline` and `example-consume`. The old set
+  compiled but demonstrated nothing the package could not do on day one.
+
 ### Added
 - **Zero-copy consume.** `Consumer.consume_borrowed(n)` returns a
   `MessageBatch` that still owns librdkafka's messages and lends

@@ -18,7 +18,7 @@ pixi run lint          # mojo format over src/ examples/ tests/ integration/
 pixi run package       # mojo precompile -> dist/kafka.mojoc
 pixi run test          # smoke tests, no broker
 pixi run test-mock     # full integration suite on the in-process mock broker
-pixi run example-producer   # also: example-consumer, example-ml
+pixi run example-produce    # also: example-pipeline, example-consume
 ```
 
 **`test-mock` is the default integration suite** — it uses librdkafka's
@@ -77,7 +77,7 @@ package is not on the import path:
 
 ```bash
 pixi run -- mojo run -I src tests/test_smoke.mojo
-pixi run -- mojo build -I src examples/producer_basic.mojo -o /tmp/prod
+pixi run -- mojo build -I src examples/produce.mojo -o /tmp/prod
 ```
 
 There is no `mojo test` subcommand, but there **is** a discovery runner. Every

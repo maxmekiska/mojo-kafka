@@ -237,7 +237,21 @@ def main() raises:
         print(t)
 ```
 
-See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipeline.mojo`](examples/ml_pipeline.mojo) — a streaming feature pipeline that reads events off Kafka and feeds them into a tensor.
+[`examples/`](examples/) holds three scripts that chain into one story — a
+sensor emitting packed `Float32` batches, a pipeline that reduces them, and a
+reader for the results:
+
+```bash
+pixi run example-produce     # 200 batches of 64 samples -> sensor.readings
+pixi run example-pipeline    # zero-copy + SIMD reduce   -> sensor.summary
+pixi run example-consume     # read the summaries back
+```
+
+[`examples/pipeline.mojo`](examples/pipeline.mojo) is the one worth reading:
+it consumes with `consume_borrowed()`, so the samples are never copied out of
+librdkafka's receive buffer, and reduces them eight lanes at a time with SIMD
+over those same borrowed bytes. That is the half a Python client cannot do —
+there, every record crosses back into the interpreter before you touch it.
 
 ## API surface
 
