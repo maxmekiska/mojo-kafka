@@ -43,6 +43,45 @@ def test_consumer_config_defaults() raises:
     assert_equal(cfg.group_id, "g")
     assert_equal(cfg.auto_offset_reset, "latest")
     assert_true(cfg.enable_auto_commit, "auto commit should default on")
+    # Off by default, matching librdkafka: a tail-following consumer would
+    # otherwise be handed an end-of-partition mark every time it caught up.
+    assert_true(
+        not cfg.enable_partition_eof, "partition EOF should default off"
+    )
+
+
+def test_produce_accepts_an_explicit_timestamp() raises:
+    """Guards the `_VuArray` entry count, without needing a broker.
+
+    Adding the timestamp took the array from seven `rd_kafka_vu_t` entries
+    to eight. `_VuArray` fixes its capacity at construction and `_entry`
+    raises rather than overrunning, so a forgotten `_VuArray(7)` fails on
+    the first produce -- here, loudly, rather than by corrupting the array
+    in somebody's pipeline.
+
+    Nothing listens on port 9, so this asserts only that the message was
+    *enqueued*; whether the broker preserved the timestamp is covered on the
+    mock and against a real broker.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("message.timeout.ms", "300")
+    cfg.set("log_level", "0")
+    var p = Producer(cfg)
+
+    # A named time, and the 0 default that means "stamp it now".
+    var stamped = p.produce(topic="t", value="v", timestamp=1600000000000)
+    var now = p.produce(topic="t", value="v")
+    var payload: List[UInt8] = [1]
+    var raw = p.produce_bytes(topic="t", value=payload^, timestamp=Int64(42))
+    assert_true(stamped != now, "sequences collided")
+    assert_true(raw != now, "sequences collided")
+
+    try:
+        p.flush(3000)
+    except:
+        pass
+    _ = p.take_failures()
+    print("    8-entry vu array accepted a timestamp")
 
 
 def test_extra_keys_recorded() raises:

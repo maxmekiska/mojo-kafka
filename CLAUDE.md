@@ -33,7 +33,8 @@ pixi run broker-down
 ```
 
 The mock does **not** implement the Topic Admin API, so
-`AdminClient.create_topic()` is only reachable against a real broker.
+`AdminClient.create_topic()` is only reachable against a real broker — nor
+ListOffsets by timestamp. See "Testing" for both, and for what that costs.
 
 A third suite produces with this client and consumes with `confluent-kafka`,
 and the reverse. It needs the separate `interop` pixi environment, which keeps
@@ -63,9 +64,11 @@ Two consequences to work with rather than around:
   integration suite that gates a PR. A guard that can be written against the
   mock belongs there, not in `test_broker.mojo`.
 - **Nothing but you runs the Docker suites.** Run `test-broker` when touching
-  `AdminClient`, and `test-interop` when touching what goes on the wire --
-  keys, values, headers, null versus empty. A symmetric produce/consume bug
-  passes every suite CI runs.
+  `AdminClient`, consumer-group behaviour (rebalance handlers, `committed`) or
+  anything time-based -- the mock fakes the group protocol and does not
+  implement ListOffsets-by-timestamp at all. Run `test-interop` when touching
+  what goes on the wire -- keys, values, headers, timestamps, null versus
+  empty. A symmetric produce/consume bug passes every suite CI runs.
 
 ### Running things directly
 
@@ -91,9 +94,11 @@ hand-written `main()` calling each case: that had a silent failure mode — a
 case that stopped being called was never run and the suite still passed.
 
 Two consequences. Helpers must **not** be named `test_*` or they run as cases
-(`bootstrap`, `unique_topic`, `wait_for_topics`, `_text_of` are named
-accordingly). And `main()` may do setup first — `test_broker.mojo` prints the
-bootstrap address — but the run itself is the one line above.
+(`bootstrap`, `unique_topic`, `wait_for_topics`, `_text_of`, `_drain` are named
+accordingly, as are the rebalance handlers the suites register --
+`_noop_handler`, `_commit_on_revoke` and friends). And `main()` may do setup
+first — `test_broker.mojo` prints the bootstrap address — but the run itself is
+the one line above.
 
 ## Mojo 1.0
 
@@ -117,6 +122,7 @@ here it will not compile:
 | `InlineArray`, `StringSlice` | `Array`, `StringSpan` |
 | `Stringable` / `__str__` | `Writable` / `write_to(self, mut writer: Some[Writer])` |
 | hand-written test `main()` | `TestSuite.discover_tests[__functions_in_module()]().run()` |
+| no C callbacks (a common training-data belief) | `abi("C")` + `thin` — see below |
 
 Two consequences that come up constantly:
 
@@ -125,6 +131,42 @@ Two consequences that come up constantly:
   propagates all the way up through callers and test functions.
 - **Destructors cannot raise.** `__deinit__` bodies wrap their FFI calls in
   `try/except: pass`.
+
+### C callbacks are possible in 1.0 — `abi("C")`
+
+Pre-1.0 Mojo could not hand C a function pointer, and several comments in
+this repo were written under that assumption. **1.0 can.** The `abi("C")`
+function effect declares the platform C calling convention, and such a
+function can be passed straight to a C API expecting a callback. Verified
+here against libc's `qsort` and against
+`rd_kafka_conf_set_rebalance_cb` — the latter fired with
+`__ASSIGN_PARTITIONS` and a decodable partition list on the mock broker.
+
+The effect goes after the closing paren, before the `->`:
+
+```mojo
+def compare(a: Pointer[c_int, ImmutAnyOrigin],
+            b: Pointer[c_int, ImmutAnyOrigin]) abi("C") -> c_int:
+```
+
+`thin` is the companion effect: a function type that captures nothing, i.e.
+a plain function pointer rather than a closure. C has no closures, so
+`abi("C")` always implies it. A pointer *type* is spelled
+`def(Int32, Int32) thin abi("C") -> Int32`.
+
+Three constraints, all confirmed by compiling rather than assumed:
+
+- **`abi("C")` may not be `raises`.** The compiler rejects it outright:
+  `'abi("C")' function may not be marked 'raises'`. Nearly every `Lib` method
+  here raises, so a callback body needs the `try/except: pass` discipline
+  `__deinit__` already uses.
+- **A callback captures nothing.** The only route back to Mojo state is
+  whatever `void *` the C API carries for you — for librdkafka,
+  `rd_kafka_conf_set_opaque`. An object addressed that way must not move, so
+  it needs the one-element `List` heap box `Lib` already uses for its handle.
+- **Borrowed arguments die when the callback returns.** librdkafka destroys
+  the partition list on return from `rebalance_cb`; a `char *` saved past
+  that reads as garbage. Copy inside the callback.
 
 Two runtime traps that cost real debugging time here:
 
@@ -137,13 +179,22 @@ Two runtime traps that cost real debugging time here:
   `MockCluster` in particular: a cluster touched only during setup is torn
   down before the first `produce()`, and the symptom is a misleading
   `1/1 brokers are down`. End such scopes with `_ = cluster^`.
+- **`where` compiles but does not format.** It is a keyword in 1.0 (the
+  `where conforms_to(...)` constraint clause), and `mojo format` refuses the
+  file with `Cannot parse` — but the *compiler* still accepts it as a variable
+  name, so the code builds and the tests pass and only `pixi run lint` fails.
+  It reads naturally in exactly the place it bites (`var where = ...` for a
+  list of offsets to seek to), so it has already been written twice here. Use
+  `start_at` or similar.
 
 ## Architecture
 
 ```
 examples/, tests/, integration/        user-facing Mojo
-  └── src/kafka/{producer,consumer,admin,config}.mojo   typed API, RAII, errors
+  └── src/kafka/__init__.mojo          the public surface — re-exports only
+      src/kafka/{producer,consumer,admin,config}.mojo   typed API, RAII, errors
       src/kafka/header.mojo            Header, shared by both sides
+      src/kafka/partition.mojo         TopicPartition, Watermarks, offsets
       src/kafka/testing.mojo           MockCluster — in-process broker
         └── src/kafka/_ffi.mojo        the only file that touches C
               └── librdkafka.so        loaded at runtime, not linked
@@ -213,8 +264,9 @@ per config type.
 
 ### Struct offsets
 
-`consumer.mojo` and `admin.mojo` decode C structs by hand-computed byte
-offsets, declared as `comptime` constants in `_ffi.mojo`. These were verified
+`consumer.mojo`, `admin.mojo` and `producer.mojo`'s delivery-report
+trampoline decode C structs by hand-computed byte offsets, declared as
+`comptime` constants in `_ffi.mojo`. These were verified
 against the installed headers with `offsetof`/`sizeof`. If you touch them,
 verify the same way rather than reasoning about padding:
 
@@ -227,6 +279,14 @@ The stride matters as much as the offsets: `sizeof(rd_kafka_metadata_topic_t)`
 is **32** on 64-bit, not 24. A short stride reads a plausible name for the
 first topic and then walks into unmapped memory.
 
+`rd_kafka_topic_partition_t` is the third one, and the consumer control
+plane walks arrays of it constantly. `sizeof` is **64**, not the 56 its seven
+members add up to: `err` at 48 is a 4-byte enum, and the struct ends with a
+`void *_private` at 56 that librdkafka reserves. `test_position_walks_every_partition`
+in the mock suite is the guard, and it asks for 12 partitions for the same
+reason the metadata one asks for 8 — a wrong stride returns *something* for
+every entry, so the test has to assert that entry `i` really is partition `i`.
+
 `_VuArray` has the same trap with a wider margin. `sizeof(rd_kafka_vu_t)` is
 **72**, because its union ends in a `char _pad[64]` librdkafka keeps for
 future vtypes — the largest member actually in use would suggest 24. Two
@@ -236,21 +296,38 @@ type rather than from luck; and its capacity is fixed at construction, because
 `_entry` hands out raw addresses into it that a reallocating append would
 leave dangling.
 
-### Delivery reports are event-sourced, not callbacks
+### Delivery reports go through a `dr_msg_cb`
 
-Mojo cannot hand librdkafka a C function pointer, so there is no `dr_msg_cb`.
-`Producer.__init__` calls `rd_kafka_conf_set_events(conf, RD_KAFKA_EVENT_DR)`,
-which routes every delivery report to the client's main queue, and
-`Producer._drain()` walks each batch with `rd_kafka_event_message_next`.
+`Producer.__init__` registers `_delivery_trampoline` with
+`rd_kafka_conf_set_dr_msg_cb`, and librdkafka calls it once per produced
+message from inside `poll()` or `flush()`.
 
-Two consequences worth knowing before touching `producer.mojo`:
+This was event-sourced until Mojo 1.0 — `rd_kafka_conf_set_events(conf,
+RD_KAFKA_EVENT_DR)` plus a hand-written drain over
+`rd_kafka_event_message_next` — because pre-1.0 Mojo could not hand C a
+function pointer. `abi("C")` removed that constraint, and converting brought
+the producer in line with the rebalance callback. Measured A/B over 200k
+messages against the mock, the two are indistinguishable: the run-to-run
+spread (~280 ns/msg) is far wider than the difference between them.
 
-- **Do not reintroduce `rd_kafka_flush`.** With `RD_KAFKA_EVENT_DR` enabled it
-  expects another thread to be serving the queue, and `rd_kafka_outq_len`
-  counts undrained events as outstanding — so it blocks until its timeout.
-  `flush()` runs its own drain loop against `outq_len`.
-- **The queue from `rd_kafka_queue_get_main` is a new reference** and must be
-  destroyed before `rd_kafka_destroy`.
+Four things to know before touching `producer.mojo`:
+
+- **`rd_kafka_flush` is correct again, and is used.** An older note here said
+  never to reintroduce it. That was true *with* `RD_KAFKA_EVENT_DR`, where
+  `rd_kafka_outq_len` counted undrained events as outstanding so flush sat
+  until its timeout. With a `dr_msg_cb` it serves the callback on the calling
+  thread and returns when the queue is genuinely empty, which is what
+  `_drain_until_empty` now is.
+- **Callbacks run on the calling thread**, never on a librdkafka background
+  thread. That is what makes touching Mojo state from the trampoline safe --
+  and why it does not make `Producer` any more thread-safe than it was.
+- **Only failures are retained.** The trampoline's success path is a single
+  load and a return; a report per delivered message would grow without bound
+  in a long-running producer that never reads them.
+- **The state is in a one-element `List`.** The callback reaches the failure
+  list by address through `rd_kafka_conf_set_opaque`, so it lives in a heap
+  box (`Producer._dr`, holding a `_DrState`) like `Lib`'s handle and
+  `Consumer`'s rebalance state, not in a bare field.
 
 `AdminClient.create_topic()` has the matching trap: `rd_kafka_event_error()`
 is only the *request*-level verdict. A topic the broker refused comes back
@@ -261,8 +338,8 @@ success for a topic that was never created.
 ## Testing
 
 `tests/` holds broker-free unit tests; `integration/` holds both integration
-suites and the compose file. `integration/test_mock.mojo` contains three cases
-that exist as regression guards, not as feature coverage. Keep their shape if
+suites and the compose file. Several cases in `integration/test_mock.mojo`
+exist as regression guards rather than feature coverage. Keep their shape if
 you touch them:
 
 - `test_round_trip_preserves_key_and_value` asserts on **both** halves of every
@@ -274,6 +351,28 @@ you touch them:
   table and asserts on `key` / `value` rather than `key_text()` /
   `value_text()`. The text helpers collapse null onto their default, so an
   assertion through them passes under exactly the conflation being guarded.
+- `test_position_walks_every_partition` does for the 64-byte
+  `rd_kafka_topic_partition_t` stride what the metadata one does for 32, and
+  asserts entry `i` really is partition `i` — a wrong stride returns
+  *something* for every entry.
+- `test_rebalance_handler_that_does_nothing_still_gets_assigned` guards the
+  silent-stall case: registering a rebalance callback stops librdkafka
+  assigning by itself, so a handler that only looks must still end up
+  assigned.
+- `test_produce_accepts_an_explicit_timestamp` (in the **smoke** suite, not
+  the mock one) guards the `_VuArray` entry count without needing a broker.
+
+Two things the mock does not implement, and both are silent about it:
+
+- **CreateTopics** -- so `AdminClient.create_topic()` is only reachable
+  against a real broker.
+- **ListOffsets by timestamp** -- it answers *every* timestamp with
+  `OFFSET_END`, including ones that plainly precede every record on the
+  partition, and reports no error doing so. An `offsets_for_times` test
+  written against the mock would therefore pass for an implementation that
+  always returned `OFFSET_END`, which is why that one case lives in
+  `test_broker.mojo`. Everything else in the consumer control plane the mock
+  does cover.
 
 Against a **real** broker, topic creation is acked before metadata propagates,
 so tests that create then immediately list must poll — use the
@@ -339,9 +438,11 @@ exactly the conflation such a test exists to catch. Assert on `key` / `value`.
 
 ## Already built — and what not to undo
 
-Six items landed together on `feat-mojo-1-0`. The full reasoning for each lives
-in the relevant docstring; what follows is only the part that is easy to undo by
-accident, and the `_ffi.mojo` conventions above cover the rest.
+Everything below landed on `feat-mojo-1-0`: six client features first, then
+the consumer control plane, then rebalance callbacks and the produce-side
+timestamp, and finally the delivery-report conversion. The full reasoning for
+each lives in the relevant docstring; what follows is only the part that is
+easy to undo by accident, and the `_ffi.mojo` conventions above cover the rest.
 
 **`CONTRIBUTING.md` is the upstream author's file — leave it alone.** Its
 "help wanted" list predates all of this and is stale: consumer-side headers,
@@ -367,12 +468,26 @@ bullets below rather than that list, and do not "fix" the code to match it:
 
 - **Producing goes through `rd_kafka_produceva`.** Taking the topic by name is
   what retired the per-topic handle cache. Two things follow:
-  - `Producer` is still **not** thread-safe — `_failures` and `_next_sequence`
-    are unsynchronised. Do not document it as safe until they are dealt with.
-  - **Timestamps were left out deliberately.** The `vu` entry is trivial, but
-    `Message` has no `timestamp` (see "Consumer surface" below), so a
-    produce-side one could not be verified by any test here. Add both halves
-    together or neither.
+  - `Producer` is still **not** thread-safe — `_dr[0].failures` and
+    `_next_sequence` are unsynchronised. The `dr_msg_cb` did not change that:
+    librdkafka runs it on whichever thread called `poll` / `flush`, so two
+    threads produce two unsynchronised writers. Do not document it as safe
+    until they are dealt with.
+  - **Both timestamp halves have landed.** `produce(timestamp=)` is the
+    record's CreateTime in milliseconds, and **0 means now** -- librdkafka's
+    rule and `confluent-kafka`'s documented default -- so the `vu` entry is
+    emitted unconditionally rather than only when a caller names a time.
+    `RD_KAFKA_VTYPE_TIMESTAMP` is **8**, read off the enum in the installed
+    header and not guessed: the enum starts at `END=0` and includes `RKT=2`,
+    which this package never emits, so the live vtypes are not densely
+    numbered. 2 would pass an `int64` where librdkafka expects a
+    `rd_kafka_topic_t *`.
+
+    The array is now **eight** entries. `_VuArray`'s capacity is fixed at
+    construction and `_entry` raises rather than overrunning, so a stale
+    `_VuArray(7)` fails on the first produce --
+    `test_produce_accepts_an_explicit_timestamp` in the smoke suite pins
+    that without needing a broker.
 
 - **Headers are a list of pairs, not a `Dict`.** Kafka permits a repeated name
   and preserves order; a map drops both silently. Names cross to C as
@@ -396,6 +511,90 @@ bullets below rather than that list, and do not "fix" the code to match it:
   stays on `.code` / `.error_code`. Resist growing it into a mirror of
   librdkafka's table.
 
+### The consumer control plane
+
+Landed on `feat-mojo-1-0` after the six items above: `assign` / `unassign`,
+`seek`, `position`, `committed`, `pause` / `resume`, both watermark calls,
+`offsets_for_times`, `Message.timestamp`, and `poll_event`. What is easy to
+undo by accident:
+
+- **Per-partition errors are the real verdict, and the two policies are
+  deliberate.** Most of these calls answer *into* the list they were given —
+  the return code is only the request-level result, exactly as
+  `rd_kafka_event_error` is for CreateTopics. The calls that hand a list back
+  (`position`, `committed`, `offsets_for_times`) leave the verdict on each
+  entry for the caller to read with `has_error()`, because one bad partition
+  should not hide two good answers. The calls that return nothing (`seek`,
+  `pause`, `resume`) raise on the first failure through
+  `_raise_on_partition_error`, because otherwise it is lost. Do not unify
+  these onto one policy.
+
+- **The list ownership dance is written once**, in `Consumer._control`, which
+  builds the TPL, makes one call, decodes, and destroys it on every path
+  including the raising ones. The C call it makes is chosen by a `comptime if`
+  on a `StaticString` parameter. That indirection exists so there is one
+  destroy site rather than seven; inlining it back into each method
+  reintroduces six chances to leak the list.
+
+- **`seek_partitions` has `produceva`'s reversed polarity** — a
+  `rd_kafka_error_t*` that is NULL on success and caller-owned. It goes
+  through `Lib.take_error`. Every other call here returns an ordinary
+  `rd_kafka_resp_err_t`.
+
+- **`topic_partition_list_add` returns an address that dies at the next add.**
+  The list grows by reallocating `elems`, so an element address kept across a
+  second add dangles. `_tpl_build` sizes the list up front *and* writes each
+  offset immediately; keep both halves.
+
+- **`OFFSET_INVALID` is not an error.** It is what `position()` reports for a
+  partition nothing has been read from, and what `committed()` reports for a
+  group that has committed nothing. Mapping it to 0 would claim a full
+  partition of lag on a consumer that has not started.
+
+- **`enable_partition_eof` defaults to `False`**, matching librdkafka. It is
+  what makes `poll_event()` able to report EOF at all, and a tail-following
+  job wants it off. `poll()` is written in terms of `poll_event()` and takes
+  the message out with `Optional.take()` rather than copying — it is the hot
+  path.
+
+- **`Message.has_timestamp()` reads the *type*, not the value.** -1 is a legal
+  `int64` millisecond value, so `timestamp != -1` is not the question;
+  `timestamp_type != TIMESTAMP_NOT_AVAILABLE` is.
+
+### Rebalance callbacks
+
+`subscribe(topics, on_assign=, on_revoke=, on_lost=)`, matching
+`confluent-kafka`'s signature. Built on a real `abi("C")` callback handed to
+`rd_kafka_conf_set_rebalance_cb` — see "C callbacks are possible in 1.0".
+Four things not to undo:
+
+- **The trampoline is installed on *every* consumer, at construction.** The
+  callback has to go on the `rd_kafka_conf_t` before the client exists, but
+  handlers only arrive at `subscribe()`, so the slots start empty. This is
+  load-bearing: registering a callback **stops librdkafka assigning by
+  itself**, so `_settle` must run whenever a handler did not take over, or
+  the consumer silently consumes nothing. `handled` on `_RebalanceState`
+  records which happened.
+
+- **A handler that does nothing must still get the default assignment.**
+  Measured against `confluent-kafka` 2.15: its `on_assign` need not call
+  `assign()` for records to flow, and neither does ours.
+  `test_rebalance_handler_that_does_nothing_still_gets_assigned` guards it.
+
+- **Handlers are thin — they capture nothing.** A C callback carries no
+  captured state, so a handler is a top-level `def`, never a closure, and
+  everything it needs arrives on the `Rebalance` context. That is also why
+  the tests observe handlers through *Kafka* — a committed offset, a
+  starting offset — rather than through a counter they cannot write to.
+
+- **`_settle` dispatches on `rebalance_protocol()`.** Eager assignors replace
+  the whole assignment; cooperative ones add and remove incrementally. The
+  wrong call stalls the group rather than raising.
+
+`Rebalance` is only valid for the duration of its callback: librdkafka
+destroys the partition list on return, which is why `_decode_tpl` copies
+every name out immediately.
+
 ## What we build next
 
 Ordered by **leverage, not parity**. `confluent-kafka` is the reference for API
@@ -404,60 +603,20 @@ its surface is administrative work people do from a CLI or Terraform. Build what
 unblocks a workload that is impossible today, and prefer the things that are
 worth more in Mojo than they are in Python.
 
-### 1. Consumer control plane
-
-`assign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`,
-`get_watermark_offsets()`, and `Message.timestamp`. Also split `PARTITION_EOF`
-from timeout — both return `None` from `poll()` today, so a job that drains to
-end-of-partition cannot tell "caught up" from "nothing arrived".
-
-Highest leverage of anything left, because four workloads are outright
-unreachable without it: **replay** from an offset, **lag measurement** (watermark
-minus position), **event-time** processing (`timestamp`), and any **bounded
-drain** (EOF). It is also the prerequisite for exactly-once, below.
-
-Rebalance callbacks (`on_assign` / `on_revoke`) are the hard part and can come
-later — they need a design that works without C function pointers.
-
-**Start by decoding `rd_kafka_topic_partition_list_t`.** Today the TPL is
-write-only — `subscribe()` builds one and destroys it, and nothing ever reads
-one back — but `assign`, `position`, `committed` and the watermark calls all
-return or fill one, so the decode is the first task and every later call
-depends on it. Probed with `offsetof`/`sizeof` against librdkafka 2.15, so add
-these to `_ffi.mojo` as `comptime` rather than re-deriving them:
-
-```
-rd_kafka_topic_partition_list_t:  cnt @0 (i32), size @4 (i32), elems @8 (ptr)
-rd_kafka_topic_partition_t:       topic @0, partition @8 (i32), offset @16 (i64),
-                                  metadata @24, metadata_size @32, opaque @40,
-                                  err @48   -- STRIDE 64
-```
-
-**Stride is 64, not 56** — the same trap as the 32-byte metadata stride, with
-the same failure mode: the first element decodes plausibly, then it walks off.
-
-Offset sentinels: `BEGINNING -2`, `END -1`, `STORED -1000`, `INVALID -1001`.
-Timestamp types: `NOT_AVAILABLE 0`, `CREATE_TIME 1`, `LOG_APPEND_TIME 2`.
-
-Symbols, all verified exported: `rd_kafka_assign`, `_seek_partitions` (prefer
-it over the deprecated per-topic `_seek`), `_position`, `_committed`,
-`_pause_partitions`, `_resume_partitions` (note: **not** `rd_kafka_pause` /
-`_resume`, which do not exist), `_query_watermark_offsets`,
-`_get_watermark_offsets`, `_offsets_for_times`, `_message_timestamp`.
-
-### 2. Batch `consume(n)`
+### 1. Batch `consume(n)`
 
 One call returning up to `n` messages, over `rd_kafka_consume_batch_queue`.
 
 **This is the item where Mojo beats a Python client, so it is worth more here
 than its position in `confluent-kafka` suggests.** `Consumer.poll()` crosses the
-FFI three times per message; a batch crosses once for the whole set and hands
-back a run of records that Mojo can then process without a per-message
-interpreter round trip. For the ML and data pipelines this package is aimed at,
+FFI four times per message — `consumer_poll`, `topic_name`,
+`message_timestamp`, `message_destroy` — where a batch crosses once for the
+whole set and hands back a run of records that Mojo can then process without a
+per-message interpreter round trip. For the ML and data pipelines this package is aimed at,
 that is the difference between "a Kafka client in Mojo" and "a reason to use
 Mojo for Kafka". Ship it with a benchmark against `confluent-kafka`.
 
-### 3. Transactions, for exactly-once
+### 2. Transactions, for exactly-once
 
 `init_transactions` / `begin` / `send_offsets_to_transaction` / `commit` /
 `abort`. The headline correctness feature, and the one most worth having that
@@ -479,9 +638,12 @@ Build it in two steps:
   throwing those bits away. Without them a transactional producer cannot be
   used correctly. Small, and really the unfinished half of `KafkaErrorKind`.
 - **Then producer-only transactions** (atomic multi-topic write), which need
-  nothing else. `send_offsets_to_transaction` comes after item 1: it takes a
-  `rd_kafka_consumer_group_metadata_t*` (not bound) plus the offsets to commit,
-  so read-process-write depends on the consumer control plane.
+  nothing else. `send_offsets_to_transaction` needs one more binding on top:
+  it takes a `rd_kafka_consumer_group_metadata_t*`, and
+  `rd_kafka_consumer_group_metadata` is the one piece of the consumer side
+  still unbound. Everything else read-process-write wants -- the TPL decode,
+  `committed`, the rebalance hooks -- has landed, so this does **not** wait on
+  item 1.
 
 ### Deliberately not chasing
 
@@ -500,3 +662,12 @@ Parity for its own sake costs more than it returns. Currently declined:
 ### Known bugs
 
 None outstanding.
+
+### Known coverage gaps
+
+- **`on_lost` has no test.** The path exists and is documented -- a lost
+  assignment routes there instead of `on_revoke`, falling back to `on_revoke`
+  when it is unset -- but exercising it needs partitions genuinely lost to a
+  session timeout or a coordinator failure, which neither suite forces today.
+  It is the one branch of the rebalance trampoline nothing runs. Whoever
+  makes a broker fail over should add it.

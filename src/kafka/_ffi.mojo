@@ -44,6 +44,10 @@ comptime RD_KAFKA_RESP_ERR_NO_ERROR: Int32 = 0
 comptime RD_KAFKA_RESP_ERR__NOENT: Int32 = -156
 comptime RD_KAFKA_RESP_ERR__TIMED_OUT: Int32 = -185
 comptime RD_KAFKA_RESP_ERR__PARTITION_EOF: Int32 = -191
+# The two codes a rebalance callback branches on. They arrive as the `err`
+# argument and are not failures -- they are the whole message.
+comptime RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS: Int32 = -175
+comptime RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS: Int32 = -174
 # The codes `kind_of` groups. Values taken from the installed rdkafka.h.
 comptime RD_KAFKA_RESP_ERR__TRANSPORT: Int32 = -195
 comptime RD_KAFKA_RESP_ERR__MSG_TIMED_OUT: Int32 = -192
@@ -64,11 +68,6 @@ comptime RD_KAFKA_PARTITION_UA: Int32 = -1
 # key and value can be freed as soon as `produce()` returns. Emitted as a
 # `RD_KAFKA_VTYPE_MSGFLAGS` entry -- see `_VuArray.msgflags`.
 comptime RD_KAFKA_MSG_F_COPY: Int32 = 0x2
-
-# Delivery reports as *events* on the main queue rather than through a C
-# callback. Mojo cannot hand librdkafka a C function pointer, but event
-# sourcing needs none -- `queue_poll` returns the batch and we walk it.
-comptime RD_KAFKA_EVENT_DR: Int32 = 0x1
 
 # rd_kafka_message_t field offsets on 64-bit, confirmed with `offsetof`
 # against rdkafka.h. `err` and `partition` are followed by padding.
@@ -99,6 +98,45 @@ comptime META_TOPICS: Int = 24
 # memory a few topics in.
 comptime META_TOPIC_STRIDE: Int = 32
 
+# rd_kafka_topic_partition_list_t and its elements, probed with
+# `offsetof`/`sizeof` against librdkafka 2.15 rather than reasoned about.
+#
+# The TPL is the currency of the whole consumer control plane: `assign`,
+# `seek`, `position`, `committed`, `pause`/`resume` and `offsets_for_times`
+# all take one, and most of them *fill it in* -- the answer comes back in the
+# same list that carried the question.
+comptime TPL_CNT: Int = 0
+comptime TPL_SIZE: Int = 4
+comptime TPL_ELEMS: Int = 8
+
+# sizeof(rd_kafka_topic_partition_t) is **64**, not the 56 its seven members
+# add up to: `err` at 48 is a 4-byte enum, and the struct ends with an
+# opaque `void *_private` at 56. This is the metadata stride trap again --
+# a 56-byte stride decodes the first element correctly and then walks off.
+comptime TP_TOPIC: Int = 0
+comptime TP_PARTITION: Int = 8
+comptime TP_OFFSET: Int = 16
+comptime TP_METADATA: Int = 24
+comptime TP_METADATA_SIZE: Int = 32
+comptime TP_OPAQUE: Int = 40
+comptime TP_ERR: Int = 48
+comptime TP_STRIDE: Int = 64
+
+# Offset sentinels. These occupy the same `int64_t` as a real offset, which
+# is why an offset field is never just a count -- see `OFFSET_INVALID`, the
+# value `position()` reports for a partition nothing has been read from yet.
+comptime RD_KAFKA_OFFSET_BEGINNING: Int64 = -2
+comptime RD_KAFKA_OFFSET_END: Int64 = -1
+comptime RD_KAFKA_OFFSET_STORED: Int64 = -1000
+comptime RD_KAFKA_OFFSET_INVALID: Int64 = -1001
+
+# rd_kafka_timestamp_type_t. `NOT_AVAILABLE` is what a broker older than
+# 0.10 yields, and it is the reason `Message.timestamp` is paired with a
+# type: -1 is a plausible timestamp only if you do not check.
+comptime RD_KAFKA_TIMESTAMP_NOT_AVAILABLE: Int32 = 0
+comptime RD_KAFKA_TIMESTAMP_CREATE_TIME: Int32 = 1
+comptime RD_KAFKA_TIMESTAMP_LOG_APPEND_TIME: Int32 = 2
+
 # rd_kafka_vtype_t discriminants, for the `vu` entries `_VuArray` builds.
 # Only the ones this package emits are named; the enum has more.
 comptime RD_KAFKA_VTYPE_TOPIC: Int32 = 1
@@ -107,6 +145,7 @@ comptime RD_KAFKA_VTYPE_VALUE: Int32 = 4
 comptime RD_KAFKA_VTYPE_KEY: Int32 = 5
 comptime RD_KAFKA_VTYPE_OPAQUE: Int32 = 6
 comptime RD_KAFKA_VTYPE_MSGFLAGS: Int32 = 7
+comptime RD_KAFKA_VTYPE_TIMESTAMP: Int32 = 8
 comptime RD_KAFKA_VTYPE_HEADERS: Int32 = 10
 
 # rd_kafka_vu_t on 64-bit, confirmed with `offsetof`/`sizeof` against
@@ -128,6 +167,27 @@ comptime VU_WORDS: Int = 9
 comptime VU_VTYPE: Int = 0
 comptime VU_ARG0: Int = 8
 comptime VU_ARG1: Int = 16
+
+
+# The signature librdkafka calls a rebalance callback with:
+#
+#     void (*)(rd_kafka_t *, rd_kafka_resp_err_t,
+#              rd_kafka_topic_partition_list_t *, void *)
+#
+# `thin` because a C callback carries no captured state, and `abi("C")` for
+# the platform calling convention -- Mojo 1.0 can supply both, so this needs
+# no event-queue workaround. Pointers cross as `Int` here as everywhere else.
+comptime RebalanceCallback = def(Int, Int32, Int, Int) thin abi("C") -> None
+
+
+# The signature librdkafka calls a delivery-report callback with:
+#
+#     void (*)(rd_kafka_t *, const rd_kafka_message_t *, void *)
+#
+# One call per produced message, from inside `rd_kafka_poll` /
+# `rd_kafka_flush` on the thread that called them -- never from a background
+# thread, which is what makes it safe to touch Mojo state from here.
+comptime DeliveryCallback = def(Int, Int, Int) thin abi("C") -> None
 
 
 # --- reading foreign memory -------------------------------------------------
@@ -154,6 +214,12 @@ def _load_word(addr: Int) raises -> Int:
 
 def _store_i32(addr: Int, value: Int32):
     Pointer[Int32, MutAnyOrigin](unsafe_from_address=addr)[
+        unsafe_offset=0
+    ] = value
+
+
+def _store_i64(addr: Int, value: Int64):
+    Pointer[Int64, MutAnyOrigin](unsafe_from_address=addr)[
         unsafe_offset=0
     ] = value
 
@@ -316,10 +382,26 @@ struct _VuArray(Movable):
         librdkafka stores this `void *` and hands it back as `_private` on
         the delivery report without ever dereferencing it, so a plain integer
         token is a legitimate value: it never has to point at anything. That
-        is what makes per-message reports reachable without the C function
-        pointer Mojo cannot supply.
+        is what makes per-message reports reachable without a `dr_msg_cb` at
+        all -- which Mojo 1.0 could supply, but this package does not need.
         """
         _store_word(self._entry(RD_KAFKA_VTYPE_OPAQUE) + VU_ARG0, token)
+
+    def timestamp(mut self, milliseconds: Int64) raises:
+        """`RD_KAFKA_VTYPE_TIMESTAMP` -- the record's CreateTime, in ms.
+
+        **0 means "stamp it now"**, which is librdkafka's own rule and the
+        default `confluent-kafka` documents, so the entry is emitted
+        unconditionally rather than only when a caller names a time.
+
+        The vtype is **8**, read off the enum rather than counted: the enum
+        starts at `END = 0` and includes `RKT = 2`, which this package never
+        emits, so the live vtypes are not densely numbered. 2 would pass an
+        `int64` where librdkafka expects a `rd_kafka_topic_t *`.
+        """
+        _store_i64(
+            self._entry(RD_KAFKA_VTYPE_TIMESTAMP) + VU_ARG0, milliseconds
+        )
 
     def headers(mut self, hdrs: Int) raises:
         """`RD_KAFKA_VTYPE_HEADERS` -- a whole `rd_kafka_headers_t`.
@@ -501,9 +583,9 @@ def _bind[
     against librdkafka 2.15 on this machine: 45-55 ns/call resolving per call
     against 1.2-1.5 ns/call resolving once, and through the wrappers below an
     idle `Producer.poll(0)` -- one crossing and nothing else -- went from
-    97-110 ns to 54-56 ns. `Consumer.poll()` crosses three times per message
-    (`consumer_poll`, `topic_name`, `message_destroy`), so name lookup was
-    most of what this binding charged per message.
+    97-110 ns to 54-56 ns. `Consumer.poll()` crosses four times per message
+    (`consumer_poll`, `topic_name`, `message_timestamp`, `message_destroy`),
+    so name lookup was most of what this binding charged per message.
 
     Two details make holding the result possible:
 
@@ -552,7 +634,6 @@ struct Lib(Movable):
     var _conf_new: _DLCallable[Int, ImmUntrackedOrigin]
     var _conf_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _conf_set: _DLCallable[Int32, ImmUntrackedOrigin]
-    var _conf_set_events: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _new: _DLCallable[Int, ImmUntrackedOrigin]
     var _destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _outq_len: _DLCallable[Int32, ImmUntrackedOrigin]
@@ -572,6 +653,25 @@ struct Lib(Movable):
     var _message_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _consumer_close: _DLCallable[Int32, ImmUntrackedOrigin]
     var _commit: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _assign: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _seek_partitions: _DLCallable[Int, ImmUntrackedOrigin]
+    var _position: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _committed: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _pause_partitions: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _resume_partitions: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _query_watermark_offsets: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _get_watermark_offsets: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _offsets_for_times: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _message_timestamp: _DLCallable[Int64, ImmUntrackedOrigin]
+    var _conf_set_rebalance_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _conf_set_dr_msg_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _poll: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _flush: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _conf_set_opaque: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _incremental_assign: _DLCallable[Int, ImmUntrackedOrigin]
+    var _incremental_unassign: _DLCallable[Int, ImmUntrackedOrigin]
+    var _rebalance_protocol: _DLCallable[Int, ImmUntrackedOrigin]
+    var _assignment_lost: _DLCallable[Int32, ImmUntrackedOrigin]
     var _topic_partition_list_new: _DLCallable[Int, ImmUntrackedOrigin]
     var _topic_partition_list_add: _DLCallable[Int, ImmUntrackedOrigin]
     var _topic_partition_list_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
@@ -581,10 +681,6 @@ struct Lib(Movable):
     var _queue_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _queue_poll: _DLCallable[Int, ImmUntrackedOrigin]
     var _event_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
-    var _queue_get_main: _DLCallable[Int, ImmUntrackedOrigin]
-    var _event_type: _DLCallable[Int32, ImmUntrackedOrigin]
-    var _event_message_count: _DLCallable[Int, ImmUntrackedOrigin]
-    var _event_message_next: _DLCallable[Int, ImmUntrackedOrigin]
     var _event_error: _DLCallable[Int32, ImmUntrackedOrigin]
     var _event_error_string: _DLCallable[Int, ImmUntrackedOrigin]
     var _createtopics: _DLCallable[NoneType, ImmUntrackedOrigin]
@@ -607,9 +703,6 @@ struct Lib(Movable):
         self._conf_new = _bind[Int](self._box, "rd_kafka_conf_new")
         self._conf_destroy = _bind[NoneType](self._box, "rd_kafka_conf_destroy")
         self._conf_set = _bind[Int32](self._box, "rd_kafka_conf_set")
-        self._conf_set_events = _bind[NoneType](
-            self._box, "rd_kafka_conf_set_events"
-        )
         self._new = _bind[Int](self._box, "rd_kafka_new")
         self._destroy = _bind[NoneType](self._box, "rd_kafka_destroy")
         self._outq_len = _bind[Int32](self._box, "rd_kafka_outq_len")
@@ -643,6 +736,58 @@ struct Lib(Movable):
             self._box, "rd_kafka_consumer_close"
         )
         self._commit = _bind[Int32](self._box, "rd_kafka_commit")
+        self._assign = _bind[Int32](self._box, "rd_kafka_assign")
+        # `rd_kafka_seek_partitions`, not the per-topic `rd_kafka_seek`:
+        # that one is deprecated, needs a topic handle this package no
+        # longer keeps, and cannot report a per-partition verdict.
+        self._seek_partitions = _bind[Int](
+            self._box, "rd_kafka_seek_partitions"
+        )
+        self._position = _bind[Int32](self._box, "rd_kafka_position")
+        self._committed = _bind[Int32](self._box, "rd_kafka_committed")
+        # Note the `_partitions` suffix on both: `rd_kafka_pause` and
+        # `rd_kafka_resume` do not exist.
+        self._pause_partitions = _bind[Int32](
+            self._box, "rd_kafka_pause_partitions"
+        )
+        self._resume_partitions = _bind[Int32](
+            self._box, "rd_kafka_resume_partitions"
+        )
+        self._query_watermark_offsets = _bind[Int32](
+            self._box, "rd_kafka_query_watermark_offsets"
+        )
+        self._get_watermark_offsets = _bind[Int32](
+            self._box, "rd_kafka_get_watermark_offsets"
+        )
+        self._offsets_for_times = _bind[Int32](
+            self._box, "rd_kafka_offsets_for_times"
+        )
+        self._message_timestamp = _bind[Int64](
+            self._box, "rd_kafka_message_timestamp"
+        )
+        self._conf_set_rebalance_cb = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_rebalance_cb"
+        )
+        self._conf_set_dr_msg_cb = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_dr_msg_cb"
+        )
+        self._poll = _bind[Int32](self._box, "rd_kafka_poll")
+        self._flush = _bind[Int32](self._box, "rd_kafka_flush")
+        self._conf_set_opaque = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_opaque"
+        )
+        self._incremental_assign = _bind[Int](
+            self._box, "rd_kafka_incremental_assign"
+        )
+        self._incremental_unassign = _bind[Int](
+            self._box, "rd_kafka_incremental_unassign"
+        )
+        self._rebalance_protocol = _bind[Int](
+            self._box, "rd_kafka_rebalance_protocol"
+        )
+        self._assignment_lost = _bind[Int32](
+            self._box, "rd_kafka_assignment_lost"
+        )
         self._topic_partition_list_new = _bind[Int](
             self._box, "rd_kafka_topic_partition_list_new"
         )
@@ -663,14 +808,6 @@ struct Lib(Movable):
         self._queue_poll = _bind[Int](self._box, "rd_kafka_queue_poll")
         self._event_destroy = _bind[NoneType](
             self._box, "rd_kafka_event_destroy"
-        )
-        self._queue_get_main = _bind[Int](self._box, "rd_kafka_queue_get_main")
-        self._event_type = _bind[Int32](self._box, "rd_kafka_event_type")
-        self._event_message_count = _bind[Int](
-            self._box, "rd_kafka_event_message_count"
-        )
-        self._event_message_next = _bind[Int](
-            self._box, "rd_kafka_event_message_next"
         )
         self._event_error = _bind[Int32](self._box, "rd_kafka_event_error")
         self._event_error_string = _bind[Int](
@@ -743,11 +880,6 @@ struct Lib(Movable):
             var msg = cstr(Int(errbuf.unsafe_ptr()))
             raise Error("rd_kafka_conf_set(" + name + "=" + value + "): " + msg)
 
-    def conf_set_events(self, conf: Int, events: Int32) raises:
-        """Route the given event types to the main queue instead of callbacks.
-        """
-        _ = self._conf_set_events(conf, events)
-
     # -- rd_kafka_t ---------------------------------------------------------
 
     def new_client(self, kind: Int32, conf: Int) raises -> Int:
@@ -766,6 +898,27 @@ struct Lib(Movable):
 
     def outq_len(self, rk: Int) raises -> Int32:
         return self._outq_len(rk)
+
+    def poll(self, rk: Int, timeout_ms: Int32) raises -> Int32:
+        """Serve the client's callbacks. Returns how many events it ran.
+
+        Delivery reports arrive through this, on **this** thread -- librdkafka
+        never invokes a callback from one of its background threads.
+        """
+        return self._poll(rk, timeout_ms)
+
+    def flush(self, rk: Int, timeout_ms: Int32) raises -> Int32:
+        """Block until every produced message has been acknowledged.
+
+        Serves delivery-report callbacks while it waits, so it needs no
+        second thread. This was unusable while delivery reports were routed
+        to the main queue as events -- `rd_kafka_outq_len` counted undrained
+        events as outstanding, so it sat until its timeout -- and became
+        correct again when they moved to a `dr_msg_cb`.
+
+        Returns `__TIMED_OUT` if anything is still queued at the deadline.
+        """
+        return self._flush(rk, timeout_ms)
 
     # -- topics -------------------------------------------------------------
 
@@ -876,8 +1029,9 @@ struct Lib(Movable):
     def consumer_close(self, rk: Int) raises -> Int32:
         return self._consumer_close(rk)
 
-    def commit(self, rk: Int, async_: Int32) raises -> Int32:
-        return self._commit(rk, 0, async_)
+    def commit(self, rk: Int, offsets: Int, async_: Int32) raises -> Int32:
+        """Commit `offsets`, or the current assignment's when it is 0."""
+        return self._commit(rk, offsets, async_)
 
     # -- topic partition lists ----------------------------------------------
 
@@ -885,17 +1039,195 @@ struct Lib(Movable):
         return self._topic_partition_list_new(size)
 
     def topic_partition_list_add(
-        self, list: Int, topic: String, partition: Int32
+        self,
+        list: Int,
+        topic: String,
+        partition: Int32,
+        offset: Int64 = RD_KAFKA_OFFSET_INVALID,
     ) raises -> Int:
+        """Append one topic+partition and return its element address.
+
+        `offset` is written straight into the new element rather than
+        through `rd_kafka_topic_partition_list_set_offset`, which would only
+        look the element back up by name. `RD_KAFKA_OFFSET_INVALID` is what
+        librdkafka initialises the field to, so the default is a no-op.
+
+        **The returned address is only valid until the next add.** The list
+        grows by reallocating its `elems` array, so an address kept across a
+        second add dangles -- the `_VuArray` trap one library down. Write to
+        the element now, or size the list with `topic_partition_list_new`
+        and re-derive the address with `topic_partition_list_elem`.
+        """
         var topic_c = _c_string(topic)
         var tp = self._topic_partition_list_add(
             list, topic_c.unsafe_ptr(), partition
         )
         _ = topic_c^
+        if tp != 0 and offset != RD_KAFKA_OFFSET_INVALID:
+            _store_i64(tp + TP_OFFSET, offset)
         return tp
 
     def topic_partition_list_destroy(self, list: Int) raises:
         _ = self._topic_partition_list_destroy(list)
+
+    def topic_partition_list_count(self, list: Int) raises -> Int:
+        """How many elements the list holds. 0 for a NULL list."""
+        if list == 0:
+            return 0
+        return Int(_load_i32(list + TPL_CNT))
+
+    def topic_partition_list_elem(self, list: Int, i: Int) raises -> Int:
+        """Address of element `i`, or 0 if the list is NULL.
+
+        The stride is 64 and not the 56 the members add up to -- see
+        `TP_STRIDE`. Nothing bounds-checks `i`; callers walk to
+        `topic_partition_list_count`.
+        """
+        if list == 0:
+            return 0
+        return _load_word(list + TPL_ELEMS) + i * TP_STRIDE
+
+    # -- consumer control plane ---------------------------------------------
+    #
+    # Every call here takes a `rd_kafka_topic_partition_list_t*`, and most of
+    # them answer *into it* rather than through their return value: the
+    # return code says whether the request as a whole worked, while the
+    # per-partition verdict lands in each element's `err`. Reading only the
+    # return code is the same mistake as reading only `rd_kafka_event_error`
+    # on a CreateTopics reply.
+
+    def assign(self, rk: Int, list: Int) raises -> Int32:
+        """Set the whole assignment. `list` of 0 clears it."""
+        return self._assign(rk, list)
+
+    def seek_partitions(
+        self, rk: Int, list: Int, timeout_ms: Int32
+    ) raises -> Int:
+        """Returns a `rd_kafka_error_t*` -- **NULL on success**.
+
+        Same reversed polarity as `produceva`, and the same disposal: hand a
+        non-NULL result to `take_error`. Per-partition results are written
+        back into `list`.
+        """
+        return self._seek_partitions(rk, list, timeout_ms)
+
+    def position(self, rk: Int, list: Int) raises -> Int32:
+        return self._position(rk, list)
+
+    def committed(self, rk: Int, list: Int, timeout_ms: Int32) raises -> Int32:
+        return self._committed(rk, list, timeout_ms)
+
+    def pause_partitions(self, rk: Int, list: Int) raises -> Int32:
+        return self._pause_partitions(rk, list)
+
+    def resume_partitions(self, rk: Int, list: Int) raises -> Int32:
+        return self._resume_partitions(rk, list)
+
+    def query_watermark_offsets(
+        self,
+        rk: Int,
+        topic: String,
+        partition: Int32,
+        low_out: Int,
+        high_out: Int,
+        timeout_ms: Int32,
+    ) raises -> Int32:
+        """Ask the broker for the partition's low and high offsets."""
+        var topic_c = _c_string(topic)
+        var rc = self._query_watermark_offsets(
+            rk, topic_c.unsafe_ptr(), partition, low_out, high_out, timeout_ms
+        )
+        _ = topic_c^
+        return rc
+
+    def get_watermark_offsets(
+        self,
+        rk: Int,
+        topic: String,
+        partition: Int32,
+        low_out: Int,
+        high_out: Int,
+    ) raises -> Int32:
+        """The watermarks this client already cached -- no broker round trip."""
+        var topic_c = _c_string(topic)
+        var rc = self._get_watermark_offsets(
+            rk, topic_c.unsafe_ptr(), partition, low_out, high_out
+        )
+        _ = topic_c^
+        return rc
+
+    def offsets_for_times(
+        self, rk: Int, list: Int, timeout_ms: Int32
+    ) raises -> Int32:
+        """Each element's `offset` is a millisecond timestamp on the way in
+        and the first offset at or after it on the way out."""
+        return self._offsets_for_times(rk, list, timeout_ms)
+
+    def message_timestamp(self, msg: Int, tstype_out: Int) raises -> Int64:
+        """Milliseconds since the epoch, or -1 when the broker sent none."""
+        return self._message_timestamp(msg, tstype_out)
+
+    # -- rebalance ----------------------------------------------------------
+    #
+    # These are set on the *conf*, before `rd_kafka_new`, and only ever fire
+    # for a consumer that `subscribe`d -- a manual `assign` never rebalances.
+    #
+    # Registering a callback **takes the assignment over**: librdkafka stops
+    # assigning by itself the moment one is set, so the callback must settle
+    # every rebalance or the consumer silently stops consuming. That failure
+    # is a stall, not an exception. See `_rebalance_trampoline`.
+
+    def conf_set_dr_msg_cb(self, conf: Int, callback: DeliveryCallback) raises:
+        """Install the C delivery-report callback.
+
+        One call per produced message, delivered from inside `poll` or
+        `flush`. See `_delivery_trampoline` in `producer.mojo`.
+        """
+        _ = self._conf_set_dr_msg_cb(conf, callback)
+
+    def conf_set_rebalance_cb(
+        self, conf: Int, callback: RebalanceCallback
+    ) raises:
+        """Install the C rebalance callback.
+
+        `callback` is an `abi("C")` Mojo function, passed as a value rather
+        than an address -- Mojo 1.0 can supply one, so this needs no
+        event-queue workaround. See "C callbacks are possible in 1.0" in
+        CLAUDE.md.
+        """
+        _ = self._conf_set_rebalance_cb(conf, callback)
+
+    def conf_set_opaque(self, conf: Int, opaque: Int) raises:
+        """The `void *` handed back to the callback.
+
+        A thin C callback captures nothing, so this pointer is the only
+        route from inside one back to Mojo state.
+        """
+        _ = self._conf_set_opaque(conf, opaque)
+
+    def incremental_assign(self, rk: Int, list: Int) raises -> Int:
+        """Add partitions to the assignment -- COOPERATIVE protocol only.
+
+        Returns a `rd_kafka_error_t*`, NULL on success.
+        """
+        return self._incremental_assign(rk, list)
+
+    def incremental_unassign(self, rk: Int, list: Int) raises -> Int:
+        """Remove partitions from the assignment -- COOPERATIVE only."""
+        return self._incremental_unassign(rk, list)
+
+    def rebalance_protocol(self, rk: Int) raises -> String:
+        """ "EAGER", "COOPERATIVE", or "NONE" when there is no group."""
+        return cstr(self._rebalance_protocol(rk))
+
+    def assignment_lost(self, rk: Int) raises -> Bool:
+        """True when partitions were lost involuntarily.
+
+        Committing offsets for a lost partition may fail -- another member
+        may already own it -- which is why it routes to `on_lost` rather
+        than `on_revoke`.
+        """
+        return self._assignment_lost(rk) != 0
 
     # -- admin --------------------------------------------------------------
 
@@ -932,20 +1264,6 @@ struct Lib(Movable):
 
     def event_destroy(self, ev: Int) raises:
         _ = self._event_destroy(ev)
-
-    def queue_get_main(self, rk: Int) raises -> Int:
-        """A new reference to the main queue -- destroy it before the client."""
-        return self._queue_get_main(rk)
-
-    def event_type(self, ev: Int) raises -> Int32:
-        return self._event_type(ev)
-
-    def event_message_count(self, ev: Int) raises -> Int:
-        return self._event_message_count(ev)
-
-    def event_message_next(self, ev: Int) raises -> Int:
-        """Next `rd_kafka_message_t*` in a DR batch; owned by the event."""
-        return self._event_message_next(ev)
 
     def event_error(self, ev: Int) raises -> Int32:
         return self._event_error(ev)

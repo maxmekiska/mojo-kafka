@@ -115,6 +115,11 @@ name and preserves the order, both of which a `Dict` would quietly drop. A
 header value is `Optional` too, and follows the same null-versus-empty rule as
 the key and the value.
 
+`produce()` also takes `timestamp=` — the record's CreateTime in milliseconds
+since the epoch, where **0 (the default) means now**, exactly as
+`confluent-kafka` documents it. Set it when the event time is not the time
+you are publishing.
+
 ### Consume
 
 ```mojo
@@ -140,6 +145,86 @@ def main() raises:
 decode UTF-8 for the common case and take a `default` for the null one;
 `msg.is_tombstone()` asks the question directly.
 
+### Replay, lag, and bounded drains
+
+`subscribe()` hands partition assignment to the group. `assign()` takes it
+back, which is what replay and lag measurement need:
+
+```mojo
+from kafka import (
+    OFFSET_BEGINNING, Consumer, ConsumerConfig, TopicPartition,
+)
+
+def main() raises:
+    var c = Consumer(ConsumerConfig(
+        bootstrap_servers="localhost:9092",
+        group_id="my-app",
+        enable_partition_eof=True,      # so EOF is not just a timeout
+    ))
+    var only: List[TopicPartition] = [
+        TopicPartition("events", 0, OFFSET_BEGINNING)
+    ]
+    c.assign(only)
+
+    while True:
+        var event = c.poll_event(1000)
+        if event.eof:
+            break                       # caught up — this is a bounded drain
+        if event.message:
+            ref msg = event.message.value()
+            print(msg.offset, msg.timestamp, msg.value_text())
+
+    # Lag: how far behind the end of the partition this consumer is.
+    var marks = c.query_watermark_offsets("events", 0)
+    print("lag:", marks.high - c.position(only)[0].offset)
+
+    c.seek([TopicPartition("events", 0, 4096)])   # replay from an offset
+    c.close()
+```
+
+`enable_partition_eof` is off by default, matching librdkafka — without it
+`poll_event()` reports a timeout where it would otherwise report EOF, and the
+loop above never terminates. A tail-following job wants it off.
+
+### Rebalance handlers
+
+When the group moves partitions between members, `on_revoke` is the last
+moment a member's offsets are still its own to commit, and `on_assign` is
+the chance to start somewhere other than the group's commit:
+
+```mojo
+from kafka import Consumer, ConsumerConfig, Rebalance, TopicPartition
+
+def commit_before_losing_them(event: Rebalance) raises:
+    event.commit()
+
+def start_from_my_store(event: Rebalance) raises:
+    var start_at = List[TopicPartition]()
+    for tp in event.partitions:
+        start_at.append(TopicPartition(tp.topic, tp.partition, lookup(tp)))
+    event.assign(start_at)
+
+c.subscribe(["events"],
+            on_assign=start_from_my_store,
+            on_revoke=commit_before_losing_them)
+```
+
+Same signature as `confluent-kafka`, and the same rule: **a handler need not
+assign anything.** Doing nothing gets the default assignment, so a handler
+is an opportunity to intervene rather than an obligation to reimplement.
+
+A handler must be a top-level `def`, not a closure — it is called from a C
+callback, which carries no captured state, so everything it needs arrives on
+the `Rebalance` it is given. `on_lost` takes over from `on_revoke` when
+partitions were lost involuntarily; without one, lost assignments fall
+through to `on_revoke`.
+
+`position()` is local and immediate; `committed()` asks the broker what the
+*group* has stored, which is a different number whenever anything has been
+consumed since the last commit. `offsets_for_times()` maps a wall-clock
+millisecond onto the first offset at or after it, for replaying from a point
+in time rather than an offset.
+
 ### Admin
 
 ```mojo
@@ -161,9 +246,14 @@ See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipel
 | `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, and `poll_event()` |
+| `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
+| `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
+| `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
+| `PollEvent` | What one `poll_event()` turned up: a `message`, an `eof` mark, or `is_timeout()` |
+| `Rebalance` | Context handed to an `on_assign` / `on_revoke` / `on_lost` handler: `partitions`, `lost`, plus `assign()` / `unassign()` / `commit()` / `protocol()` |
 | `AdminClient` | Create / list topics |
-| `Message` | `topic`, `partition`, `offset`, `key`, `value` as `Optional[List[UInt8]]`, `headers` as `List[Header]`; `key_text()` / `value_text()` / `is_tombstone()` / `header()` / `header_text()` |
+| `Message` | `topic`, `partition`, `offset`, `key`, `value` as `Optional[List[UInt8]]`, `headers` as `List[Header]`, `timestamp` + `timestamp_type`; `key_text()` / `value_text()` / `is_tombstone()` / `has_timestamp()` / `header()` / `header_text()` |
 | `Header` | One record header: `name`, plus an `Optional` byte `value` and `value_text()` |
 | `KafkaError` | Raised with `librdkafka` error code + human description; `kind()` for the branchable category |
 | `KafkaErrorKind` | Eight tags — `KIND_QUEUE_FULL`, `KIND_TIMED_OUT`, … — for handling rather than reporting |
@@ -234,10 +324,8 @@ transposed the key and value of every message it produced, and both
 
 Known limitations today:
 
-- No transactional producer, no manual partition assignment or `seek()`, and
-  `Message` carries no `timestamp` yet.
-- `poll()` returns `None` both on timeout and at end-of-partition, so a job
-  that drains to the end of a partition cannot tell the two apart.
+- No transactional producer, and no batch `consume(n)` — `poll()` is still one
+  message per call.
 - `AdminClient` does create and list only — no delete, alter, configs,
   partitions, consumer groups or ACLs.
 - Retiring the topic-handle cache removed the Mojo-side state that made
@@ -271,17 +359,24 @@ people do from a CLI or Terraform.
   `Producer.failures()` reports every rejection against it, so a message's
   verdict is addressable rather than a count plus the first failure string.
   Also: a typed `KafkaErrorKind`, so queue-full backpressure can be handled
-  programmatically rather than by matching on error text.
-- **v0.3 — consumer control plane.** `assign()`, `seek()`, `position()`,
+  programmatically rather than by matching on error text. Also: the
+  **consumer control plane** — `assign()`, `seek()`, `position()`,
   `committed()`, `pause()` / `resume()`, watermark offsets,
-  `Message.timestamp`, and end-of-partition told apart from a poll timeout.
-  Unblocks replay, lag measurement, event-time processing and bounded drains,
-  none of which are reachable today.
-- **v0.4 — batch `consume(n)`.** One FFI crossing for a whole batch instead of
+  `Message.timestamp` and `offsets_for_times()`, plus `poll_event()`, which
+  tells end-of-partition apart from a poll timeout. That unblocks replay, lag
+  measurement, event-time processing and bounded drains, none of which were
+  reachable before. Also: **rebalance callbacks** —
+  `subscribe(topics, on_assign=, on_revoke=, on_lost=)`, matching
+  `confluent-kafka`'s signature — built on a real C function pointer via
+  Mojo 1.0's `abi("C")` effect. Also: `produce(timestamp=)`, completing the
+  event-time pair with `Message.timestamp`. Also: delivery reports moved from
+  librdkafka's event queue to a `dr_msg_cb`, so both callback paths in the
+  package now work the same way.
+- **v0.3 — batch `consume(n)`.** One FFI crossing for a whole batch instead of
   three per message. This is the item where Mojo beats a Python client, so it
   ranks higher here than its place in `confluent-kafka` would suggest; it ships
   with a benchmark.
-- **v0.5 — transactions, for exactly-once.** `init_transactions` / `begin` /
+- **v0.4 — transactions, for exactly-once.** `init_transactions` / `begin` /
   `send_offsets_to_transaction` / `commit` / `abort`. Gated on binding
   librdkafka's error predicates (`is_fatal` / `is_retriable` /
   `txn_requires_abort`), which a transactional caller must branch on.

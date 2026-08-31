@@ -7,13 +7,26 @@ everywhere, including macOS CI runners where Docker is not available.
 
     pixi run test-mock
 
-The mock does not implement the Topic Admin API, so `AdminClient`'s
-topic *creation* is covered in `test_broker.mojo` instead.
+Two things the mock does not implement, both covered in `test_broker.mojo`
+instead:
+
+- the Topic Admin API, so `AdminClient`'s topic *creation* is not reachable
+  here;
+- **ListOffsets by timestamp**, which it answers with `OFFSET_END` for every
+  timestamp -- including ones that plainly precede every record on the
+  partition. It reports no error doing so, so a `offsets_for_times` test
+  written here would pass against an implementation that always returned
+  `OFFSET_END` and against one that worked.
 """
 
 from std.testing import TestSuite, assert_equal, assert_true
 
 from kafka import (
+    OFFSET_BEGINNING,
+    Rebalance,
+    OFFSET_END,
+    OFFSET_INVALID,
+    TIMESTAMP_CREATE_TIME,
     AdminClient,
     Consumer,
     ConsumerConfig,
@@ -21,6 +34,7 @@ from kafka import (
     Message,
     Producer,
     ProducerConfig,
+    TopicPartition,
 )
 from kafka.testing import MockCluster
 
@@ -524,6 +538,604 @@ def test_delivered_messages_report_no_failures() raises:
 
     print("    8 delivered, 0 reports, 8 distinct tokens")
     _ = cluster^
+
+
+def test_position_walks_every_partition() raises:
+    """Regression guard for the topic-partition stride.
+
+    `sizeof(rd_kafka_topic_partition_t)` is 64, not the 56 its members add
+    up to -- there is a trailing `void *_private`. A 56-byte stride decodes
+    the first element correctly and then drifts, exactly like the 24-byte
+    metadata stride did, so this needs enough partitions to make the drift
+    unmistakable rather than plausible.
+
+    Asserting that entry `i` comes back as partition `i` is what catches it:
+    a wrong stride returns *something* for every entry, just not the right
+    thing.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("stride-tp", partition_count=12)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="stride-tp-group",
+            auto_offset_reset="earliest",
+        )
+    )
+
+    var wanted = List[TopicPartition]()
+    for p in range(12):
+        wanted.append(TopicPartition("stride-tp", Int32(p), OFFSET_BEGINNING))
+    consumer.assign(wanted)
+
+    var got = consumer.position(wanted)
+    assert_equal(len(got), 12)
+    for i in range(12):
+        assert_equal(got[i].topic, "stride-tp")
+        assert_equal(Int(got[i].partition), i)
+
+    consumer.close()
+    print("    decoded 12 partitions without stride drift")
+    _ = cluster^
+
+
+def test_assign_and_seek_replay_from_an_offset() raises:
+    """Replay: the workload `assign` and `seek` exist for.
+
+    Consumes a partition to the end, then seeks back into the middle of it
+    and checks the *same* records come back from there -- which is the whole
+    point, and which a seek that silently did nothing would fail. Both the
+    absolute offset and `OFFSET_BEGINNING` are exercised, because they take
+    different paths through librdkafka.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("replay", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(10):
+        _ = producer.produce(topic="replay", value="r-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="replay-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    # `assign`, not `subscribe`: this consumer names its own partition.
+    var at_start: List[TopicPartition] = [
+        TopicPartition("replay", 0, OFFSET_BEGINNING)
+    ]
+    consumer.assign(at_start)
+
+    var first_pass = _drain(consumer, 10)
+    assert_equal(len(first_pass), 10)
+    assert_equal(first_pass[0].offset, Int64(0))
+    assert_equal(first_pass[9].value_text(), "r-9")
+
+    # Back to the middle. The partition is assigned and has been fetched
+    # from, which is the state `seek_partitions` requires.
+    consumer.seek([TopicPartition("replay", 0, 5)])
+    var replayed = _drain(consumer, 5)
+    assert_equal(len(replayed), 5)
+    assert_equal(replayed[0].offset, Int64(5))
+    assert_equal(replayed[0].value_text(), "r-5")
+    assert_equal(replayed[4].value_text(), "r-9")
+
+    # And all the way back to the start.
+    consumer.seek([TopicPartition("replay", 0, OFFSET_BEGINNING)])
+    var from_start = _drain(consumer, 1)
+    assert_equal(len(from_start), 1)
+    assert_equal(from_start[0].offset, Int64(0))
+
+    consumer.close()
+    print("    replayed from offset 5 and from the beginning")
+    _ = cluster^
+
+
+def test_position_and_watermarks_measure_lag() raises:
+    """Lag is `high watermark - position`, and both halves must be real.
+
+    The two are read through completely different paths -- `position` is
+    local state, the watermarks come from the broker -- so a test that only
+    checked one would pass with the other returning a plausible constant.
+    This pins both against a partition whose contents it chose.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("lag", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(20):
+        _ = producer.produce(topic="lag", value="m-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="lag-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    var only: List[TopicPartition] = [
+        TopicPartition("lag", 0, OFFSET_BEGINNING)
+    ]
+    consumer.assign(only)
+
+    # Nothing read yet: position is INVALID, not 0. The difference matters --
+    # 0 would claim 20 records of lag on a partition we have not started.
+    var before = consumer.position(only)
+    assert_equal(len(before), 1)
+    assert_equal(before[0].offset, OFFSET_INVALID)
+
+    var consumed = _drain(consumer, 8)
+    assert_equal(len(consumed), 8)
+
+    var after = consumer.position(only)
+    assert_equal(after[0].offset, Int64(8))
+    assert_true(not after[0].has_error(), "position reported a partition error")
+
+    var marks = consumer.query_watermark_offsets("lag", 0)
+    assert_equal(marks.low, Int64(0))
+    assert_equal(marks.high, Int64(20))
+    assert_true(not marks.is_empty(), "a 20-record partition read as empty")
+    assert_equal(marks.high - after[0].offset, Int64(12))
+
+    # The cached watermarks are a by-product of fetching, so they are only
+    # available once this consumer has actually fetched -- which it has.
+    var cached = consumer.get_watermark_offsets("lag", 0)
+    assert_equal(cached.high, Int64(20))
+
+    consumer.close()
+    print("    position 8 of 20, lag 12, watermarks [0, 20)")
+    _ = cluster^
+
+
+def test_committed_is_not_position() raises:
+    """The group's committed offset and this consumer's position differ.
+
+    Everything consumed since the last commit sits between them, so a test
+    that only checked they were equal after a commit would pass for an
+    implementation that returned `position` from both. This reads them at a
+    point where the right answers are different numbers.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("committed", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(10):
+        _ = producer.produce(topic="committed", value="c-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="committed-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+    )
+    var only: List[TopicPartition] = [
+        TopicPartition("committed", 0, OFFSET_BEGINNING)
+    ]
+    consumer.assign(only)
+
+    # Nothing committed by this group yet.
+    var fresh = consumer.committed(only)
+    assert_equal(len(fresh), 1)
+    assert_equal(fresh[0].topic, "committed")
+    assert_equal(fresh[0].offset, OFFSET_INVALID)
+
+    assert_equal(len(_drain(consumer, 4)), 4)
+    consumer.commit()
+
+    var stored = consumer.committed(only)
+    assert_equal(stored[0].offset, Int64(4))
+
+    # Read four more without committing: position moves, the commit does not.
+    assert_equal(len(_drain(consumer, 4)), 4)
+    assert_equal(consumer.position(only)[0].offset, Int64(8))
+    assert_equal(consumer.committed(only)[0].offset, Int64(4))
+
+    consumer.close()
+    print("    committed stayed at 4 while position reached 8")
+    _ = cluster^
+
+
+def test_pause_stops_the_flow_and_resume_restarts_it() raises:
+    """Paused partitions stop delivering; resumed ones pick up where they
+    stopped.
+
+    The consumer is assigned at `OFFSET_END` and paused *before* anything it
+    could read exists, then the records are produced. That ordering is what
+    makes the assertion sound: with records already on the partition, a
+    fetch could have buffered them locally before the pause landed, and
+    `poll` would keep handing those out however correct the pause was.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("paused", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="paused", value="before-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="paused-group",
+            auto_offset_reset="latest",
+        )
+    )
+    var only: List[TopicPartition] = [TopicPartition("paused", 0, OFFSET_END)]
+    consumer.assign(only)
+    # Let the assignment settle. Nothing should arrive: the three records
+    # above are behind OFFSET_END.
+    for _ in range(3):
+        assert_true(not consumer.poll(timeout_ms=300), "OFFSET_END delivered")
+
+    consumer.pause(only)
+
+    for i in range(5):
+        _ = producer.produce(topic="paused", value="after-" + String(i))
+    producer.flush(10000)
+
+    for _ in range(6):
+        assert_true(
+            not consumer.poll(timeout_ms=300), "a paused partition delivered"
+        )
+
+    consumer.resume(only)
+    var got = _drain(consumer, 5)
+    assert_equal(len(got), 5)
+    assert_equal(got[0].value_text(), "after-0")
+    assert_equal(got[4].value_text(), "after-4")
+
+    consumer.close()
+    print("    5 records withheld while paused, all 5 after resume")
+    _ = cluster^
+
+
+def test_partition_eof_is_distinguishable_from_a_timeout() raises:
+    """ "Caught up" and "nothing arrived" are different answers.
+
+    Both come back from `poll()` as `None`, which is why a bounded drain was
+    impossible before `poll_event`. This asserts both halves of the split:
+    the same drained partition reports an EOF mark to a consumer configured
+    for it, and a plain timeout to one that is not. Checking only the first
+    would pass for an implementation that reported EOF unconditionally.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("eof", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(4):
+        _ = producer.produce(topic="eof", value="e-" + String(i))
+    producer.flush(10000)
+
+    var bounded = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="eof-group",
+            auto_offset_reset="earliest",
+            enable_partition_eof=True,
+        )
+    )
+    bounded.assign([TopicPartition("eof", 0, OFFSET_BEGINNING)])
+
+    var seen = 0
+    var hit_eof = False
+    for _ in range(60):
+        var event = bounded.poll_event(timeout_ms=1000)
+        if event.eof:
+            ref at = event.eof.value()
+            assert_equal(at.topic, "eof")
+            assert_equal(Int(at.partition), 0)
+            # The EOF mark carries where the partition ends, which is the
+            # offset the next record written will get -- 4, not 3.
+            assert_equal(at.offset, Int64(4))
+            hit_eof = True
+            break
+        if event.message:
+            assert_equal(
+                event.message.value().value_text(), "e-" + String(seen)
+            )
+            seen += 1
+
+    assert_equal(seen, 4)
+    assert_true(hit_eof, "drained partition never reported end-of-partition")
+    bounded.close()
+
+    # The other half: without the flag the same drain only ever times out.
+    var tailing = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="eof-tail-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    tailing.assign([TopicPartition("eof", 0, OFFSET_BEGINNING)])
+    assert_equal(len(_drain(tailing, 4)), 4)
+    for _ in range(4):
+        var event = tailing.poll_event(timeout_ms=500)
+        assert_true(not event.eof, "EOF reported without enable_partition_eof")
+        assert_true(event.is_timeout(), "idle poll was not a timeout")
+
+    tailing.close()
+    print("    EOF at offset 4 with the flag, plain timeouts without it")
+    _ = cluster^
+
+
+def test_message_timestamps_are_populated() raises:
+    """Event-time processing needs a timestamp and needs to know its clock.
+
+    `timestamp` is asserted through `has_timestamp()` rather than against
+    -1: -1 is a legal `int64` millisecond value, so the type is the only
+    field that actually answers whether there is a timestamp at all.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("stamped", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="stamped", value="t-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="stamped-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.assign([TopicPartition("stamped", 0, OFFSET_BEGINNING)])
+
+    var got = _drain(consumer, 3)
+    assert_equal(len(got), 3)
+    for m in got:
+        assert_true(m.has_timestamp(), "record carried no timestamp")
+        # The producer stamped these, so it is create time and not the
+        # broker's log-append time.
+        assert_equal(m.timestamp_type, TIMESTAMP_CREATE_TIME)
+        # Bounded rather than compared to a clock: after 2020-09-13 and
+        # before 2100-01-01, which no plausible garbage read satisfies.
+        assert_true(m.timestamp > 1600000000000, "timestamp before 2020")
+        assert_true(m.timestamp < 4102444800000, "timestamp after 2100")
+
+    # Written in order, so stamped in order.
+    assert_true(got[0].timestamp <= got[1].timestamp, "timestamps went back")
+    assert_true(got[1].timestamp <= got[2].timestamp, "timestamps went back")
+
+    consumer.close()
+    print("    3 records carried create-time timestamps in order")
+    _ = cluster^
+
+
+def test_produced_timestamp_is_preserved() raises:
+    """An explicit CreateTime survives the round trip.
+
+    The reason `produce(timestamp=)` exists: replaying an archive, or
+    forwarding records from another system, where the event time is not the
+    time you happen to be publishing. Two fixed values in the past are used
+    rather than a clock, so "preserved" means equal to a number this test
+    chose -- a client that ignored the argument would stamp `now` and fail.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("stamps", partition_count=1)
+
+    # 2021-01-01 and 2021-06-01, in milliseconds.
+    var first = Int64(1609459200000)
+    var second = Int64(1622505600000)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(topic="stamps", value="a", timestamp=first)
+    _ = producer.produce(topic="stamps", value="b", timestamp=second)
+    # And one without, which must be stamped now rather than 0.
+    _ = producer.produce(topic="stamps", value="c")
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="stamps-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.assign([TopicPartition("stamps", 0, OFFSET_BEGINNING)])
+
+    var got = _drain(consumer, 3)
+    assert_equal(len(got), 3)
+    for m in got:
+        assert_true(m.has_timestamp(), "record carried no timestamp")
+        assert_equal(m.timestamp_type, TIMESTAMP_CREATE_TIME)
+
+    assert_equal(got[0].timestamp, first)
+    assert_equal(got[1].timestamp, second)
+    # The default is "now", not 0 -- 0 would be 1970 and is what a missing
+    # vu entry, or one written at the wrong offset, would look like.
+    assert_true(got[2].timestamp > second, "default timestamp was not now")
+
+    consumer.close()
+    print("    two chosen timestamps preserved, the default stamped now")
+    _ = cluster^
+
+
+def _noop_handler(event: Rebalance) raises:
+    """An `on_assign` that looks and does nothing.
+
+    Which must still leave the consumer assigned -- see the test below.
+    """
+    pass
+
+
+def _assign_from_offset_three(event: Rebalance) raises:
+    """An `on_assign` that starts somewhere other than the group's commit.
+
+    The shape a job with its own offset store uses: rewrite the offsets on
+    the partitions being handed over, then assign those instead.
+    """
+    var start_at = List[TopicPartition]()
+    for tp in event.partitions:
+        start_at.append(TopicPartition(tp.topic, tp.partition, 3))
+    event.assign(start_at)
+
+
+def _commit_on_revoke(event: Rebalance) raises:
+    """An `on_revoke` that commits before the partitions move elsewhere."""
+    event.commit()
+
+
+def test_rebalance_handler_that_does_nothing_still_gets_assigned() raises:
+    """A handler is an opportunity, not an obligation.
+
+    Registering a rebalance callback stops librdkafka assigning by itself,
+    so a handler that only looks would strand the consumer with no
+    partitions -- a silent stall, not an error. `_rebalance_trampoline`
+    applies the default whenever the handler did not.
+
+    Measured against `confluent-kafka` 2.15, whose `on_assign` likewise need
+    not call `assign()` for records to flow.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("rb-default", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(5):
+        _ = producer.produce(topic="rb-default", value="d-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="rb-default-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["rb-default"], on_assign=_noop_handler)
+
+    var got = _drain(consumer, 5)
+    assert_equal(len(got), 5)
+    assert_equal(got[0].offset, Int64(0))
+    assert_equal(got[4].value_text(), "d-4")
+
+    consumer.close()
+    print("    a no-op on_assign still received all 5 records")
+    _ = cluster^
+
+
+def test_rebalance_handler_can_choose_the_starting_offset() raises:
+    """`on_assign` can start the consumer somewhere else.
+
+    This is what the handler is *for*, and it is asserted through the
+    records that actually arrive rather than a flag saying the handler ran:
+    starting at offset 3 means the first record is offset 3, which a handler
+    whose `assign()` was ignored could not produce.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("rb-seek", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(8):
+        _ = producer.produce(topic="rb-seek", value="s-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="rb-seek-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["rb-seek"], on_assign=_assign_from_offset_three)
+
+    var got = _drain(consumer, 5)
+    assert_equal(len(got), 5)
+    assert_equal(got[0].offset, Int64(3))
+    assert_equal(got[0].value_text(), "s-3")
+    assert_equal(got[4].value_text(), "s-7")
+
+    consumer.close()
+    print("    on_assign started the consumer at offset 3, not 0")
+    _ = cluster^
+
+
+def test_on_revoke_can_commit_before_the_partitions_move() raises:
+    """The reason `on_revoke` exists.
+
+    Once a rebalance completes the partitions belong to another member, and
+    anything consumed but uncommitted is reprocessed there. The handler
+    commits inside the callback, which is the last moment that is still
+    possible.
+
+    Asserted through Kafka itself rather than a counter: auto-commit is off,
+    so if a *second* consumer in the same group sees a committed offset, the
+    only thing that could have written it is the handler.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("rb-revoke", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(6):
+        _ = producer.produce(topic="rb-revoke", value="r-" + String(i))
+    producer.flush(10000)
+
+    var first = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="rb-revoke-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+    )
+    first.subscribe(["rb-revoke"], on_revoke=_commit_on_revoke)
+    assert_equal(len(_drain(first, 4)), 4)
+    # Leaving the group revokes the partitions, which runs the handler.
+    first.close()
+
+    var second = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="rb-revoke-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+    )
+    var only: List[TopicPartition] = [TopicPartition("rb-revoke", 0)]
+    var stored = second.committed(only)
+    assert_equal(len(stored), 1)
+    assert_equal(stored[0].offset, Int64(4))
+
+    second.close()
+    print("    on_revoke committed offset 4 before leaving the group")
+    _ = cluster^
+
+
+def _drain(mut consumer: Consumer, want: Int) raises -> List[Message]:
+    """Poll until `want` messages have arrived, or give up.
+
+    A helper and **not** a test case: `TestSuite.discover_tests` runs every
+    `test_*` function it finds, so helpers here must not be named like one.
+    """
+    var got = List[Message]()
+    var attempts = 0
+    while len(got) < want and attempts < 60:
+        attempts += 1
+        var maybe = consumer.poll(timeout_ms=1000)
+        if maybe:
+            got.append(maybe.value().copy())
+    return got^
 
 
 def _text_of(field: Optional[List[UInt8]]) raises -> String:

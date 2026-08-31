@@ -7,7 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Delivery reports now go through a `dr_msg_cb`** rather than librdkafka's
+  event queue. No API change — `failures()`, `take_failures()` and
+  `flush()`'s raise-on-rejection behave exactly as before — but the producer
+  and the consumer's rebalance handling now use the same mechanism, and
+  `flush()` is `rd_kafka_flush()` instead of a hand-written drain loop.
+
+  The event queue was never the preferred design; it was a workaround for
+  pre-1.0 Mojo being unable to hand C a function pointer. Measured A/B over
+  200k messages, throughput is indistinguishable — the run-to-run spread is
+  far wider than the difference between the two paths.
+
 ### Added
+- **Rebalance callbacks.** `subscribe()` now takes `on_assign`, `on_revoke`
+  and `on_lost`, matching `confluent-kafka`'s signature and its semantics: a
+  handler is an *opportunity* to intervene, not an obligation — one that does
+  nothing still gets the default assignment.
+
+  `on_assign` can start the consumer at offsets from your own store rather
+  than the group's commit; `on_revoke` can commit synchronously before the
+  partitions belong to another member, which is the last moment that is
+  possible. `on_lost` takes over from `on_revoke` when partitions were lost
+  involuntarily, falling back to `on_revoke` when it is not set.
+
+  Handlers receive a `Rebalance` context carrying `partitions` plus
+  `assign()`, `unassign()`, `commit()` and `protocol()`. A handler must be a
+  top-level `def` rather than a closure: it is called from a C callback,
+  which carries no captured state.
+
+  This is built on a genuine C function pointer — Mojo 1.0's `abi("C")`
+  effect — not an event-queue workaround. Earlier notes in this repo claimed
+  Mojo could not supply one; that was true before 1.0 and is not now.
+
+- **`produce(timestamp=)` / `produce_bytes(timestamp=)`.** The record's
+  CreateTime in milliseconds since the Unix epoch, completing the pair with
+  `Message.timestamp`. **0 means now**, which is librdkafka's own rule and
+  the default `confluent-kafka` documents for the same argument. Set it when
+  the event time is not the time you are publishing — replaying an archive,
+  or forwarding records from another system.
+
+- **Consumer control plane.** `Consumer` can now name its own partitions and
+  move around inside them: `assign()` / `unassign()`, `seek()`, `position()`,
+  `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` /
+  `get_watermark_offsets()` and `offsets_for_times()`. Four workloads that
+  were unreachable become reachable: replay from an offset, lag measurement
+  (`watermarks.high - position`), event-time processing, and bounded drains.
+
+  The calls speak in `TopicPartition`, a new type mapping onto librdkafka's
+  `rd_kafka_topic_partition_t`. Its `offset` field carries a question in and
+  an answer out — most obviously in `offsets_for_times()`, where a millisecond
+  timestamp goes in and an offset comes back. `OFFSET_BEGINNING`,
+  `OFFSET_END`, `OFFSET_STORED` and `OFFSET_INVALID` are exported for it.
+
+  Several of these calls report **per partition** rather than through their
+  return code — the same shape that made `AdminClient.create_topic()` report
+  success for a topic the broker refused. The ones that return a list
+  (`position`, `committed`, `offsets_for_times`) leave the per-partition
+  verdict on each entry, readable with `TopicPartition.has_error()` and
+  `.kind()`; the ones that return nothing (`seek`, `pause`, `resume`) raise on
+  the first failed partition, because there would be nowhere else to put it.
+
+- **End-of-partition told apart from a poll timeout.** `poll()` returns `None`
+  for both, so a job draining a partition to its end could not tell "caught
+  up" from "nothing arrived yet". `poll_event()` returns a `PollEvent` that
+  keeps the three cases apart — `message`, `eof`, or `is_timeout()` — and
+  `poll()` is now written in terms of it.
+
+  End-of-partition is opt-in, matching librdkafka: build the consumer with
+  `ConsumerConfig(..., enable_partition_eof=True)`. Without it `poll_event()`
+  reports a timeout where it would otherwise report EOF. A tail-following job
+  wants it off; a bounded drain needs it on.
+
+- **`Message.timestamp` and `Message.timestamp_type`.** Milliseconds since the
+  epoch, plus which clock stamped it — `TIMESTAMP_CREATE_TIME` (the producer)
+  or `TIMESTAMP_LOG_APPEND_TIME` (the broker). Read `has_timestamp()` rather
+  than testing `timestamp != -1`: -1 is a legal `int64` millisecond value, so
+  the type is the only field that answers whether there is a timestamp at all.
+
+  This is the **consume** half only. `produce()` still cannot set a timestamp;
+  librdkafka stamps each record with the current time.
+
 - **Typed `KafkaErrorKind`.** `kind_of(code)` classifies a librdkafka error
   into one of eight branchable tags, read from `KafkaError.kind()`,
   `DeliveryReport.kind()` and `Producer.last_error_kind()`. Backpressure is

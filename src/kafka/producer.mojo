@@ -1,7 +1,5 @@
 """High-level producer."""
 
-from std.time import perf_counter_ns
-
 from ._ffi import (
     Lib,
     MSG_ERR,
@@ -9,7 +7,6 @@ from ._ffi import (
     MSG_PARTITION,
     MSG_PRIVATE,
     MSG_RKT,
-    RD_KAFKA_EVENT_DR,
     RD_KAFKA_MSG_F_COPY,
     RD_KAFKA_PARTITION_UA,
     RD_KAFKA_PRODUCER,
@@ -120,6 +117,66 @@ struct _Field(Copyable, Movable):
         return self.pointer if self.pointer != 0 else placeholder
 
 
+@fieldwise_init
+struct _DrState(Copyable, Movable):
+    """What the delivery-report callback can reach.
+
+    Lives in a one-element `List` on the `Producer`, so its address survives
+    anything that moves the producer -- the same heap box `Lib` uses for its
+    handle, and `Consumer` for its rebalance state.
+    """
+
+    var lib: Int
+    var failures: List[DeliveryReport]
+
+
+def _delivery_trampoline(rk: Int, msg: Int, opaque: Int) abi("C"):
+    """librdkafka's verdict on one produced message.
+
+    `abi("C")` and therefore **thin**: it captures nothing, so `opaque` --
+    set with `rd_kafka_conf_set_opaque` -- is the only route back to the
+    producer's state. `abi("C")` may not be `raises` either, so the body is
+    wrapped, the same discipline `__deinit__` uses.
+
+    Called once per message from inside `poll()` or `flush()`, on the calling
+    thread. librdkafka does not invoke callbacks from its background threads,
+    which is what makes touching Mojo state here safe -- and is also why
+    `Producer` is no more thread-safe than it was.
+
+    **Only failures are retained.** A report per delivered message would grow
+    without bound in a long-running producer that never reads them, and the
+    question worth answering is which messages did not make it. The success
+    path is therefore a single load and a return, which is what keeps this
+    off the produce path's cost.
+    """
+    try:
+        var err = _load_i32(msg + MSG_ERR)
+        if err == RD_KAFKA_RESP_ERR_NO_ERROR:
+            return
+        ref state = Pointer[_DrState, MutAnyOrigin](unsafe_from_address=opaque)[
+            unsafe_offset=0
+        ]
+        ref lib = Pointer[Lib, ImmutAnyOrigin](unsafe_from_address=state.lib)[
+            unsafe_offset=0
+        ]
+        # `_private` is the token handed to produceva as
+        # RD_KAFKA_VTYPE_OPAQUE, returned untouched.
+        state.failures.append(
+            DeliveryReport(
+                _load_word(msg + MSG_PRIVATE),
+                lib.topic_name(_load_word(msg + MSG_RKT)),
+                _load_i32(msg + MSG_PARTITION),
+                _load_i64(msg + MSG_OFFSET),
+                err,
+                String(lib.error(err)),
+            )
+        )
+    except:
+        # Nothing here is actionable, and librdkafka is mid-teardown of the
+        # message. Losing one report is better than aborting the process.
+        pass
+
+
 struct Producer:
     """A producer over librdkafka.
 
@@ -127,11 +184,11 @@ struct Producer:
     `flush()` before drop to wait for in-flight messages to be acked.
 
     **Delivery is verified, not assumed.** `produce()` only enqueues; the
-    broker's verdict arrives later. The producer asks librdkafka for delivery
-    reports as events on its main queue (`RD_KAFKA_EVENT_DR`), drains them in
-    `poll()` and `flush()`, and `flush()` raises if any message was rejected.
-    Without that, a message dropped at `message.timeout.ms` leaves the queue
-    empty and a plain `rd_kafka_flush` reports success over the top of it.
+    broker's verdict arrives later. The producer registers a `dr_msg_cb`,
+    which librdkafka calls once per message from inside `poll()` or
+    `flush()`, and `flush()` raises if any message was rejected. Without
+    that, a message dropped at `message.timeout.ms` leaves the queue empty
+    and `flush()` alone would report success over the top of it.
 
     Messages go out through `rd_kafka_produceva`, which names the topic by
     string. That is what lets this hold no per-topic state: the producer used
@@ -142,31 +199,39 @@ struct Producer:
 
     var _lib: Lib
     var _rk: Int
-    var _dr_queue: Int
-    var _failures: List[DeliveryReport]
+    # One element, on the heap: the C delivery-report callback reaches this
+    # by address, and a `List`'s buffer does not move when the `Producer`
+    # does. `failures()` and friends read through it.
+    var _dr: List[_DrState]
     var _next_sequence: Int
     var _last_error_kind: KafkaErrorKind
 
     def __init__(out self, cfg: ProducerConfig) raises:
         self._lib = Lib()
+
+        var state = List[_DrState](capacity=1)
+        state.append(_DrState(0, List[DeliveryReport]()))
+        self._dr = state^
+
         var conf = cfg._build(self._lib)
         try:
-            # Delivery reports as events, not callbacks: Mojo cannot hand C a
-            # function pointer, and event sourcing does not need one.
-            self._lib.conf_set_events(conf, RD_KAFKA_EVENT_DR)
+            self._lib.conf_set_dr_msg_cb(conf, _delivery_trampoline)
+            self._lib.conf_set_opaque(conf, Int(self._dr.unsafe_ptr()))
         except e:
             self._lib.conf_destroy(conf)
             raise e
         # rd_kafka_new adopts conf on success and _build/new_client
         # between them free it on every failure path.
         self._rk = self._lib.new_client(RD_KAFKA_PRODUCER, conf)
-        self._dr_queue = self._lib.queue_get_main(self._rk)
-        self._failures = List[DeliveryReport]()
         # Sequences start at 1, not 0. The opaque travels as a `void *` and
         # comes back as `_private`, where 0 is indistinguishable from a
         # message produced without one.
         self._next_sequence = 1
         self._last_error_kind = KIND_OTHER
+        # Recorded after construction because it is the address of a field of
+        # `self`, which is only final once the producer exists. `Producer` is
+        # neither `Copyable` nor `Movable`, so it stays put from here on.
+        self._dr[0].lib = Int(Pointer(to=self._lib))
 
     def __deinit__(deinit self):
         # Destructors cannot raise, and there is nothing useful to do with a
@@ -182,8 +247,6 @@ struct Producer:
         if self._rk != 0:
             try:
                 _ = self._drain_until_empty(5000)
-                if self._dr_queue != 0:
-                    self._lib.queue_destroy(self._dr_queue)
                 self._lib.destroy(self._rk)
             except:
                 pass
@@ -191,53 +254,27 @@ struct Producer:
     # -- delivery reports -----------------------------------------------------
 
     def _drain(mut self, timeout_ms: Int32) raises -> Int:
-        """Consume one delivery-report batch, recording any rejections."""
-        var ev = self._lib.queue_poll(self._dr_queue, timeout_ms)
-        if ev == 0:
-            return 0
-        var seen = 0
-        try:
-            if self._lib.event_type(ev) == RD_KAFKA_EVENT_DR:
-                for _ in range(self._lib.event_message_count(ev)):
-                    var m = self._lib.event_message_next(ev)
-                    if m == 0:
-                        break
-                    seen += 1
-                    var err = _load_i32(m + MSG_ERR)
-                    if err != RD_KAFKA_RESP_ERR_NO_ERROR:
-                        # `_private` is the token handed to produceva as
-                        # RD_KAFKA_VTYPE_OPAQUE, returned untouched.
-                        self._failures.append(
-                            DeliveryReport(
-                                _load_word(m + MSG_PRIVATE),
-                                self._lib.topic_name(_load_word(m + MSG_RKT)),
-                                _load_i32(m + MSG_PARTITION),
-                                _load_i64(m + MSG_OFFSET),
-                                err,
-                                String(self._lib.error(err)),
-                            )
-                        )
-        except e:
-            self._lib.event_destroy(ev)
-            raise e
-        self._lib.event_destroy(ev)
-        return seen
+        """Serve delivery reports, recording any rejections.
+
+        The recording happens in `_delivery_trampoline`, which librdkafka
+        calls once per message from inside this. Returns how many events were
+        served.
+        """
+        return Int(self._lib.poll(self._rk, timeout_ms))
 
     def _drain_until_empty(mut self, timeout_ms: Int32) raises -> Bool:
-        """Serve delivery reports until nothing is outstanding.
+        """Block until nothing is outstanding, serving reports as they land.
 
-        `rd_kafka_flush` is deliberately not used: with `RD_KAFKA_EVENT_DR`
-        enabled it expects a second thread to be serving the queue, and
-        `rd_kafka_outq_len` counts undrained events as outstanding, so it
-        would sit there until the timeout.
+        `rd_kafka_flush` is exactly this, and it is used directly: it polls
+        the client itself, so the delivery-report callback runs on this
+        thread while it waits. It was unusable while reports were routed to
+        the main queue as events -- `rd_kafka_outq_len` counted undrained
+        events as outstanding, so it blocked until its timeout regardless --
+        which is why this used to be a hand-written loop.
         """
-        var deadline = Int(perf_counter_ns()) + Int(timeout_ms) * 1_000_000
-        while True:
-            if self._lib.outq_len(self._rk) == 0:
-                return True
-            _ = self._drain(50)
-            if Int(perf_counter_ns()) >= deadline:
-                return self._lib.outq_len(self._rk) == 0
+        return (
+            self._lib.flush(self._rk, timeout_ms) == RD_KAFKA_RESP_ERR_NO_ERROR
+        )
 
     def _raise_if_undelivered(self) raises:
         """Raise if any rejection is still unacknowledged.
@@ -247,12 +284,12 @@ struct Producer:
         count and a string -- exactly what per-message reports exist to
         replace. `take_failures()` is how they are acknowledged.
         """
-        if len(self._failures) == 0:
+        if len(self._dr[0].failures) == 0:
             return
         raise Error(
-            String(len(self._failures))
+            String(len(self._dr[0].failures))
             + " message(s) failed delivery; first was "
-            + String(self._failures[0])
+            + String(self._dr[0].failures[0])
             + " (call take_failures() for all of them)"
         )
 
@@ -278,7 +315,7 @@ struct Producer:
 
     def delivery_failures(self) -> Int:
         """Rejections tallied since the last `flush()`, without blocking."""
-        return len(self._failures)
+        return len(self._dr[0].failures)
 
     def failures(self) -> List[DeliveryReport]:
         """Every unacknowledged rejection, each naming the sequence
@@ -290,7 +327,7 @@ struct Producer:
         did not make it -- needs only the failures. After a `flush()` that
         does not raise, every message produced before it was delivered.
         """
-        return self._failures.copy()
+        return self._dr[0].failures.copy()
 
     def take_failures(mut self) -> List[DeliveryReport]:
         """Acknowledge every rejection, returning what was outstanding.
@@ -304,8 +341,8 @@ struct Producer:
                 for report in p.take_failures():
                     print(report)
         """
-        var taken = self._failures.copy()
-        self._failures.clear()
+        var taken = self._dr[0].failures.copy()
+        self._dr[0].failures.clear()
         return taken^
 
     # -- producing ------------------------------------------------------------
@@ -356,6 +393,7 @@ struct Producer:
         key: _Field,
         headers: List[Header],
         partition: Int32,
+        timestamp: Int64,
     ) raises -> Int:
         """Hand one message to librdkafka, null fields and all.
 
@@ -391,15 +429,18 @@ struct Producer:
             var somewhere = Int(placeholder.unsafe_ptr())
             var topic_c = _c_string(topic)
 
-            # Seven entries, matching the calls below. `_entry` raises
-            # rather than overrunning if this is ever left behind.
-            var vus = _VuArray(7)
+            # Eight entries, matching the calls below. `_entry` raises
+            # rather than overrunning if this is ever left behind -- so a
+            # miscount fails on the first produce instead of corrupting the
+            # array.
+            var vus = _VuArray(8)
             vus.topic(Int(topic_c.unsafe_ptr()))
             vus.partition(partition)
             vus.msgflags(RD_KAFKA_MSG_F_COPY)
             vus.value(value.address(somewhere), value.length)
             vus.key(key.address(somewhere), key.length)
             vus.opaque(sequence)
+            vus.timestamp(timestamp)
             if hdrs != 0:
                 vus.headers(hdrs)
 
@@ -432,6 +473,7 @@ struct Producer:
         key: Optional[String] = None,
         headers: List[Header] = [],
         partition: Int32 = PARTITION_UNASSIGNED,
+        timestamp: Int64 = 0,
     ) raises -> Int:
         """Enqueue a message whose key and value are text.
 
@@ -460,6 +502,17 @@ struct Producer:
         choice to the topic's partitioner -- key hashing, normally. Name one
         to bypass it.
 
+        `timestamp` is the record's **CreateTime**, in milliseconds since the
+        Unix epoch, and **0 means now** -- librdkafka's own rule, and the
+        default `confluent-kafka` documents for the same argument. Set it
+        when the event time is not the time you happen to be publishing:
+        replaying an archive, or forwarding records from another system.
+        It comes back as `Message.timestamp`.
+
+        A broker whose topic is configured `log.message.timestamp.type=
+        LogAppendTime` overwrites it, and the consumer then reports
+        `TIMESTAMP_LOG_APPEND_TIME` rather than `TIMESTAMP_CREATE_TIME`.
+
         Returns a **sequence token** identifying this message. It comes back
         on the message's delivery report, so `failures()` can name exactly
         which messages the broker rejected. Ignore it if a count is enough.
@@ -467,7 +520,7 @@ struct Producer:
         Use `produce_bytes()` for anything that is not valid UTF-8.
         """
         return self._enqueue(
-            topic, _Field(value), _Field(key), headers, partition
+            topic, _Field(value), _Field(key), headers, partition, timestamp
         )
 
     def produce_bytes(
@@ -477,25 +530,28 @@ struct Producer:
         key: Optional[List[UInt8]] = None,
         headers: List[Header] = [],
         partition: Int32 = PARTITION_UNASSIGNED,
+        timestamp: Int64 = 0,
     ) raises -> Int:
         """Enqueue an arbitrary byte payload -- Avro, Protobuf, a compressed blob.
 
         The same null / empty / present rules as `produce()`, over bytes
-        rather than text, and the same `headers` and `partition`. Mojo will
-        not copy a `List` implicitly, so pass an owned one (`value^`) or an
-        explicit `value.copy()`.
+        rather than text, and the same `headers`, `partition` and
+        `timestamp`. Mojo will not copy a `List` implicitly, so pass an owned
+        one (`value^`) or an explicit `value.copy()`.
 
         Returns the same sequence token as `produce()`.
         """
         return self._enqueue(
-            topic, _Field(value), _Field(key), headers, partition
+            topic, _Field(value), _Field(key), headers, partition, timestamp
         )
 
     def poll(mut self, timeout_ms: Int32 = 0) raises -> Int32:
-        """Serve delivery reports. Returns how many were collected.
+        """Serve delivery reports. Returns how many events librdkafka ran.
 
-        Rejections are tallied as they arrive; `flush()` raises on them and
-        `delivery_failures()` reads the running count.
+        The count is events served, which for a producer is delivery reports
+        plus any errors -- not a count of rejections. Rejections are tallied
+        as they arrive; `flush()` raises on them and `delivery_failures()`
+        reads the running count.
         """
         return Int32(self._drain(timeout_ms))
 

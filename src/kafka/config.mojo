@@ -92,6 +92,7 @@ struct ConsumerConfig(Copyable, Movable):
     var client_id: String
     var auto_offset_reset: String
     var enable_auto_commit: Bool
+    var enable_partition_eof: Bool
     var extra: Dict[String, String]
 
     def __init__(
@@ -101,12 +102,22 @@ struct ConsumerConfig(Copyable, Movable):
         client_id: String = "mojo-kafka",
         auto_offset_reset: String = "latest",
         enable_auto_commit: Bool = True,
+        enable_partition_eof: Bool = False,
     ):
+        """`enable_partition_eof` defaults to `False`, matching librdkafka.
+
+        Turn it on for a job that drains a partition and stops: it is what
+        makes `Consumer.poll_event()` able to report end-of-partition, and
+        without it "caught up" is indistinguishable from "nothing arrived".
+        A tail-following job wants it off -- it would otherwise get an EOF
+        mark every time it caught up with the log.
+        """
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
         self.client_id = client_id
         self.auto_offset_reset = auto_offset_reset
         self.enable_auto_commit = enable_auto_commit
+        self.enable_partition_eof = enable_partition_eof
         self.extra = Dict[String, String]()
 
     def set(mut self, key: String, value: String):
@@ -124,6 +135,12 @@ struct ConsumerConfig(Copyable, Movable):
                 (
                     "enable.auto.commit",
                     String("true") if self.enable_auto_commit else String(
+                        "false"
+                    ),
+                ),
+                (
+                    "enable.partition.eof",
+                    String("true") if self.enable_partition_eof else String(
                         "false"
                     ),
                 ),
