@@ -770,6 +770,8 @@ struct Lib(Movable):
     var _commit_transaction: _DLCallable[Int, ImmUntrackedOrigin]
     var _abort_transaction: _DLCallable[Int, ImmUntrackedOrigin]
     var _send_offsets_to_transaction: _DLCallable[Int, ImmUntrackedOrigin]
+    var _queue_get_consumer: _DLCallable[Int, ImmUntrackedOrigin]
+    var _consume_batch_queue: _DLCallable[Int, ImmUntrackedOrigin]
     var _consumer_group_metadata: _DLCallable[Int, ImmUntrackedOrigin]
     var _consumer_group_metadata_destroy: _DLCallable[
         NoneType, ImmUntrackedOrigin
@@ -862,6 +864,12 @@ struct Lib(Movable):
         )
         self._send_offsets_to_transaction = _bind[Int](
             self._box, "rd_kafka_send_offsets_to_transaction"
+        )
+        self._queue_get_consumer = _bind[Int](
+            self._box, "rd_kafka_queue_get_consumer"
+        )
+        self._consume_batch_queue = _bind[Int](
+            self._box, "rd_kafka_consume_batch_queue"
         )
         self._consumer_group_metadata = _bind[Int](
             self._box, "rd_kafka_consumer_group_metadata"
@@ -1156,6 +1164,57 @@ struct Lib(Movable):
         from the consumer that read them.
         """
         return self._send_offsets_to_transaction(rk, offsets, cgmd, timeout_ms)
+
+    # -- batch consume ------------------------------------------------------
+
+    def queue_get_consumer(self, rk: Int) raises -> Int:
+        """A reference to the queue `rd_kafka_consumer_poll` serves.
+
+        **The reference must be destroyed before `rd_kafka_consumer_close`**
+        -- librdkafka says MUST, and `Consumer` honours it explicitly in both
+        `close()` and `__deinit__`.
+
+        Polling this queue counts as a consumer poll and resets the
+        `max.poll.interval.ms` timer, which is what lets a batch-consuming
+        member stay in its group without a keepalive of its own.
+        """
+        return self._queue_get_consumer(rk)
+
+    def consume_batch_queue(
+        self, rkqu: Int, timeout_ms: Int32, out_array: Int, size: Int
+    ) raises -> Int:
+        """`rd_kafka_consume_batch_queue` -- up to `size` messages at once.
+
+        Fills `out_array` (an array of `size` `rd_kafka_message_t*`) and
+        returns how many it wrote, or -1 on error. Every message written is
+        the caller's to destroy.
+
+        **Two of these must never run concurrently on one queue.**
+        librdkafka's `INTRODUCTION.md` calls that undefined behaviour and
+        says it "will not be supported in future as well"; it is not in
+        `rdkafka.h`, which is the only reason it is repeated here.
+        `Consumer.consume` refuses a second concurrent caller.
+        """
+        return self._consume_batch_queue(rkqu, timeout_ms, out_array, size)
+
+    def topic_name_ptr(self, rkt: Int) raises -> Int:
+        """`rd_kafka_topic_name` **without** copying it into a `String`.
+
+        The pointer belongs to the topic handle and stays valid as long as
+        it does, which outlives any batch of its messages. `topic_name`
+        copies; the borrowed consume path must not.
+        """
+        return self._topic_name(rkt)
+
+    def cstr_len(self, addr: Int) raises -> Int:
+        """`strlen`, for a C string being lent rather than copied."""
+        if addr == 0:
+            return 0
+        var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=addr)
+        var n = 0
+        while p[unsafe_offset=n] != 0:
+            n += 1
+        return n
 
     def consumer_group_metadata(self, rk: Int) raises -> Int:
         """The consumer's group identity, to hand to a transactional

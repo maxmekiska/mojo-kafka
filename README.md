@@ -246,7 +246,7 @@ See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipel
 | `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads; `consume_borrowed(n)` for zero-copy reads |
 | `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
 | `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
 | `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
@@ -259,6 +259,7 @@ See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipel
 | `KafkaErrorKind` | Eight tags — `KIND_QUEUE_FULL`, `KIND_TIMED_OUT`, … — for handling rather than reporting |
 | `ConsumerGroupMetadata` | A consumer's group identity, from `Consumer.consumer_group_metadata()` — the bridge that lets a transaction commit that consumer's offsets |
 | `TxnAction` | What a failed transactional call needs: `TXN_ABORT`, `TXN_RETRY` or `TXN_FATAL`, from `KafkaError.txn_action()` |
+| `MessageBatch` / `BorrowedMessage` | A batch still owned by librdkafka, lending `Span`s into its buffer — zero copy, with the lifetime compiler-enforced |
 | `kafka.testing.MockCluster` | In-process broker for tests — no Docker; `push_request_errors()` makes it answer chosen requests with chosen errors |
 
 The named fields are Mojo-idiomatic (`bootstrap_servers` → `bootstrap.servers`, `auto_offset_reset` → `auto.offset.reset`). Anything else the C client supports is reachable through `set()`, which takes the **librdkafka property name verbatim**:
@@ -384,17 +385,19 @@ people do from a CLI or Terraform.
   raising, because Mojo 1.0's `Error` is text and would discard the fatal /
   retriable / abortable flags a transactional caller has to branch on.
   `KafkaError.txn_action()` reduces those to the three-way decision, in
-  librdkafka's order — abort before fatal. Also:
+  librdkafka's order — abort before fatal. Also: **batch and zero-copy
+  consume** — `consume(n)` returns a run of records from one FFI crossing, and
+  `consume_borrowed(n)` lends `Span`s straight into librdkafka's buffer with
+  the lifetime compiler-enforced, measuring ~2x `confluent-kafka`'s
+  `consume()` on identical records (see `benchmarks/`). Also:
   `send_offsets_to_transaction()` with `Consumer.consumer_group_metadata()`,
   which completes **read-process-write** exactly-once: the consumer's offsets
   commit inside the producer's transaction, so a failed transaction replays
   the input rather than skipping it.
-- **v0.3 — batch `consume(n)`.** One FFI crossing for a whole batch instead of
-  three per message. This is the item where Mojo beats a Python client, so it
-  ranks higher here than its place in `confluent-kafka` would suggest; it ships
-  with a benchmark.
-- **v0.4** — open. Transactions landed early (see above); suggestions
-  welcome in the issue tracker.
+- **v0.4** — open. Everything previously planned here has landed: batch
+  `consume(n)`, transactions end to end, and a zero-copy `consume_borrowed(n)`
+  that measures ~2x `confluent-kafka`'s `consume()` on the same records.
+  Suggestions welcome in the issue tracker.
 - **v1.0** — API stable and production-ready. Not feature parity with
   `confluent-kafka-python`: deliberately no ACL / consumer-group / alter-config
   admin surface, and Schema Registry belongs in a second package.

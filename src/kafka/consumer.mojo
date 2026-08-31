@@ -3,6 +3,7 @@
 from std.atomic import Atomic
 
 from ._ffi import (
+    KafkaError,
     Lib,
     RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS,
     RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS,
@@ -32,6 +33,7 @@ from ._ffi import (
     cstr,
 )
 from .config import ConsumerConfig
+from ._sync import _Latch
 from .group import ConsumerGroupMetadata
 from .header import Header, _text
 from .partition import (
@@ -43,6 +45,11 @@ from .partition import (
 
 # rd_kafka_timestamp_type_t, re-exported so `Message.timestamp_type` can be
 # compared against something with a name.
+# The largest batch `consume()` will accept, matching `confluent-kafka`'s
+# documented limit for `num_messages`. The array of message pointers is
+# allocated before the call, so this bounds what one bad argument can ask for.
+comptime MAX_BATCH: Int = 1_000_000
+
 comptime TIMESTAMP_NOT_AVAILABLE: Int32 = RD_KAFKA_TIMESTAMP_NOT_AVAILABLE
 comptime TIMESTAMP_CREATE_TIME: Int32 = RD_KAFKA_TIMESTAMP_CREATE_TIME
 comptime TIMESTAMP_LOG_APPEND_TIME: Int32 = RD_KAFKA_TIMESTAMP_LOG_APPEND_TIME
@@ -536,6 +543,164 @@ def _rebalance_trampoline(
         pass
 
 
+@fieldwise_init
+struct BorrowedMessage[origin: Origin[mut=False]](Copyable, Movable):
+    """One record, read **in place** in librdkafka's own buffer.
+
+    The zero-copy half of the consume API. `Message` copies every field into
+    owned Mojo storage so a record can outlive the fetch that produced it;
+    this copies nothing at all -- `key()` and `value()` are `Span`s pointing
+    straight into the memory librdkafka received the batch into. It is the
+    same shape as `rust-rdkafka`'s `BorrowedMessage`, for the same reason.
+
+    **The lifetime is compiler-enforced, and that is not obvious**, because
+    the pointers underneath are fabricated from raw addresses and the
+    compiler cannot see their provenance. What it *can* see is `origin`: this
+    struct is parameterised by the origin of the `MessageBatch` that lends
+    it, so holding a `BorrowedMessage` -- or even just a `Span` taken from
+    one -- keeps the batch alive, and the batch is what destroys the
+    messages. Verified by instrumenting the batch destructor: transferring
+    the batch away mid-scope runs its teardown **after** the last use of a
+    span, not at the transfer.
+
+    That last part is why the origin is a **struct parameter** and not
+    `origin_of(self)` on the accessor. Probed both: an origin taken from a
+    `ref self` borrow ends when the method returns, and the free then happens
+    *before* the read -- a real use-after-free that looks fine only because
+    `free()` does not scrub. Do not "simplify" these signatures.
+
+    Headers are deliberately absent. Every header is a separate name and
+    value that would have to be copied out one at a time, which is the cost
+    this type exists to avoid; `confluent-kafka` defers them for the same
+    reason. Use `consume()` and `Message.headers` when you need them.
+    """
+
+    var _raw: Int
+    var _topic_addr: Int
+    var _topic_len: Int
+
+    def partition(self) raises -> Int32:
+        return _load_i32(self._raw + MSG_PARTITION)
+
+    def offset(self) raises -> Int64:
+        return _load_i64(self._raw + MSG_OFFSET)
+
+    def topic(self) -> Span[UInt8, Self.origin]:
+        """The topic name's bytes, in librdkafka's memory.
+
+        Resolved once per distinct topic handle by the batch, not per
+        message -- `rd_kafka_topic_name` is a crossing, and a batch is nearly
+        always one topic.
+        """
+        return Span[UInt8, Self.origin](
+            unsafe_ptr=Pointer[UInt8, Self.origin](
+                unsafe_from_address=self._topic_addr
+            ),
+            length=self._topic_len,
+        )
+
+    def key(self) raises -> Optional[Span[UInt8, Self.origin]]:
+        """The key, in place. `None` for a null key -- presence is read from
+        the **pointer**, exactly as `copy_bytes` does it, because Kafka tells
+        a null field from an empty one and so must this."""
+        return self._field(MSG_KEY, MSG_KEY_LEN)
+
+    def value(self) raises -> Optional[Span[UInt8, Self.origin]]:
+        """The payload, in place. `None` for a tombstone."""
+        return self._field(MSG_PAYLOAD, MSG_LEN)
+
+    def _field(
+        self, ptr_offset: Int, len_offset: Int
+    ) raises -> Optional[Span[UInt8, Self.origin]]:
+        var addr = _load_word(self._raw + ptr_offset)
+        if addr == 0:
+            return None
+        var n = _load_word(self._raw + len_offset)
+        return Span[UInt8, Self.origin](
+            unsafe_ptr=Pointer[UInt8, Self.origin](unsafe_from_address=addr),
+            length=n if n > 0 else 0,
+        )
+
+    def is_tombstone(self) raises -> Bool:
+        return _load_word(self._raw + MSG_PAYLOAD) == 0
+
+
+struct MessageBatch(Sized):
+    """A run of records still owned by librdkafka, lent out in place.
+
+    Returned by `Consumer.consume_borrowed()`. **It owns the raw messages**
+    and destroys them in its destructor, which is what makes every
+    `BorrowedMessage` it lends valid for exactly as long as it lives -- and
+    the compiler enforces that, see `BorrowedMessage`.
+
+        var batch = consumer.consume_borrowed(1000)
+        for i in range(len(batch)):
+            var record = batch[i]
+            if record.value():
+                total += process(record.value().value())
+        _ = batch^
+
+    Not `Copyable`: two batches destroying the same messages is a double
+    free. Not reusable either -- take a new one per fetch.
+    """
+
+    var _lib: Lib
+    var _raws: List[Int]
+    var _topic_addr: Int
+    var _topic_len: Int
+    var _eof: Bool
+
+    def __init__(
+        out self,
+        var lib: Lib,
+        var raws: List[Int],
+        topic_addr: Int,
+        topic_len: Int,
+        eof: Bool,
+    ):
+        self._lib = lib^
+        self._raws = raws^
+        self._topic_addr = topic_addr
+        self._topic_len = topic_len
+        self._eof = eof
+
+    def __deinit__(deinit self):
+        # Destructors cannot raise, and every message here is ours.
+        for raw in self._raws:
+            if raw != 0:
+                try:
+                    self._lib.message_destroy(raw)
+                except:
+                    pass
+
+    def __len__(self) -> Int:
+        return len(self._raws)
+
+    def reached_end(self) -> Bool:
+        """Whether this fetch ran off the end of a partition.
+
+        The borrowed path drops end-of-partition marks -- they carry no
+        payload to lend -- but a bounded drain still has to know, and
+        **without this it cannot**: it would have to keep asking until a
+        batch came back empty, which costs a full `timeout_ms` every time.
+        That is not hypothetical. The first version of this type had no
+        `reached_end`, and the benchmark measured the borrowed path at
+        19,927 msg/s against 1.2M for the owned one -- 200,000 records in
+        10.04 seconds, which is one 10s timeout and nothing else.
+
+        Only meaningful with `enable_partition_eof`, which is off by default
+        for the same reason it is on `poll_event()`.
+        """
+        return self._eof
+
+    def __getitem__(ref self, i: Int) -> BorrowedMessage[origin_of(self)]:
+        """Lend record `i`. The result borrows this batch and cannot outlive
+        it -- that is the whole safety argument, and it is checked."""
+        return BorrowedMessage[origin_of(self)](
+            self._raws[i], self._topic_addr, self._topic_len
+        )
+
+
 struct Consumer:
     """A consumer group member over librdkafka.
 
@@ -563,6 +728,15 @@ struct Consumer:
     # One element, on the heap: the C rebalance callback reaches this by
     # address, and a `List`'s buffer does not move when the `Consumer` does.
     var _rebalance: List[_RebalanceState]
+    # The queue `consumer_poll` serves, held for `consume()`. Taken at
+    # construction rather than lazily so its teardown is unconditional:
+    # librdkafka requires it be destroyed **before** `consumer_close`, and a
+    # reference that may or may not exist is a rule that may or may not be
+    # followed.
+    var _queue: Int
+    # Not for sharing: `consume()` refuses a second concurrent caller rather
+    # than queueing it. See `consume`.
+    var _batch: _Latch
 
     def __init__(out self, cfg: ConsumerConfig) raises:
         self._lib = Lib()
@@ -592,11 +766,37 @@ struct Consumer:
         # consumer is constructed. `Consumer` is neither `Copyable` nor
         # `Movable`, so it stays put from here on.
         self._rebalance[0].lib = Int(Pointer(to=self._lib))
+        self._batch = _Latch()
+        self._queue = self._lib.queue_get_consumer(self._rk)
+        if self._queue == 0:
+            raise Error("rd_kafka_queue_get_consumer returned NULL")
+
+    def _release_queue(mut self):
+        """Drop the consumer-queue reference. Idempotent.
+
+        Separate from both teardown paths because librdkafka is emphatic
+        that it has to happen **before** `rd_kafka_consumer_close`, and
+        there are two places that close.
+        """
+        if self._queue != 0:
+            try:
+                self._lib.queue_destroy(self._queue)
+            except:
+                pass
+            self._queue = 0
 
     def __deinit__(deinit self):
         # Destructors cannot raise; a failed close is not actionable here.
         if self._rk != 0:
             try:
+                # **Before the close, always.** librdkafka: the consumer
+                # queue reference "MUST" be destroyed prior to
+                # `rd_kafka_consumer_close`. This is also why `_queue` is an
+                # `Int` and not something with a destructor of its own -- a
+                # field released at its last use in this body would be freed
+                # in the wrong order relative to the close, which is exactly
+                # the bug `_rebalance` had.
+                self._release_queue()
                 # Same compare-exchange as `close()`: if the app
                 # already closed, this must not close again.
                 var expected = Int32(0)
@@ -733,36 +933,360 @@ struct Consumer:
             raise Error("poll: " + String(e))
 
         # Every exit from here on has to destroy `raw`, including the ones
-        # taken by a raising decode.
+        # taken by a raising decode. `_decode` is shared with the batch path,
+        # which is why it takes the topic name rather than reading it: there
+        # it is usually already known from the previous message.
         var msg: Message
         try:
-            # The timestamp is the one field that is not at a fixed offset in
-            # `rd_kafka_message_t` -- it lives in librdkafka's private part
-            # of the allocation, so it is read through the accessor, which
-            # also fills in which clock it came from.
-            var tstype = Array[Int32, 1](fill=TIMESTAMP_NOT_AVAILABLE)
-            var timestamp = self._lib.message_timestamp(
-                raw, Int(tstype.unsafe_ptr())
-            )
-            msg = Message(
-                self._lib.topic_name(_load_word(raw + MSG_RKT)),
-                _load_i32(raw + MSG_PARTITION),
-                _load_i64(raw + MSG_OFFSET),
-                copy_bytes(
-                    _load_word(raw + MSG_KEY), _load_word(raw + MSG_KEY_LEN)
-                ),
-                copy_bytes(
-                    _load_word(raw + MSG_PAYLOAD), _load_word(raw + MSG_LEN)
-                ),
-                self._headers_of(raw),
-                timestamp,
-                tstype[0],
+            msg = self._decode(
+                raw, self._lib.topic_name(_load_word(raw + MSG_RKT))
             )
         except e:
             self._lib.message_destroy(raw)
             raise e
         self._lib.message_destroy(raw)
         return PollEvent(msg^)
+
+    def consume(
+        mut self, n: Int, timeout_ms: Int32 = 1000
+    ) raises -> List[Message]:
+        """Fetch up to `n` messages in one call. The batch path.
+
+        `poll()` crosses into C several times per message; this crosses once
+        for the fetch and hands back a run of records Mojo can then walk
+        without a per-message round trip. That is the reason this exists and
+        the reason it is worth more in Mojo than the same call is in Python.
+
+        Returns fewer than `n` -- possibly none -- when the timeout expires
+        first. An empty list is a quiet partition, not an error.
+
+        **`timeout_ms` is how long librdkafka will wait to *fill* the batch,
+        not how long until it returns what it has.** Measured: 5 available
+        records with `n=64` and a 10s timeout come back after the full 10s.
+        So size the timeout for the latency you can accept on a partly-full
+        batch, not for the fetch -- a large `n` with a long timeout is a
+        slow tail on a quiet topic, not a faster one.
+
+        End-of-partition marks are dropped, exactly as `poll()` drops them;
+        use `consume_events()` if you want them. A hard error **raises**, and
+        that is the one thing to know before choosing between the two: the
+        messages that arrived alongside it are lost with it, because a Mojo
+        `Error` carries only text and cannot bring them along. A caller who
+        cannot afford that uses `consume_events()`, which returns the verdict
+        per entry and loses nothing. `poll()` and `poll_event()` are the same
+        pair for the same reason.
+
+        **One `consume()` at a time per consumer.** Two concurrent calls on
+        one consumer are undefined behaviour in librdkafka -- not slow,
+        undefined, and it says the case "will not be supported in future as
+        well". A second caller is **refused** with an exception rather than
+        queued: serialising would hide the bug and silently change what the
+        program does. Scale by giving each thread its own `Consumer` in the
+        same group, which is what librdkafka recommends, or fan the returned
+        batch out across threads, which is what makes this fast in Mojo.
+        """
+        var events = self.consume_events(n, timeout_ms)
+        var out = List[Message](capacity=len(events))
+        for ref event in events:
+            if event.message:
+                out.append(event.message.value().copy())
+        return out^
+
+    def consume_borrowed(
+        mut self, n: Int, timeout_ms: Int32 = 1000
+    ) raises -> MessageBatch:
+        """Fetch up to `n` records and lend them **without copying**.
+
+        The zero-copy counterpart to `consume()`. Where that copies every key,
+        value and header into owned Mojo storage, this hands back a
+        `MessageBatch` that still owns librdkafka's messages and lends
+        `BorrowedMessage` views straight into them -- the shape
+        `rust-rdkafka` uses, and the reason a binding can be as fast as the
+        library underneath it.
+
+        Use it when the records are consumed **inside the loop**: parsed,
+        aggregated, forwarded. Use `consume()` when a record has to outlive
+        the batch, or when you need headers -- a borrowed view deliberately
+        has none, because copying them per message is the cost this avoids.
+
+        The batch owns the messages, so nothing it lends can outlive it, and
+        the compiler enforces that rather than the docs; see
+        `BorrowedMessage`. End the scope with `_ = batch^` if the last use of
+        a span is not obviously the last use of the batch.
+
+        End-of-partition marks carry no payload to lend, so they are not
+        records in the batch -- ask `batch.reached_end()` instead, which is
+        what makes a bounded drain possible **without leaving this path**.
+        A hard error is likewise not a record; it raises only if the batch
+        held nothing else, so one bad entry cannot take the good ones with
+        it. That is the same policy `consume_events()` uses.
+
+        Same one-at-a-time rule as `consume()`, enforced the same way.
+        """
+        if n <= 0 or n > MAX_BATCH:
+            raise Error(
+                "consume_borrowed: n must be between 1 and "
+                + String(MAX_BATCH)
+                + ", got "
+                + String(n)
+            )
+        if self._queue == 0:
+            raise Error(
+                "consume_borrowed(): the consumer is closed. The"
+                " consumer-queue reference is released before"
+                " rd_kafka_consumer_close, which librdkafka requires, so"
+                " there is nothing left to read from."
+            )
+        if not self._batch.try_acquire():
+            raise Error(
+                "consume_borrowed(): another thread is already inside"
+                " consume() on this consumer. Concurrent batch consumption"
+                " is undefined behaviour in librdkafka; give each thread its"
+                " own Consumer in the same group, or split the batch this"
+                " one returns."
+            )
+
+        var batch: MessageBatch
+        try:
+            batch = self._consume_borrowed_locked(n, timeout_ms)
+        except e:
+            self._batch.release()
+            raise e
+        self._batch.release()
+        return batch^
+
+    def _consume_borrowed_locked(
+        mut self, n: Int, timeout_ms: Int32
+    ) raises -> MessageBatch:
+        """The body of `consume_borrowed`, with the batch latch held.
+
+        Nothing here is copied out of a message, so nothing here can raise
+        after the fetch -- which matters, because a raise would have to
+        destroy every message it had not yet handed to the batch.
+        """
+        var raws = List[Int](capacity=n)
+        for _ in range(n):
+            raws.append(0)
+
+        var count = self._lib.consume_batch_queue(
+            self._queue, timeout_ms, Int(raws.unsafe_ptr()), n
+        )
+        if count < 0:
+            var code = self._lib.last_error()
+            _ = raws^
+            raise Error("consume_borrowed: " + String(self._lib.error(code)))
+
+        # Keep only the records with a payload to lend, destroying the rest
+        # here so the batch never holds a message it cannot describe.
+        var kept = List[Int](capacity=count)
+        var topic_addr = 0
+        var topic_len = 0
+        var eof = False
+        var failure = Optional[KafkaError](None)
+        for i in range(count):
+            var raw = raws[i]
+            if raw == 0:
+                continue
+            var err_code = _load_i32(raw + MSG_ERR)
+            if err_code == RD_KAFKA_RESP_ERR__PARTITION_EOF:
+                # No payload to lend, but the caller still needs to know --
+                # see `MessageBatch.reached_end`.
+                eof = True
+                self._lib.message_destroy(raw)
+                continue
+            if err_code != RD_KAFKA_RESP_ERR_NO_ERROR:
+                if not failure:
+                    failure = self._lib.error(err_code)
+                self._lib.message_destroy(raw)
+                continue
+            if topic_addr == 0:
+                # Once per batch, not per message: `rd_kafka_topic_name` is a
+                # crossing, and the pointer it returns belongs to the topic
+                # handle, which outlives every message in this batch.
+                topic_addr = self._lib.topic_name_ptr(_load_word(raw + MSG_RKT))
+                topic_len = self._lib.cstr_len(topic_addr)
+            kept.append(raw)
+        _ = raws^
+        # Same policy as `consume_events`: an error beside good records is
+        # reported through the records the caller already has; one on its own
+        # has nowhere else to go.
+        if failure and len(kept) == 0:
+            raise Error("consume_borrowed: " + String(failure.value()))
+        return MessageBatch(Lib(), kept^, topic_addr, topic_len, eof)
+
+    def consume_events(
+        mut self, n: Int, timeout_ms: Int32 = 1000
+    ) raises -> List[PollEvent]:
+        """`consume()` without the lossy parts: one verdict per entry.
+
+        Every entry is a message, an end-of-partition mark, or -- unlike
+        `poll_event()` -- nothing at all where a hard error was decoded, and
+        the error is raised only if it is the **only** thing in the batch.
+        That is the same policy the consumer control plane already uses for
+        `position` / `committed` / `offsets_for_times`: one bad partition
+        must not hide the good answers beside it.
+
+        Same one-at-a-time rule as `consume()`; see there.
+        """
+        # The bound is `confluent-kafka`'s, and it is not arbitrary: the
+        # array of `rd_kafka_message_t*` is allocated up front, so an
+        # unbounded `n` turns one caller's slip into an unbounded allocation
+        # before a single message has arrived.
+        if n <= 0 or n > MAX_BATCH:
+            # **A deliberate divergence at 0.** `confluent-kafka` accepts
+            # `consume(0)` and returns an empty list; this raises. A drain
+            # loop written around a `consume(n)` that can silently return
+            # nothing for a reason that has nothing to do with the topic
+            # spins forever, and 0 is only ever reached by accident -- a
+            # variable that was meant to hold a batch size and did not.
+            raise Error(
+                "consume: n must be between 1 and "
+                + String(MAX_BATCH)
+                + ", got "
+                + String(n)
+            )
+
+        # **A closed consumer has no queue, and NULL is not a queue
+        # librdkafka checks for.** `close()` and the destructor both drop the
+        # reference before `rd_kafka_consumer_close`, as librdkafka requires,
+        # which leaves `_queue` at 0 -- and handing that to
+        # `rd_kafka_consume_batch_queue` faults inside `rd_kafka_consume_batch0`
+        # rather than returning an error. `poll()` after `close()` does not
+        # crash, so this asymmetry belongs to the batch path alone and has to
+        # be caught here.
+        if self._queue == 0:
+            raise Error(
+                "consume(): the consumer is closed. The consumer-queue"
+                " reference is released before rd_kafka_consumer_close, which"
+                " librdkafka requires, so there is nothing left to read from."
+            )
+
+        if not self._batch.try_acquire():
+            # Refused, not queued. See `consume`.
+            raise Error(
+                "consume(): another thread is already inside consume() on"
+                " this consumer. Concurrent batch consumption is undefined"
+                " behaviour in librdkafka; give each thread its own Consumer"
+                " in the same group, or split the batch this one returns."
+            )
+
+        var out: List[PollEvent]
+        try:
+            out = self._consume_locked(n, timeout_ms)
+        except e:
+            # Released before the raise, never under it -- see `_sync`.
+            self._batch.release()
+            raise e
+        self._batch.release()
+        return out^
+
+    def _consume_locked(
+        mut self, n: Int, timeout_ms: Int32
+    ) raises -> List[PollEvent]:
+        """The body of `consume_events`, with the batch latch already held.
+
+        Note that FFI calls happen inside this critical section, which
+        `_sync`'s first rule forbids in general. The rule exists because the
+        producer's latch is contended by a **callback** that librdkafka
+        invokes from inside the very call the holder is making. This latch is
+        not: it is contended only by other `consume()` callers, and the one
+        callback reachable from here -- the rebalance trampoline -- takes no
+        latch at all any more, it reads atomic words. There is no cycle to
+        close.
+        """
+        # One array of `rd_kafka_message_t*`, sized once. `List[Int]` rather
+        # than bytes so the pointer alignment comes from the element type,
+        # the same reason `_VuArray` is a `List[Int]`.
+        var raws = List[Int](capacity=n)
+        for _ in range(n):
+            raws.append(0)
+
+        var count = self._lib.consume_batch_queue(
+            self._queue, timeout_ms, Int(raws.unsafe_ptr()), n
+        )
+        if count < 0:
+            var code = self._lib.last_error()
+            _ = raws^
+            raise Error("consume: " + String(self._lib.error(code)))
+
+        # Every message from here on is ours to destroy, including on the
+        # paths a decode raises on -- so the loop never raises, and the one
+        # error worth surfacing is carried out and raised after the sweep.
+        var out = List[PollEvent](capacity=count)
+        var failure = Optional[KafkaError](None)
+        # A batch is nearly always one topic, and `rd_kafka_topic_name` is a
+        # crossing per message otherwise. Caching the last handle is what
+        # turns 3 crossings per message into 2.
+        var last_rkt = 0
+        var last_name = String("")
+
+        for i in range(count):
+            var raw = raws[i]
+            if raw == 0:
+                continue
+            try:
+                var err_code = _load_i32(raw + MSG_ERR)
+                var rkt = _load_word(raw + MSG_RKT)
+                if rkt != last_rkt:
+                    last_name = self._lib.topic_name(rkt)
+                    last_rkt = rkt
+
+                if err_code == RD_KAFKA_RESP_ERR__PARTITION_EOF:
+                    out.append(
+                        PollEvent(
+                            TopicPartition(
+                                last_name,
+                                _load_i32(raw + MSG_PARTITION),
+                                _load_i64(raw + MSG_OFFSET),
+                            )
+                        )
+                    )
+                elif err_code != RD_KAFKA_RESP_ERR_NO_ERROR:
+                    if not failure:
+                        failure = self._lib.error(err_code)
+                else:
+                    out.append(PollEvent(self._decode(raw, last_name)))
+            except e:
+                if not failure:
+                    failure = KafkaError(-1, String(e))
+            self._lib.message_destroy(raw)
+
+        _ = raws^
+        # An error alongside good records is reported through the records
+        # the caller already has; one on its own has nowhere else to go.
+        if failure and len(out) == 0:
+            raise Error("consume: " + String(failure.value()))
+        return out^
+
+    def _decode(self, raw: Int, topic: String) raises -> Message:
+        """Build a `Message` from a raw one whose topic name is already known.
+
+        Split out of `poll_event` so the batch path can reuse it *and* skip
+        the `rd_kafka_topic_name` crossing when the previous message shared
+        the handle.
+        """
+        # The timestamp is the one field that is not at a fixed offset in
+        # `rd_kafka_message_t` -- it lives in librdkafka's private part of
+        # the allocation, so it is read through the accessor, which also
+        # fills in which clock it came from.
+        var tstype = Array[Int32, 1](fill=TIMESTAMP_NOT_AVAILABLE)
+        var timestamp = self._lib.message_timestamp(
+            raw, Int(tstype.unsafe_ptr())
+        )
+        return Message(
+            topic,
+            _load_i32(raw + MSG_PARTITION),
+            _load_i64(raw + MSG_OFFSET),
+            copy_bytes(
+                _load_word(raw + MSG_KEY), _load_word(raw + MSG_KEY_LEN)
+            ),
+            copy_bytes(
+                _load_word(raw + MSG_PAYLOAD), _load_word(raw + MSG_LEN)
+            ),
+            self._headers_of(raw),
+            timestamp,
+            tstype[0],
+        )
 
     def _headers_of(self, raw: Int) raises -> List[Header]:
         """Copy a raw message's headers out before the message is destroyed.
@@ -1112,6 +1636,8 @@ struct Consumer:
         var expected = Int32(0)
         if not self._closed.compare_exchange(expected, 1):
             return
+        # librdkafka requires the consumer-queue reference to go first.
+        self._release_queue()
         # Claimed before the call, so a close that fails still counts as
         # done -- retrying it would only report the same failure twice.
         self._lib.raise_if(self._lib.consumer_close(self._rk), "close")

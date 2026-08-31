@@ -721,6 +721,115 @@ Four things not to undo:
 destroys the partition list on return, which is why `_decode_tpl` copies
 every name out immediately.
 
+### Batch `consume(n)`
+
+`Consumer.consume(n, timeout_ms)` over `rd_kafka_consume_batch_queue`, on the
+queue from `rd_kafka_queue_get_consumer` -- the same construction
+`confluent-kafka`'s `Consumer.consume()` uses. `consume_events(n)` is its
+`poll_event` counterpart. Six things not to undo:
+
+- **One `consume()` at a time per consumer, and a second caller is
+  *refused*.** librdkafka calls concurrent `rd_kafka_consume_batch_queue` on
+  one queue undefined behaviour and says the case "will not be supported in
+  future as well" -- and it is in `INTRODUCTION.md`, **not** `rdkafka.h`, so
+  nothing a reader of the header would see. It is also silent: no error, no
+  crash, just UB. `_batch` is a `_Latch` used through `try_acquire`, which
+  raises on contention rather than queueing. Serialising instead would hide
+  the caller's bug and silently change their execution.
+  `test_concurrent_consume_is_refused_not_serialised` asserts exactly one of
+  eight threads gets in, and fails both ways -- serialise it or drop it and
+  all eight return.
+
+- **`_consume_locked` makes FFI calls inside a critical section**, which
+  `_sync`'s first rule forbids. The exemption is reasoned and written there:
+  that rule exists because the *producer's* latch is contended by a callback
+  librdkafka invokes from inside the very call the holder is making. This one
+  is contended only by other `consume()` callers, and the rebalance
+  trampoline takes no latch at all any more. There is no cycle to close.
+
+- **The consumer-queue reference is destroyed before `consumer_close`**, in
+  both `close()` and `__deinit__`, via `_release_queue`. librdkafka says
+  MUST. `_queue` is a bare `Int` for that reason: a field with a destructor
+  of its own would be released at its last use in the destructor body, which
+  is the wrong order relative to the close -- exactly the bug `_rebalance`
+  had.
+
+- **It is taken at construction, not lazily.** A reference that may or may
+  not exist makes the teardown rule conditional, and a conditional rule is
+  one that gets missed.
+
+- **`n` is bounded at both ends, and the upper bound is the load-bearing
+  one.** `MAX_BATCH` is 1,000,000, matching `confluent-kafka`'s cap on
+  `num_messages` -- checked against it, not assumed. The pointer array is
+  allocated before the call, so an unbounded `n` is an unbounded allocation
+  from one caller's slip. **0 is a deliberate divergence**: `confluent-kafka`
+  returns an empty list, this raises, because a drain loop built on a call
+  that can silently return nothing for a reason unrelated to the topic spins
+  forever. `test_consume_rejects_a_batch_size_it_cannot_honour` also asserts
+  `MAX_BATCH` itself is *accepted* -- an off-by-one that rejected the largest
+  legal batch would otherwise go unnoticed.
+
+- **`consume()` on a closed consumer raises, and must.** Releasing the queue
+  before the close -- which librdkafka requires -- leaves `_queue` at 0, and
+  `rd_kafka_consume_batch_queue` **faults** on NULL inside
+  `rd_kafka_consume_batch0` rather than returning an error. Measured: a
+  segfault, 1 run in 1. `poll()` after `close()` does not crash, so this is
+  the batch path's alone. `test_consume_after_close_raises_instead_of_faulting`
+  is the guard, and like the racing-close case it **crashes rather than
+  fails** if the check is removed.
+
+- **The topic name is cached across the batch.** `rd_kafka_topic_name` is a
+  crossing per message otherwise, and a batch is nearly always one topic.
+  That is what takes the per-message crossings from 3 to 2; the fetch itself
+  is 1 for the whole batch. `_decode` is shared with `poll_event`, which is
+  why it takes the topic name instead of reading it.
+
+- **The benchmark lives in `benchmarks/`, is local-only, and its cross-client
+  number is not settled.** `pixi run -e interop bench`, needs a real broker.
+  Two methodology points were learned the hard way and are written up in
+  `benchmarks/README.md`: the timed loop must drain a **warm local queue**
+  (without a prefetch pause every configuration measures fetch latency and
+  lands within 15% of the others, with batching apparently slower), and the
+  **median** must be reported, not the best (the spread is not one-sided, and
+  best-of-N rewards whichever client got luckiest). What reproduces is that
+  batching beats polling in both clients -- 1.44x here for us, 2.08x for
+  `confluent-kafka`.
+
+  **`consume_borrowed()` is where the win is, and it is measured.** All
+  three mojo modes and `confluent-kafka` return the same checksum over the
+  same topic, so the comparison is like for like and the speed is not
+  skipped work. Back to back in one session on one 50k topic: borrowed
+  17.4ms, our own `consume()` 35.7ms, `confluent-kafka`'s `consume()`
+  32.2ms. So **borrowed is ~2x our owned path and ~1.8-3.3x
+  `confluent-kafka`** -- the two runs disagree on magnitude, so quote
+  "roughly 2x". The owned path against `confluent-kafka` is **parity**,
+  which is what the code predicts: both copy every key and value, and only
+  the borrowed path does not.
+
+  **The owned-path cross-client ratio does not reproduce and must not be
+  quoted.** A
+  decomposition that removed our per-message decode work one piece at a time
+  produced a variant doing strictly less work that measured *slower* than the
+  one above it, and a single variant swinging 2.8x between runs -- so the
+  noise on this hardware exceeds the signal outright. The unmodified decode
+  reached 1,557,155 msg/s in that run, above the `confluent-kafka` median
+  from the published table. **Do not optimise our decode on the strength of
+  the 0.58x figure**; it is an artefact.
+
+  Parity is what the structure predicts anyway. `confluent-kafka`'s
+  `Message_new0` does, per message: `rd_kafka_topic_name` plus a Python str,
+  `PyBytes` for key and value, and `rd_kafka_message_timestamp`. We do the
+  same four with the topic name cached across the batch, plus **one** extra
+  crossing -- `rd_kafka_message_headers`, which it defers to `msg.headers()`.
+  That one call was measured and rejected as an explanation for any gap.
+
+- **`consume()` raises on a hard error and loses the batch with it;
+  `consume_events()` does not.** A Mojo `Error` is text and cannot carry the
+  records that arrived alongside. So the pair exists for the same reason
+  `poll`/`poll_event` does, and `consume_events` follows the control plane's
+  policy -- one bad entry must not hide the good ones beside it, so it raises
+  only when the error is the *only* thing in the batch.
+
 ### Transactions, and exactly-once
 
 `init_transactions` / `begin_transaction` / `send_offsets_to_transaction` /
@@ -820,6 +929,86 @@ topic the mock does not have comes back **abortable**, not "unknown topic".
 Create the input topic in these tests even though nothing produces to it
 through the mock.
 
+### Borrowed message views
+
+`Consumer.consume_borrowed(n)` returns a `MessageBatch` that still owns
+librdkafka's messages and lends `BorrowedMessage` views into them --
+`key()` and `value()` are `Span`s pointing at the fetched bytes, copied
+nowhere. The same shape as `rust-rdkafka`'s `BorrowedMessage`, alongside the
+owned `Message` rather than instead of it. Five things not to undo:
+
+- **The origin is a struct parameter, never `origin_of(self)` on the
+  accessor.** This is the whole safety argument and it is easy to "simplify"
+  into a use-after-free. Probed both ways: an origin taken from a `ref self`
+  borrow ends when the method returns, and the message is then freed
+  **before** the read -- it only looks correct because `free()` does not
+  scrub. Threading the batch's origin through `BorrowedMessage[origin]` and
+  returning `Span[UInt8, Self.origin]` instead makes the compiler extend the
+  batch's life past the last use of any span taken from it. Verified with an
+  instrumented destructor, and again through a span extracted and used after
+  the batch's last mention.
+
+- **The batch owns the messages and destroys them.** That is what bounds
+  every borrowed view. It is not `Copyable` -- two batches destroying one
+  message is a double free.
+
+- **Error and EOF entries are destroyed inside the fetch**, not handed to the
+  batch: they have no payload to lend, and a batch must not hold a message it
+  cannot describe.
+
+- **`rd_kafka_topic_name` is resolved once per batch**, via
+  `Lib.topic_name_ptr` which does *not* copy into a `String` -- the pointer
+  belongs to the topic handle and outlives every message in the batch. The
+  owned path's `topic_name` still copies; both exist deliberately.
+
+- **No headers on a borrowed view.** Each one is a separate name and value
+  that would have to be copied out individually, which is the cost this type
+  exists to avoid -- `confluent-kafka` defers them for the same reason. Use
+  `consume()` when you need them.
+
+`test_borrowed_and_owned_consume_agree` is the correctness guard: it reads
+the same topic both ways and asserts record for record on both halves,
+including a tombstone and an empty-but-present value, because presence is
+read from the pointer on this path too.
+`test_a_borrowed_batch_outlives_the_spans_taken_from_it` is the lifetime
+guard, and if it regresses it is a **use-after-free** -- it may crash or
+return plausible garbage, which is why it asserts on the payload's contents
+and not merely its length.
+
+### The origin research behind it
+
+`rust-rdkafka`'s `BorrowedMessage` hands back `Option<&[u8]>` pointing into
+librdkafka's own buffer -- no copy. We copy key and value into owned
+`List[UInt8]` on every message, as `confluent-kafka` does into `PyBytes`.
+That is the one structural difference between us and a zero-copy binding, and
+it is worth knowing exactly what Mojo can do about it. Probed, not assumed:
+
+- **Reading straight out of librdkafka's allocation works.** A
+  `Span[UInt8, origin_of(...)]` built over a `malloc`'d C buffer reads
+  correctly with no copy. Nothing stops us offering this.
+
+- **Mojo's origins *are* enforced for tracked memory.** A struct owning a
+  `List[UInt8]` that lends `Span[UInt8, origin_of(self._buf)]` keeps the
+  owner alive: with an instrumented `__deinit__`, transferring the owner
+  away (`_ = h^`) mid-scope ran the destructor **after** the last use of the
+  view, not at the transfer. That is Rust's guarantee, and the compiler
+  provides it.
+
+- **It is *not* enforced across `unsafe_from_address`.** The same shape over
+  foreign memory freed the buffer **before** the read -- a real
+  use-after-free that only looked fine because `free()` does not scrub.
+  Tying the origin to a real tracked field instead of to `self` did not help.
+  The reason is provenance: the pointer is fabricated from an `Int`, so the
+  compiler sees no live borrow of the owner and the declared origin is
+  decoration.
+
+So a zero-copy `BorrowedMessage` here would match Rust's *performance* but
+not its *safety*: the lifetime would rest on API shape and the `_ = owner^`
+discipline this file already documents under "Lifetimes", not on the checker.
+If it is built, the batch must own the raw messages and lend views that
+cannot outlive the loop -- and it belongs **beside** the owned `Message`, not
+instead of it, because the owned one is what makes a record safe to keep.
+
 ## What we build next
 
 Ordered by **leverage, not parity**. `confluent-kafka` is the reference for API
@@ -828,92 +1017,30 @@ its surface is administrative work people do from a CLI or Terraform. Build what
 unblocks a workload that is impossible today, and prefer the things that are
 worth more in Mojo than they are in Python.
 
-### 1. Batch `consume(n)`
+**Everything previously listed here is built.** Batch `consume(n)`,
+transactions end to end, and the borrowed zero-copy view all landed on
+`feat-mojo-1-0`; see "Already built" for each, and read those notes before
+touching any of it. There is no queued feature work, which means the next
+thing is a judgement call rather than a plan. Three candidates, none started:
 
-One call returning up to `n` messages, over `rd_kafka_consume_batch_queue`
-on the queue from `rd_kafka_queue_get_consumer` — which is exactly how
-`confluent-kafka-python`'s `Consumer.consume()` is built, so the shape to copy
-is proven against the same primitive.
+- **A borrowed producer path.** `produce()` copies its key and value through
+  `RD_KAFKA_MSG_F_COPY`. The consume side just showed what removing a copy
+  per record is worth (~2x); the produce side has never been measured. Do
+  the measurement before the work -- `F_COPY` exists so the caller's buffer
+  can go out of scope immediately, and taking that away is a real API cost
+  that a number should justify.
 
-**This is the item where Mojo beats a Python client**, but the reason is the
-batch it hands back, not the crossings it saves — see the arithmetic below.
-Mojo can process a run of records without a per-message interpreter round
-trip, which for the ML and data pipelines this package is aimed at is the
-difference between "a Kafka client in Mojo" and "a reason to use Mojo for
-Kafka". Ship it with a benchmark against `confluent-kafka`.
+- **Settle the cross-client benchmark somewhere quiet.** The numbers in
+  `benchmarks/README.md` are from a WSL2 laptop sharing a kernel with the
+  broker, and a single configuration swung 2.8x between runs there. The
+  borrowed result is large enough to survive that; the owned-path parity
+  claim is not. A quiet machine with `--repeat 9` would turn two ranges into
+  two numbers.
 
-**One batch call per consumer. This is not a style preference.** librdkafka's
-`INTRODUCTION.md` ("Note on Batch consume APIs"): using multiple instances of
-`rd_kafka_consume_batch()` / `rd_kafka_consume_batch_queue()` concurrently "is
-not thread safe and will result in undefined behaviour... This usecase is not
-supported and will not be supported in future as well." Three things about
-that, all checked:
-
-- **It is not in `rdkafka.h`.** Grepped against the installed 2.15 header:
-  the declaration carries nothing but `@sa rd_kafka_consume_batch()`. Since
-  `_ffi.mojo` is written against the header, the constraint is invisible from
-  where we work — which is the only reason it is written down here.
-- **The scope is per consumer, not global.** librdkafka's own listed
-  alternatives include "multiple consumers in same consumer group... each
-  consumer can run its own batch call". So N consumers each running a batch
-  call is the *recommended* scaling path, and the API needs no lock across
-  consumers. Parallelism goes **downstream** of the call — alternative 3 is
-  "read data from single batch call and process this data in parallel", which
-  is precisely the Mojo argument.
-- **There is no configuration where concurrent batch is defensible for us.**
-  The note's escape hatch is "don't use any of the **seek**, **pause**,
-  **resume** or **rebalancing** operation in conjunction with these API
-  calls". We have all four, and the rebalance trampoline is installed on
-  every consumer at construction. So `consume()` is single-instance per
-  `Consumer`, unconditionally.
-
-librdkafka raises no error for the violation — UB is silent — so enforcement
-is ours. Prefer a `_Latch` try-acquire that **raises** on a second concurrent
-entrant over one that serialises: serialising hides the caller's bug, and
-unlike the `subscribe()` latch under "Known coverage gaps" this one is a
-guard a test can actually fail.
-
-Two more things from the header, both load-bearing:
-
-- **`rd_kafka_queue_destroy()` MUST be called on the consumer queue before
-  `rd_kafka_consumer_close()`.** Given the "Lifetimes" rule that a field is
-  released at its last use *inside* the destructor body, a `_queue` field
-  held for batch consume has to be destroyed explicitly, before the close, in
-  both `close()` and `__deinit__`. That is the exact shape of the bug that
-  made every `close()`-less `Consumer` fault.
-- **Polling that queue counts as a consumer poll** and resets
-  `max.poll.interval.ms`, so batch consume feeds the liveness timer and
-  composes with the group protocol. No keepalive of our own.
-
-**The crossing arithmetic is `4n` → `1 + 3n`, not `4n` → `1`.** An earlier
-note here claimed the latter. A batch replaces only `consumer_poll`;
-`topic_name`, `message_timestamp` and `message_destroy` are still one call
-each per message (`consumer.mojo:662-718`), there is no bulk
-`rd_kafka_message_destroy` in the header, and the timestamp is not a field of
-the public `rd_kafka_message_t`. That is ~25%. Caching `topic_name` per
-`rkt` pointer across the batch — messages in one batch overwhelmingly share a
-topic handle — gets it to roughly `2n`, a real 2x. Design for that before
-writing the benchmark, or the number will disappoint.
-
-### 2. Transactions, for exactly-once
-
-`init_transactions` / `begin` / `send_offsets_to_transaction` / `commit` /
-`abort`. The headline correctness feature, and the one most worth having that
-`confluent-kafka` users reach for.
-
-**The mock does cover it** — an earlier note here claimed otherwise and was
-wrong. Probed against librdkafka 2.15: a transactional producer pointed at
-`MockCluster` completes `init_transactions`, `begin_transaction`, a produce and
-`commit_transaction`, so the mock serves `InitProducerId`, `AddPartitionsToTxn`
-and `EndTxn`. Docker-free, and therefore CI-gatable.
-
-**This item is done** — see "Transactions, and exactly-once" under "Already
-built". `init_transactions`, `begin`, `send_offsets_to_transaction`, `commit`
-and `abort` are all public, the error predicates are bound and branched on by
-`txn_action()`, and the mock suite covers the happy path and both failure
-branches without Docker.
-
-That leaves item 1, batch `consume(n)`, as the next thing to build.
+- **A `rust-rdkafka` peer for the benchmark.** `cargo` is on this machine.
+  It would answer the question the borrowed view was built to answer --
+  whether we are actually level with a zero-copy Rust binding, rather than
+  merely faster than a copying Python one.
 
 ### Deliberately not chasing
 
@@ -936,10 +1063,16 @@ None outstanding.
 
 ### Known coverage gaps
 
-None outstanding. Both entries that stood here are closed, and the second one
-is worth reading before adding a lock anywhere in this package: when a guard
-cannot be tested, the fix is usually to remove the need for it, not to write
-a test that passes either way.
+**None outstanding.** Both entries that once stood here are closed, and the
+way they closed is the part worth carrying forward:
+
+- When a guard cannot be tested, the fix is usually to **remove the need for
+  it**, not to write a test that passes either way. That is what happened to
+  the `subscribe()` latch below.
+- When a test keeps needing its bounds loosened, it is measuring the
+  environment rather than the code. `test_a_borrowed_batch_reports_end_of_
+  partition` asserts the contract for that reason, and its docstring records
+  the three attempts that did not.
 
 **All four `txn_action()` arms are covered by
 real errors** -- `is_fatal` and `txn_requires_abort` by mock error injection,

@@ -21,7 +21,7 @@ instead:
 
 from std.os import getenv, setenv
 from std.testing import TestSuite, assert_equal, assert_true
-from std.time import sleep
+from std.time import perf_counter_ns, sleep
 
 from kafka import (
     API_KEY_ADD_OFFSETS_TO_TXN,
@@ -1744,6 +1744,502 @@ def test_a_failed_offset_commit_asks_for_an_abort() raises:
     consumer.close()
 
     print("    a failed offset commit asked for an abort, and took it")
+    _ = cluster^
+
+
+# --- batch consume ----------------------------------------------------------
+
+
+def test_consume_returns_a_whole_batch_in_order() raises:
+    """`consume(n)` must hand back the same records `poll()` would, in order.
+
+    Asserts on **both** halves of every message and on the offsets, for the
+    reason `test_round_trip_preserves_key_and_value` does: a batch decoder
+    that transposed key and value, or that read the array with the wrong
+    stride, still returns the right *number* of messages.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("batch-order", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(20):
+        _ = producer.produce(
+            topic="batch-order", key="k" + String(i), value="v" + String(i)
+        )
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="batch-order-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["batch-order"])
+
+    var got = List[Message]()
+    var attempts = 0
+    while len(got) < 20 and attempts < 30:
+        attempts += 1
+        for ref m in consumer.consume(20, timeout_ms=1000):
+            got.append(m.copy())
+    assert_equal(len(got), 20, "consume() did not return the whole topic")
+
+    for i in range(20):
+        assert_equal(_text_of(got[i].key), "k" + String(i), "key out of order")
+        assert_equal(
+            _text_of(got[i].value), "v" + String(i), "value out of order"
+        )
+        assert_equal(got[i].offset, Int64(i), "offset out of order")
+        assert_equal(got[i].topic, "batch-order")
+    consumer.close()
+    print(
+        "    consume(20) returned 20 records in order, keys and values intact"
+    )
+    _ = cluster^
+
+
+def test_consume_returns_fewer_than_asked_rather_than_waiting() raises:
+    """A short batch is the normal case, not an error.
+
+    Ask for far more than exists: the call must come back with what is there
+    once the timeout expires, and an empty topic must give an empty list
+    rather than raising.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("batch-short", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="batch-short", value="v" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="batch-short-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["batch-short"])
+
+    var got = 0
+    var attempts = 0
+    while got < 3 and attempts < 30:
+        attempts += 1
+        got += len(consumer.consume(500, timeout_ms=1000))
+    assert_equal(got, 3, "consume() lost records when asked for more than 3")
+
+    # Nothing left: a quiet partition is an empty list.
+    assert_equal(
+        len(consumer.consume(500, timeout_ms=500)),
+        0,
+        "a drained partition must return an empty batch, not raise",
+    )
+    consumer.close()
+    print("    consume(500) over 3 records returned 3, then 0")
+    _ = cluster^
+
+
+def test_consume_preserves_headers_and_null_fields() raises:
+    """The batch decoder is a second decode path and must not be a lesser one.
+
+    Headers are borrowed from each raw message and have to be copied before
+    it is destroyed -- a batch destroys 20 messages in a loop, so a decoder
+    that pointed at them instead would read freed memory here and not in
+    `poll()`. Null and empty are asserted on `key` / `value` rather than the
+    text helpers, which collapse the two.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("batch-fields", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(
+        topic="batch-fields",
+        key="with-headers",
+        value="payload",
+        headers=[
+            Header("trace", "abc"),
+            Header("trace", "def"),
+            Header("empty", ""),
+            Header("null", None),
+        ],
+    )
+    _ = producer.produce(topic="batch-fields", key=None, value="")
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="batch-fields-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["batch-fields"])
+
+    var got = List[Message]()
+    var attempts = 0
+    while len(got) < 2 and attempts < 30:
+        attempts += 1
+        for ref m in consumer.consume(10, timeout_ms=1000):
+            got.append(m.copy())
+    assert_equal(len(got), 2, "consume() did not return both records")
+
+    ref first = got[0]
+    assert_equal(len(first.headers), 4, "headers lost in the batch decode")
+    assert_equal(first.headers[0].name, "trace")
+    assert_equal(_text_of(first.headers[0].value), "abc")
+    assert_equal(first.headers[1].name, "trace", "a repeated name was dropped")
+    assert_equal(_text_of(first.headers[1].value), "def")
+    assert_true(
+        Bool(first.headers[2].value)
+        and len(first.headers[2].value.value()) == 0,
+        "an empty header value came back null",
+    )
+    assert_true(
+        not first.headers[3].value, "a null header value came back empty"
+    )
+
+    ref second = got[1]
+    assert_true(not second.key, "a null key came back present")
+    assert_true(
+        Bool(second.value) and len(second.value.value()) == 0,
+        "an empty value came back null",
+    )
+    consumer.close()
+    print("    batch decode kept headers ordered and null apart from empty")
+    _ = cluster^
+
+
+def test_consume_events_reports_end_of_partition() raises:
+    """`consume_events()` is to `consume()` what `poll_event()` is to `poll()`.
+
+    With `enable_partition_eof`, the batch carries an EOF mark after the last
+    record. `consume()` drops it and `consume_events()` must not -- otherwise
+    a bounded drain has no way to know it reached the end.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("batch-eof", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="batch-eof", value="v" + String(i))
+    producer.flush(10000)
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id="batch-eof-group",
+        auto_offset_reset="earliest",
+        enable_partition_eof=True,
+    )
+    var consumer = Consumer(cfg)
+    consumer.subscribe(["batch-eof"])
+
+    var messages = 0
+    var eofs = 0
+    var attempts = 0
+    while eofs == 0 and attempts < 30:
+        attempts += 1
+        for ref event in consumer.consume_events(10, timeout_ms=1000):
+            if event.message:
+                messages += 1
+            elif event.eof:
+                eofs += 1
+                assert_equal(
+                    event.eof.value().offset,
+                    3,
+                    "the EOF mark is not at the end of the partition",
+                )
+    assert_equal(messages, 3, "records lost alongside the EOF mark")
+    assert_true(eofs > 0, "consume_events() never reported end-of-partition")
+    consumer.close()
+    print("    consume_events() reported 3 records then EOF at offset 3")
+    _ = cluster^
+
+
+def test_consume_keeps_the_group_alive_without_polling() raises:
+    """Batch consuming must feed `max.poll.interval.ms` on its own.
+
+    librdkafka counts a poll of the consumer queue as a consumer poll, so a
+    member that only ever calls `consume()` should keep its assignment. If
+    that were not so, a batch-only loop would be thrown out of its group
+    mid-run -- which is the `on_lost` path, and it would look like data loss
+    rather than a liveness bug.
+
+    Same 3000ms floor as the `on_lost` tests: below it the mock cannot
+    complete a JoinGroup.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("batch-alive", partition_count=1)
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id="batch-alive-group",
+        auto_offset_reset="earliest",
+    )
+    cfg.set("session.timeout.ms", "3000")
+    cfg.set("max.poll.interval.ms", "3000")
+    var consumer = Consumer(cfg)
+    consumer.subscribe(["batch-alive"])
+
+    # Nothing to read: every call is a timeout, and the timer must still be
+    # fed by them. Comfortably past max.poll.interval.ms in total.
+    for _ in range(5):
+        assert_equal(
+            len(consumer.consume(10, timeout_ms=1000)),
+            0,
+            "unexpected records on an empty topic",
+        )
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(topic="batch-alive", value="after-the-idle")
+    producer.flush(10000)
+
+    var got = 0
+    var attempts = 0
+    while got == 0 and attempts < 30:
+        attempts += 1
+        got += len(consumer.consume(10, timeout_ms=1000))
+    assert_equal(got, 1, "the consumer lost its assignment while batching")
+    consumer.close()
+    print(
+        "    5s of idle consume() kept the assignment; the next record arrived"
+    )
+    _ = cluster^
+
+
+def test_borrowed_and_owned_consume_agree() raises:
+    """The zero-copy path must return exactly what the copying one does.
+
+    This is the guard that matters for `consume_borrowed()`: it reads the
+    same bytes through a different mechanism -- `Span`s pointing into
+    librdkafka's buffer rather than owned copies -- so the two must agree
+    record for record, on **both** halves of every message. A borrowed
+    decoder that read the wrong offset, or the right offset with the wrong
+    length, still returns the right *number* of records.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("borrow-agree", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(12):
+        _ = producer.produce(
+            topic="borrow-agree", key="k" + String(i), value="v" + String(i)
+        )
+    # A tombstone and an empty-but-present value, because null and empty are
+    # different messages and the borrowed path decides presence from the
+    # pointer just as `copy_bytes` does.
+    _ = producer.produce(topic="borrow-agree", key="null-value", value=None)
+    _ = producer.produce(topic="borrow-agree", key="empty-value", value="")
+    producer.flush(10000)
+
+    var owned = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="borrow-agree-owned",
+            auto_offset_reset="earliest",
+        )
+    )
+    owned.subscribe(["borrow-agree"])
+    var by_copy = List[Message]()
+    var attempts = 0
+    while len(by_copy) < 14 and attempts < 30:
+        attempts += 1
+        for ref m in owned.consume(32, timeout_ms=1000):
+            by_copy.append(m.copy())
+    assert_equal(len(by_copy), 14, "the owned path did not read the topic")
+    owned.close()
+
+    var lender = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="borrow-agree-borrowed",
+            auto_offset_reset="earliest",
+        )
+    )
+    lender.subscribe(["borrow-agree"])
+
+    # Compare in place: the spans are only valid while their batch lives, so
+    # the assertions happen inside the loop that holds it.
+    var seen = 0
+    attempts = 0
+    while seen < 14 and attempts < 30:
+        attempts += 1
+        var batch = lender.consume_borrowed(32, timeout_ms=1000)
+        for i in range(len(batch)):
+            var record = batch[i]
+            ref expected = by_copy[seen]
+            assert_equal(
+                Int(record.partition()), Int(expected.partition), "partition"
+            )
+            assert_equal(Int(record.offset()), Int(expected.offset), "offset")
+            assert_equal(
+                String(unsafe_from_utf8=record.topic()),
+                expected.topic,
+                "topic",
+            )
+            assert_true(Bool(record.key()), "a key came back null")
+            assert_equal(
+                String(unsafe_from_utf8=record.key().value()),
+                _text_of(expected.key),
+                "key mismatch at " + String(seen),
+            )
+            # Null and empty must stay apart on the borrowed side too.
+            if expected.value:
+                assert_true(
+                    Bool(record.value()), "a present value came back null"
+                )
+                assert_equal(
+                    String(unsafe_from_utf8=record.value().value()),
+                    _text_of(expected.value),
+                    "value mismatch at " + String(seen),
+                )
+                assert_true(
+                    not record.is_tombstone(),
+                    "a present value read as a tombstone",
+                )
+            else:
+                assert_true(
+                    not record.value(), "a null value came back present"
+                )
+                assert_true(
+                    record.is_tombstone(), "a null value is a tombstone"
+                )
+            seen += 1
+        _ = batch^
+    assert_equal(seen, 14, "the borrowed path did not read the topic")
+    lender.close()
+
+    print("    borrowed and owned agree on 14 records, nulls included")
+    _ = cluster^
+
+
+def test_a_borrowed_batch_outlives_the_spans_taken_from_it() raises:
+    """The safety property, exercised rather than asserted.
+
+    A `BorrowedMessage` and any `Span` from it are parameterised by the
+    batch's origin, so holding one keeps the batch -- and therefore
+    librdkafka's messages -- alive. This reads through a span *after* the
+    batch's last syntactic mention, which is exactly the shape that faults
+    when the origin is not threaded properly.
+
+    If this regresses it is a **use-after-free**, so it may crash or return
+    plausible garbage rather than fail cleanly. The value assertion is what
+    catches the quiet version.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("borrow-life", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(topic="borrow-life", key="k", value="payload-here")
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="borrow-life-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["borrow-life"])
+
+    var checked = False
+    var attempts = 0
+    while not checked and attempts < 30:
+        attempts += 1
+        var batch = consumer.consume_borrowed(8, timeout_ms=1000)
+        if len(batch) == 0:
+            continue
+        var span = batch[0].value().value()
+        # `batch` is not mentioned again. The span must still be readable.
+        assert_equal(len(span), 12, "the borrowed payload changed length")
+        assert_equal(
+            String(unsafe_from_utf8=span),
+            "payload-here",
+            "the batch was destroyed while a span still pointed into it",
+        )
+        checked = True
+    assert_true(checked, "no record arrived to borrow")
+    consumer.close()
+
+    print("    spans stayed valid past the batch's last mention")
+    _ = cluster^
+
+
+def _eof_reader(bootstrap: String, group: String) raises -> Consumer:
+    """A consumer that reports end-of-partition. Not a test case."""
+    return Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id=group,
+            auto_offset_reset="earliest",
+            enable_partition_eof=True,
+        )
+    )
+
+
+def test_a_borrowed_batch_reports_end_of_partition() raises:
+    """A bounded drain must be possible **without leaving** the borrowed path.
+
+    End-of-partition marks carry no payload, so they are not records in a
+    `MessageBatch` -- but a caller draining a finite topic still has to know
+    when to stop, and `reached_end()` is the only way to learn it on this
+    path. Without it the sole remaining signal is a batch that comes back
+    empty, which costs an entire extra fetch.
+
+    **Found by benchmarking, not by reading the code**: the first version of
+    this type had no `reached_end`, and the borrowed path measured 19,927
+    msg/s against 1.2M for the owned one -- 200,000 records in 10.04s, one
+    whole 10s timeout and nothing else. Every record was returned, so no
+    correctness test would have caught it.
+
+    **This asserts the contract, not the saving**, and that is deliberate.
+    Three attempts to pin the saving here all failed for reasons that belong
+    to librdkafka rather than to this flag: `rd_kafka_consume_batch_queue`
+    blocks up to `timeout_ms` trying to *fill* the count it was asked for (5
+    records with `n=64` and a 10s timeout come back after the full 10s); the
+    group join costs several empty fetches before anything arrives at all;
+    and a fetch-count A/B against a second consumer is at the mercy of when
+    the mock decides to emit the EOF. A test that keeps needing its bounds
+    loosened is measuring the environment. The saving is the benchmark's job
+    and is recorded in `benchmarks/README.md`; the contract is this test's.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("borrow-eof", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(5):
+        _ = producer.produce(topic="borrow-eof", value="v" + String(i))
+    producer.flush(10000)
+
+    var consumer = _eof_reader(bootstrap, "borrow-eof-group")
+    consumer.subscribe(["borrow-eof"])
+
+    var seen = 0
+    var saw_end = False
+    var attempts = 0
+    while not saw_end and attempts < 30:
+        attempts += 1
+        var batch = consumer.consume_borrowed(64, timeout_ms=500)
+        seen += len(batch)
+        if batch.reached_end():
+            saw_end = True
+        _ = batch^
+
+    assert_true(saw_end, "the borrowed path never reported end-of-partition")
+    assert_equal(
+        seen, 5, "records were lost alongside the end-of-partition mark"
+    )
+    consumer.close()
+    print("    borrowed batch reported EOF after all 5 records")
     _ = cluster^
 
 

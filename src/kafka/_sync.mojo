@@ -5,12 +5,15 @@ either, so a caller driving a client from several threads is necessarily
 bringing its own, through MAX or through `pthread_create`. `std.atomic` is
 the whole toolbox, and `_Latch` is what gets built from it.
 
-Both clients hold state that a C callback reaches by address: `Producer`'s
-delivery-report failures and `Consumer`'s rebalance handler slots.
-librdkafka runs those callbacks on **whichever thread called `poll` /
-`flush` / `close`**, never on a background thread of its own, so several
-threads driving one client are several writers to that state. This is what
-makes them one.
+`Producer` holds state that a C callback reaches by address -- the
+delivery-report failure list. librdkafka runs that callback on **whichever
+thread called `poll` / `flush`**, never on a background thread of its own,
+so several threads draining one producer are several writers to one list.
+That is what this was built for.
+
+`Consumer` uses it for something different: `consume()` must not run twice
+at once on one consumer, and the latch is how that is **detected and
+refused** rather than serialised. See `try_acquire`.
 
 Two rules keep every use of it correct, and both have a specific failure
 mode behind them:
@@ -45,6 +48,19 @@ struct _Latch(Movable):
 
     def __init__(out self):
         self._flag = Atomic[DType.int64](0)
+
+    def try_acquire(mut self) -> Bool:
+        """Take the latch if it is free, or report that it is not.
+
+        For the case where contention is a **caller error rather than
+        ordinary sharing**: `Consumer.consume()` is undefined behaviour if
+        two threads enter it on one consumer, so it refuses the second
+        caller instead of queueing it. Serialising there would hide the bug
+        and hand back a silently different execution; failing loudly is the
+        whole point.
+        """
+        var expected = Int64(0)
+        return self._flag.compare_exchange(expected, 1)
 
     def acquire(mut self):
         # `compare_exchange` writes the observed value back into `expected`

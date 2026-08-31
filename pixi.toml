@@ -11,7 +11,7 @@ license = "Apache-2.0"
 example-producer = "mojo run -I src examples/producer_basic.mojo"
 example-consumer = "mojo run -I src examples/consumer_basic.mojo"
 example-ml = "mojo run -I src examples/ml_pipeline.mojo"
-lint = "mojo format src/ examples/ tests/ integration/"
+lint = "mojo format src/ examples/ tests/ integration/ benchmarks/"
 package = "mkdir -p dist && mojo precompile src/kafka -o dist/kafka.mojoc"
 test = "mojo run -I src tests/test_smoke.mojo"
 test-mock = "mojo run -I src integration/test_mock.mojo"
@@ -46,6 +46,8 @@ pytest = ">=8,<9"
 
 [feature.interop.tasks]
 test-interop = "pytest integration/interop -q"
+# Local only, like the Docker suites: needs a real broker and both clients.
+bench = "python benchmarks/run.py"
 
 [environments]
 interop = ["interop"]

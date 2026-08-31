@@ -29,6 +29,8 @@ from .admin import AdminClient
 from .config import ConsumerConfig, ProducerConfig
 from .consumer import (
     TIMESTAMP_CREATE_TIME,
+    BorrowedMessage,
+    MessageBatch,
     TIMESTAMP_LOG_APPEND_TIME,
     TIMESTAMP_NOT_AVAILABLE,
     Consumer,

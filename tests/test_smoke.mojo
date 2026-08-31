@@ -11,6 +11,7 @@ from std.ffi import OwnedDLHandle
 from std.testing import TestSuite, assert_equal, assert_true
 
 from kafka._ffi import PTR_STRIDE
+from kafka.consumer import MAX_BATCH
 from kafka.consumer import (
     Rebalance,
     RebalanceHandler,
@@ -876,6 +877,216 @@ def test_racing_close_calls_close_the_consumer_exactly_once() raises:
         " reported an error; only one may reach rd_kafka_consumer_close",
     )
     print("    ", _THREADS, "racing close() calls, none reported an error")
+
+
+def test_consume_rejects_a_batch_size_it_cannot_honour() raises:
+    """`n` is bounded at both ends, and the upper bound is the load-bearing one.
+
+    The array of `rd_kafka_message_t*` is allocated **before** the call, so an
+    unbounded `n` turns one caller's slip -- a variable holding a byte count
+    rather than a message count, say -- into a multi-gigabyte allocation
+    before a single record has arrived. `confluent-kafka` caps `num_messages`
+    at 1M for the same reason and this matches it, checked against
+    `confluent-kafka` 2.x rather than assumed.
+
+    **0 is a deliberate divergence.** `confluent-kafka` accepts `consume(0)`
+    and hands back an empty list; this raises. A drain loop built on a call
+    that can silently return nothing for a reason unrelated to the topic
+    spins forever, and 0 is only ever reached by accident.
+    """
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="batch-bounds"
+    )
+    cfg.set("log_level", "0")
+    var consumer = Consumer(cfg)
+
+    for bad in [0, -1, MAX_BATCH + 1]:
+        var raised = False
+        try:
+            _ = consumer.consume(bad, timeout_ms=10)
+        except e:
+            raised = True
+            assert_true(
+                String(e).find("n must be between") >= 0,
+                "unexpected error for n=" + String(bad) + ": " + String(e),
+            )
+        assert_true(raised, "consume(" + String(bad) + ") was accepted")
+
+    # The bound itself must be reachable -- an off-by-one here would reject
+    # the largest legal batch and nothing would notice.
+    _ = consumer.consume(MAX_BATCH, timeout_ms=10)
+    consumer.close()
+    print("    consume() bounds n to 1 ..", MAX_BATCH)
+
+
+def test_consume_after_close_raises_instead_of_faulting() raises:
+    """A closed consumer has no queue, and NULL is not one librdkafka checks.
+
+    `close()` drops the consumer-queue reference **before**
+    `rd_kafka_consumer_close`, which librdkafka requires -- so `_queue` is 0
+    afterwards, and handing that to `rd_kafka_consume_batch_queue` faults
+    inside `rd_kafka_consume_batch0` rather than returning an error. Measured:
+    it segfaults 1 run in 1 without the guard.
+
+    `poll()` after `close()` does **not** crash, so this asymmetry belongs to
+    the batch path alone. Note the failure mode if this regresses: the run
+    crashes rather than fails, the same shape as
+    `test_racing_close_calls_close_the_consumer_exactly_once`.
+
+    No broker: nothing listens on port 9, and an unsubscribed consumer has no
+    group to leave, so `close()` is local and prompt.
+    """
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="consume-after-close"
+    )
+    cfg.set("log_level", "0")
+    var consumer = Consumer(cfg)
+    consumer.close()
+
+    var raised = False
+    try:
+        _ = consumer.consume(4, timeout_ms=200)
+    except e:
+        raised = True
+        var text = String(e)
+        assert_true(
+            text.find("the consumer is closed") >= 0,
+            "unexpected error: " + text,
+        )
+    assert_true(raised, "consume() after close() reported success")
+
+    # The event form takes the same path and must be guarded by the same
+    # check, not by a copy of it that could drift.
+    raised = False
+    try:
+        _ = consumer.consume_events(4, timeout_ms=200)
+    except:
+        raised = True
+    assert_true(raised, "consume_events() after close() reported success")
+    print("    consume() after close() raised rather than faulting")
+
+
+@fieldwise_init
+struct _ConsumeWork(Copyable, Movable):
+    """One racing `consume()` caller and the slot it reports into."""
+
+    var consumer: Int
+    var results: Int
+    var index: Int
+    var gate: Int
+
+
+def _consume_worker(arg: Int) abi("C") -> Int:
+    """Call `consume()` and record which of the three things happened.
+
+    0 = returned normally, 1 = refused as a concurrent caller, 2 = some other
+    error. `abi("C")` may not raise, so the verdict is recorded.
+    """
+    ref work = Pointer[_ConsumeWork, ImmutAnyOrigin](unsafe_from_address=arg)[
+        unsafe_offset=0
+    ]
+    ref consumer = Pointer[Consumer, MutAnyOrigin](
+        unsafe_from_address=work.consumer
+    )[unsafe_offset=0]
+    var slots = Pointer[Int, MutAnyOrigin](unsafe_from_address=work.results)
+    ref gate = Pointer[Atomic[DType.int64], MutAnyOrigin](
+        unsafe_from_address=work.gate
+    )[unsafe_offset=0]
+    while gate.load() == 0:
+        pass
+    try:
+        _ = consumer.consume(16, timeout_ms=1500)
+        slots[unsafe_offset=work.index] = 0
+    except e:
+        var text = String(e)
+        if text.find("already inside consume()") >= 0:
+            slots[unsafe_offset=work.index] = 1
+        else:
+            slots[unsafe_offset=work.index] = 2
+    return 0
+
+
+def test_concurrent_consume_is_refused_not_serialised() raises:
+    """Two `consume()` calls on one consumer must not both run.
+
+    librdkafka is explicit that concurrent `rd_kafka_consume_batch_queue` on
+    one queue is **undefined behaviour** and that the case "will not be
+    supported in future as well" -- and it is silent about the violation, so
+    nothing detects it but us. It is also not in `rdkafka.h`, only in
+    `INTRODUCTION.md`, so a reader of the header would never know.
+
+    The rule could be honoured by serialising, and that would be wrong: it
+    hides the caller's bug and silently changes what their program does.
+    A second caller is **refused**.
+
+    This is deterministic rather than a race to lose: the winner sits inside
+    the batch call for its full 1.5s timeout against a dead port, so the
+    other seven arrive while it is unambiguously still in there. Exactly one
+    return and seven refusals is the assertion, and it fails both ways --
+    serialise the latch instead of refusing, or drop it entirely, and all
+    eight return.
+    """
+    var libc = _open_libc()
+    var create = libc.get_function[Int32]("pthread_create")
+    var join = libc.get_function[Int32]("pthread_join")
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="race-consume"
+    )
+    cfg.set("log_level", "0")
+    var consumer = Consumer(cfg)
+
+    var results = List[Int](length=_THREADS, fill=-1)
+    var gate = Atomic[DType.int64](0)
+    var work = List[_ConsumeWork](capacity=_THREADS)
+    var threads = List[Int](length=_THREADS, fill=0)
+    for t in range(_THREADS):
+        work.append(
+            _ConsumeWork(
+                Int(Pointer(to=consumer)),
+                Int(results.unsafe_ptr()),
+                t,
+                Int(Pointer(to=gate)),
+            )
+        )
+    for t in range(_THREADS):
+        var rc = create(
+            Int(threads.unsafe_ptr()) + t * PTR_STRIDE,
+            0,
+            _consume_worker,
+            Int(Pointer(to=work[t])),
+        )
+        assert_equal(Int(rc), 0, "pthread_create failed")
+
+    gate.store(1)
+    for t in range(_THREADS):
+        _ = join(threads[t], 0)
+
+    # Load-bearing, for the same reason as the racing-close case: without
+    # this the consumer's last use is in the loop above and it is destroyed
+    # before the threads ever run.
+    _ = consumer^
+
+    var returned = 0
+    var refused = 0
+    for r in results:
+        assert_true(r >= 0, "a consume() thread never reported")
+        if r == 0:
+            returned += 1
+        elif r == 1:
+            refused += 1
+        else:
+            raise Error("a consume() thread failed for an unexpected reason")
+    assert_equal(
+        returned,
+        1,
+        String(returned)
+        + " threads were inside consume() at once; exactly 1 may be",
+    )
+    assert_equal(refused, _THREADS - 1, "a concurrent caller was not refused")
+    print(
+        "    1 of", _THREADS, "consume() callers ran;", refused, "were refused"
+    )
 
 
 def main() raises:

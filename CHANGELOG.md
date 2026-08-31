@@ -135,6 +135,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape and the round trip, and both fail when broken.
 
 ### Added
+- **Zero-copy consume.** `Consumer.consume_borrowed(n)` returns a
+  `MessageBatch` that still owns librdkafka's messages and lends
+  `BorrowedMessage` views into them — `key()` and `value()` are `Span`s
+  pointing at the fetched bytes, copied nowhere. The shape `rust-rdkafka`'s
+  `BorrowedMessage` uses, offered **alongside** the owned `Message` rather
+  than instead of it.
+
+  **The lifetime is compiler-enforced.** The batch owns the messages and
+  destroys them; `BorrowedMessage[origin]` and the `Span`s it returns are
+  parameterised by that batch's origin, so holding either keeps the batch
+  alive. Threading the origin as a *struct parameter* is what makes this
+  work — taking it from a `ref self` borrow instead lets the messages be
+  freed before the read, which is a use-after-free that looks correct
+  because `free()` does not scrub.
+
+  Measured against `confluent-kafka` on the same topic, with every client
+  computing the same checksum: **~2x our own `consume()`** (17.4ms vs 35.7ms
+  for 50k records) and **~2x `confluent-kafka`'s `consume()`**. The owned
+  path remains at parity with `confluent-kafka`, which is what the code
+  predicts — both copy every key and value.
+
+  No headers on a borrowed view: each is a separate name and value that
+  would have to be copied out, which is the cost this avoids.
+  `MessageBatch.reached_end()` reports end-of-partition, without which a
+  bounded drain pays a full timeout per pass.
+
+- **Batch consume.** `Consumer.consume(n, timeout_ms)` returns up to `n`
+  messages from one `rd_kafka_consume_batch_queue` call, over the queue from
+  `rd_kafka_queue_get_consumer` — the same construction `confluent-kafka`'s
+  `Consumer.consume()` uses. `consume_events(n)` is the `poll_event()`
+  counterpart: it reports end-of-partition instead of dropping it, and
+  returns per-entry verdicts instead of raising, so one bad record cannot
+  take the good ones with it.
+
+  **Two `consume()` calls on one consumer are refused, not serialised.**
+  librdkafka documents concurrent `rd_kafka_consume_batch_queue` on one queue
+  as undefined behaviour that "will not be supported in future as well", and
+  says so only in `INTRODUCTION.md` — not in the header. It gives no error
+  for the violation, so the check is ours; queueing the second caller would
+  hide their bug and silently change what their program does. Scale by giving
+  each thread its own `Consumer` in the same group, which is what librdkafka
+  recommends, or by splitting the returned batch.
+
+  The consumer-queue reference is destroyed before `rd_kafka_consumer_close`
+  in both `close()` and the destructor, which librdkafka requires — and
+  `consume()` on a closed consumer therefore raises, because
+  `rd_kafka_consume_batch_queue` segfaults on the resulting NULL queue rather
+  than reporting an error.
+
+  `n` is bounded to 1..1,000,000, matching `confluent-kafka`'s cap on
+  `num_messages`: the pointer array is allocated before the call, so an
+  unbounded `n` is an unbounded allocation. `consume(0)` raises here where
+  `confluent-kafka` returns an empty list — a deliberate divergence, because
+  a drain loop around a call that can silently return nothing spins forever.
+
 - **Transactions, producer side.** `Producer.init_transactions()`,
   `begin_transaction()`, `commit_transaction()` and `abort_transaction()` —
   exactly-once for atomic multi-topic writes. The shape follows
