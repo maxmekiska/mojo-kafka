@@ -5,8 +5,18 @@ be loaded, or a symbol has moved, the first test fails loudly rather than
 at the first produce in someone's pipeline.
 """
 
+from std.os import getenv, setenv
+from std.atomic import Atomic
+from std.ffi import OwnedDLHandle
 from std.testing import TestSuite, assert_equal, assert_true
 
+from kafka._ffi import PTR_STRIDE
+from kafka.consumer import (
+    Rebalance,
+    RebalanceHandler,
+    _handler_from_word,
+    _handler_word,
+)
 from kafka import (
     KIND_AUTHORIZATION,
     KIND_FATAL,
@@ -16,9 +26,15 @@ from kafka import (
     KIND_TIMED_OUT,
     KIND_TRANSPORT,
     KIND_UNKNOWN_TOPIC_OR_PARTITION,
+    TXN_ABORT,
+    TXN_FATAL,
+    TXN_RETRY,
+    Consumer,
     ConsumerConfig,
     Producer,
     ProducerConfig,
+    KafkaError,
+    TopicPartition,
     kind_of,
     librdkafka_version,
 )
@@ -226,6 +242,247 @@ def test_error_kinds_classify_the_codes_callers_branch_on() raises:
     print("    kinds classify; QUEUE_FULL prints as", String(KIND_QUEUE_FULL))
 
 
+def test_txn_action_orders_abort_before_fatal() raises:
+    """The three-way transactional branch, in librdkafka's order.
+
+    This is the case the order exists for: librdkafka flags an error **both**
+    fatal and abortable, because the transactional producer treats most of
+    the idempotent producer's fatal errors as recoverable -- a transaction
+    can be aborted and replayed whole. Testing `is_fatal` first reads
+    correctly and answers `TXN_FATAL`, which tears down a producer that only
+    needed `abort_transaction()`.
+
+    Built from values rather than from a real error on purpose: no broker,
+    and every cell of the table is reachable, including the both-flags one
+    that a live cluster produces only under fencing.
+    """
+    # abortable alone.
+    assert_true(
+        KafkaError(-1, "abortable", txn_requires_abort=True).txn_action()
+        == TXN_ABORT,
+        "an abortable error must abort",
+    )
+
+    # Fatal *and* abortable -- the ordering case. Abort wins.
+    assert_true(
+        KafkaError(
+            -1, "both", is_fatal=True, txn_requires_abort=True
+        ).txn_action()
+        == TXN_ABORT,
+        "is_fatal was tested before txn_requires_abort",
+    )
+
+    # Retriable and abortable. Abort still wins: retrying a call that needs
+    # an abort leaves the transaction wedged.
+    assert_true(
+        KafkaError(
+            -1, "both", is_retriable=True, txn_requires_abort=True
+        ).txn_action()
+        == TXN_ABORT,
+        "is_retriable was tested before txn_requires_abort",
+    )
+
+    # Retriable alone.
+    assert_true(
+        KafkaError(-1, "retriable", is_retriable=True).txn_action()
+        == TXN_RETRY,
+        "a retriable error must be retried",
+    )
+
+    # Fatal alone.
+    assert_true(
+        KafkaError(-1, "fatal", is_fatal=True).txn_action() == TXN_FATAL,
+        "a fatal error must be fatal",
+    )
+
+    # No flags at all. librdkafka's guidance is explicit -- "treat all other
+    # errors as fatal" -- so this is not an "unknown" fourth tag.
+    assert_true(
+        KafkaError(-1, "unflagged").txn_action() == TXN_FATAL,
+        "an unflagged error must be treated as fatal",
+    )
+
+    assert_true(TXN_ABORT != TXN_FATAL, "actions collapsed")
+    print("    txn_action orders abort first; prints as", String(TXN_ABORT))
+
+
+def test_a_bare_error_code_claims_no_flags() raises:
+    """A `KafkaError` built from a code alone must not assert anything.
+
+    The flags live on `rd_kafka_error_t`, which most of this API never sees;
+    a bare `rd_kafka_resp_err_t` has nowhere to keep one. False here is the
+    absence of an opinion, not a claim that the operation was survivable --
+    which is why `txn_action()` is documented as meaningful only for an
+    error a transactional call returned.
+    """
+    var err = KafkaError(-185, "Local: Timed out")
+    assert_true(not err.is_fatal, "a bare code claimed to be fatal")
+    assert_true(not err.is_retriable, "a bare code claimed to be retriable")
+    assert_true(
+        not err.txn_requires_abort, "a bare code claimed to need an abort"
+    )
+    # The code still classifies, which is the part a bare code *can* answer.
+    assert_true(err.kind() == KIND_TIMED_OUT, "kind lost")
+
+
+def test_take_error_reads_the_flags_off_a_real_error() raises:
+    """The flags must survive `take_error`, which destroys what holds them.
+
+    Pure-value tests above cover the branch order but not the read: the
+    predicates are called on a `rd_kafka_error_t*` that is freed three lines
+    later, so dropping them, reading them after the destroy, or never
+    calling them at all all look identical from `KafkaError` alone.
+
+    `init_transactions` against a dead port is the cheapest flagged error this
+    package can raise without a broker -- probed, not assumed: seek and
+    `sasl_set_credentials` return NULL outright, and every other call
+    answers with a bare code. librdkafka answers this one
+    `__TIMED_OUT` with the **retriable** flag set, in the timeout it was
+    given, so the whole case costs 500ms and no Docker.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("transactional.id", "mojo-kafka-smoke-txn")
+    cfg.set("log_level", "0")
+    var p = Producer(cfg)
+
+    var failure = p.init_transactions(500)
+    assert_true(
+        Bool(failure), "init_transactions succeeded against a dead port"
+    )
+    ref err = failure.value()
+    assert_equal(err.code, -185, "expected __TIMED_OUT: " + String(err))
+    assert_true(
+        err.is_retriable,
+        "the retriable flag was lost crossing take_error: " + String(err),
+    )
+    assert_true(not err.is_fatal, "a timeout is not fatal")
+    assert_true(not err.txn_requires_abort, "a timeout needs no abort")
+    assert_true(
+        err.txn_action() == TXN_RETRY,
+        "a retriable timeout must be retried, not " + String(err.txn_action()),
+    )
+    assert_true(err.message != "", "no error string")
+    print("    real flagged error:", err, "->", err.txn_action())
+
+
+def test_a_producer_without_a_transactional_id_is_not_retriable() raises:
+    """The other half: an error librdkafka leaves entirely unflagged.
+
+    Without `transactional.id` the call fails immediately with
+    `__NOT_CONFIGURED` and no flags at all, which `txn_action()` must call
+    fatal rather than retry -- retrying would spin forever on a producer
+    whose configuration can never satisfy the call. It also pins the flags
+    as genuinely read per error, not stamped on by `take_error`.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("log_level", "0")
+    var p = Producer(cfg)
+
+    var failure = p.init_transactions(500)
+    assert_true(Bool(failure), "init_transactions succeeded with no txn id")
+    ref err = failure.value()
+    assert_equal(err.code, -145, "expected __NOT_CONFIGURED: " + String(err))
+    assert_true(not err.is_retriable, "a misconfiguration is not retriable")
+    assert_true(
+        err.txn_action() == TXN_FATAL,
+        "an unflagged error must be fatal, not " + String(err.txn_action()),
+    )
+
+
+def _slot_marker_a(event: Rebalance) raises:
+    _ = setenv("MOJO_KAFKA_SLOT_MARKER", "A", overwrite=True)
+
+
+def _slot_marker_b(event: Rebalance) raises:
+    _ = setenv("MOJO_KAFKA_SLOT_MARKER", "B", overwrite=True)
+
+
+def test_a_handler_slot_is_one_word() raises:
+    """A rebalance handler slot must be a single naturally-aligned word.
+
+    This is the guard that replaced an untestable lock, and it is the same
+    kind of guard as the struct-stride ones: it asserts the *shape* the
+    safety argument depends on, because the race it protects against cannot
+    be provoked on demand.
+
+    `subscribe()` writes these slots and the rebalance trampoline reads them
+    on another thread. One word means one atomic store and one atomic load,
+    so a reader sees the whole old address or the whole new one. They used to
+    hold `Optional[RebalanceHandler]`, guarded by a `_Latch`, on the recorded
+    reasoning that a slot was "pointer-sized and aligned" and so could not
+    tear. **Measured here, that was false** -- an `Optional` is a
+    discriminant *plus* the pointer -- so an unguarded read could pair
+    `has_value = True` with the other value's payload and call through it.
+
+    So both halves are asserted: the bare handler is one word, and the
+    `Optional` is not. Put a multi-word type back in those slots and this
+    fails.
+    """
+    var bare = List[RebalanceHandler](capacity=2)
+    bare.append(_slot_marker_a)
+    bare.append(_slot_marker_b)
+    var bare_stride = Int(bare.unsafe_ptr().unsafe_offset(1)) - Int(
+        bare.unsafe_ptr()
+    )
+    assert_equal(
+        bare_stride,
+        PTR_STRIDE,
+        "a handler is no longer a single word; the slots cannot stay atomic",
+    )
+
+    var boxed = List[Optional[RebalanceHandler]](capacity=2)
+    boxed.append(Optional[RebalanceHandler](_slot_marker_a))
+    boxed.append(Optional[RebalanceHandler](_slot_marker_b))
+    var boxed_stride = Int(boxed.unsafe_ptr().unsafe_offset(1)) - Int(
+        boxed.unsafe_ptr()
+    )
+    assert_true(
+        boxed_stride > PTR_STRIDE,
+        (
+            "Optional[RebalanceHandler] is now one word -- re-check"
+            " _RebalanceState, the reasoning there assumes it is not"
+        ),
+    )
+    print(
+        "    handler slot:",
+        bare_stride,
+        "bytes; Optional would be",
+        boxed_stride,
+    )
+
+
+def test_a_handler_survives_the_round_trip_through_its_slot() raises:
+    """The pun the slots rest on must reach the *same* function.
+
+    A slot holds a raw code address, so `_handler_word` / `_handler_from_word`
+    are what stand between an atomic store and calling the right handler.
+    Two distinct handlers, because a round trip that always returned the
+    first one would pass with a single one.
+    """
+    var word_a = _handler_word(_slot_marker_a)
+    var word_b = _handler_word(_slot_marker_b)
+    assert_true(word_a != 0 and word_b != 0, "a handler address was 0")
+    assert_true(word_a != word_b, "two handlers share one address")
+
+    var event = Rebalance(List[TopicPartition](), False, 0, 0, 0)
+
+    _ = setenv("MOJO_KAFKA_SLOT_MARKER", "", overwrite=True)
+    _handler_from_word(word_a)(event)
+    assert_equal(
+        getenv("MOJO_KAFKA_SLOT_MARKER"),
+        "A",
+        "the slot called the wrong handler",
+    )
+
+    _handler_from_word(word_b)(event)
+    assert_equal(
+        getenv("MOJO_KAFKA_SLOT_MARKER"),
+        "B",
+        "the slot called the wrong handler",
+    )
+    print("    handler round-tripped through its slot and kept its identity")
+
+
 def test_delivery_reports_carry_a_branchable_kind() raises:
     """A rejection's kind is readable without matching on error text.
 
@@ -289,6 +546,336 @@ def test_queue_full_is_branchable_backpressure() raises:
     )
     print("    backpressure surfaced as", String(p.last_error_kind()))
     _ = p.take_failures()
+
+
+# --- concurrent producer ----------------------------------------------------
+#
+# `Producer` claims to tolerate being driven from more than one thread, and
+# that claim is worth exactly as much as a test that actually does it. Mojo
+# 1.0 ships no thread API -- there is no `std.sync` and no `parallelize`
+# outside MAX, which this package deliberately does not depend on -- so the
+# threads come from libc through the same `abi("C")` mechanism the rebalance
+# and delivery callbacks use.
+#
+# Nothing listens on port 9, so every message fails at `message.timeout.ms`.
+# That is the point: a *delivered* message never touches the failure list,
+# because the trampoline's success path returns before it. Only a failing
+# one exercises the latch, and only many failing ones arriving from several
+# threads at once exercise it under contention.
+
+comptime _THREADS = 8
+comptime _PER_THREAD = 400
+comptime _TOTAL = _THREADS * _PER_THREAD
+
+
+def _open_libc() raises -> OwnedDLHandle:
+    """libc, for `pthread_create` / `pthread_join`.
+
+    Same candidate-list shape as `_open_librdkafka`, for the same reason:
+    the name differs per platform and CI runs both. glibc 2.34 folded the
+    pthread symbols into libc proper, and on macOS they have always lived
+    in libSystem.
+    """
+    var candidates = [
+        String("libc.so.6"),
+        String("libc.so"),
+        String("libSystem.B.dylib"),
+    ]
+    for name in candidates:
+        try:
+            return OwnedDLHandle(name)
+        except:
+            continue
+    raise Error("could not load libc for pthread_create")
+
+
+@fieldwise_init
+struct _Work(Copyable, Movable):
+    """What one producing thread needs. Passed as `pthread_create`'s `void *`.
+
+    Addresses rather than references: a thin C callback captures nothing, so
+    this struct is the entire world the thread body can see.
+    """
+
+    var producer: Int
+    var tokens: Int
+    var start: Int
+    var count: Int
+
+
+def _produce_worker(arg: Int) abi("C") -> Int:
+    """Produce `count` messages, recording each token in its own slot.
+
+    The slots are disjoint per thread, so the token array needs no lock --
+    the contention this test is looking for is inside `Producer`, and a
+    lock out here would only mask it.
+
+    `poll(0)` between produces is what puts the delivery-report callback on
+    *this* thread as well as the main one, which is the case `_Latch` exists
+    for: librdkafka runs the callback on whichever thread called poll.
+    """
+    try:
+        ref work = Pointer[_Work, ImmutAnyOrigin](unsafe_from_address=arg)[
+            unsafe_offset=0
+        ]
+        ref producer = Pointer[Producer, MutAnyOrigin](
+            unsafe_from_address=work.producer
+        )[unsafe_offset=0]
+        var slots = Pointer[Int, MutAnyOrigin](unsafe_from_address=work.tokens)
+        for i in range(work.count):
+            var at = work.start + i
+            slots[unsafe_offset=at] = producer.produce(
+                topic="nowhere", value="c-" + String(at)
+            )
+            if i % 8 == 7:
+                _ = producer.poll(0)
+    except:
+        # A thread body may not raise across the C boundary. A failure here
+        # leaves this thread's slots at 0, which the assertions below catch
+        # as a missing token rather than passing quietly.
+        pass
+    return 0
+
+
+def test_concurrent_produce_keeps_every_sequence_and_report() raises:
+    """Four threads producing at once must not lose or duplicate a message.
+
+    Two pieces of `Producer` state are shared, and this asserts on both:
+
+    - **The sequence counter.** It is an `Atomic`, so `fetch_add` hands each
+      message its own token. A plain `+= 1` loses increments under
+      contention, and two messages sharing a token is not a cosmetic bug --
+      it mis-attributes their delivery reports to each other. Asserting the
+      tokens are exactly `1 ..= _TOTAL` catches both a duplicate and a gap.
+
+    - **The failure list.** Every one of these messages times out, so all
+      `_TOTAL` reports are appended through `_Latch` from whichever threads
+      happen to be inside `poll` / `flush`, while the main thread reads the
+      running count. An unguarded `List` reallocating under a concurrent
+      append is a corrupted heap, not a wrong number.
+
+    The thread and message counts are **measured, not guessed.** Reverting
+    the producer to a plain `+= 1` and no latch, this fails 6 runs out of 6
+    at 8x400; at the 4x50 it was first written with it caught the same
+    regression only 3 times in 6, which is a guard that lets half of them
+    through. Do not lower them without re-measuring the same way.
+    """
+    var libc = _open_libc()
+    var create = libc.get_function[Int32]("pthread_create")
+    var join = libc.get_function[Int32]("pthread_join")
+
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("message.timeout.ms", "2000")
+    cfg.set("log_level", "0")
+    var producer = Producer(cfg)
+
+    var tokens = List[Int](length=_TOTAL, fill=0)
+    # Sized once and never appended to: `_Work` addresses are handed to
+    # threads, and a reallocating append would leave every one of them
+    # dangling -- the `_VuArray` rule, one layer up.
+    var work = List[_Work](capacity=_THREADS)
+    var threads = List[Int](length=_THREADS, fill=0)
+    for t in range(_THREADS):
+        work.append(
+            _Work(
+                Int(Pointer(to=producer)),
+                Int(tokens.unsafe_ptr()),
+                t * _PER_THREAD,
+                _PER_THREAD,
+            )
+        )
+
+    for t in range(_THREADS):
+        # The element's own address rather than base + t * stride: the
+        # stride of a *Mojo* struct is the compiler's business, and this
+        # package hand-computes offsets only for C structs it has probed.
+        var rc = create(
+            Int(threads.unsafe_ptr()) + t * PTR_STRIDE,
+            0,
+            _produce_worker,
+            Int(Pointer(to=work[t])),
+        )
+        assert_equal(Int(rc), 0, "pthread_create failed")
+
+    # A concurrent *reader* while the workers produce and drain: this is the
+    # side of the latch the worker threads do not exercise.
+    var observed = 0
+    for _ in range(200):
+        observed = producer.delivery_failures()
+
+    for t in range(_THREADS):
+        _ = join(threads[t], 0)
+
+    var raised = False
+    try:
+        producer.flush(20000)
+    except:
+        raised = True
+    assert_true(raised, "flush() reported success for messages that timed out")
+
+    # Every token distinct, none zero, none missing. A presence array says
+    # all three at once: a duplicate trips the second mark, a lost increment
+    # leaves a hole, and a thread that died leaves its slot at 0, which is
+    # out of range because sequences start at 1.
+    var seen = List[Bool](length=_TOTAL + 1, fill=False)
+    for token in tokens:
+        assert_true(
+            token >= 1 and token <= _TOTAL,
+            "token out of range: " + String(token),
+        )
+        assert_true(
+            not seen[token], "two messages shared token " + String(token)
+        )
+        seen[token] = True
+    for i in range(1, _TOTAL + 1):
+        assert_true(seen[i], "no message ever claimed token " + String(i))
+
+    var reports = producer.take_failures()
+    assert_equal(
+        len(reports), _TOTAL, "a delivery report was lost between threads"
+    )
+    assert_equal(len(producer.failures()), 0)
+    assert_true(observed >= 0, "concurrent read of the failure count faulted")
+    print(
+        "    ",
+        _THREADS,
+        "threads produced",
+        _TOTAL,
+        "distinct tokens and",
+        len(reports),
+        "reports",
+    )
+
+
+# --- concurrent consumer teardown -------------------------------------------
+
+
+@fieldwise_init
+struct _CloseWork(Copyable, Movable):
+    """One racing `close()` caller and the slot it reports into.
+
+    `gate` is a start barrier. Without it the threads are staggered by the
+    `pthread_create` loop itself, and an unsubscribed `close()` returns so
+    fast that thread 1 is finished before thread 2 exists -- which is
+    exactly why the first version of this test passed against the very race
+    it was written to catch.
+    """
+
+    var consumer: Int
+    var results: Int
+    var index: Int
+    var gate: Int
+
+
+def _close_worker(arg: Int) abi("C") -> Int:
+    """Call `close()` and record whether it reported an error.
+
+    Slots are disjoint per thread, so nothing out here needs a lock: what is
+    under test is inside `Consumer`.
+    """
+    ref work = Pointer[_CloseWork, ImmutAnyOrigin](unsafe_from_address=arg)[
+        unsafe_offset=0
+    ]
+    ref consumer = Pointer[Consumer, MutAnyOrigin](
+        unsafe_from_address=work.consumer
+    )[unsafe_offset=0]
+    var slots = Pointer[Int, MutAnyOrigin](unsafe_from_address=work.results)
+    # Line up on the barrier so every thread calls close() at once.
+    ref gate = Pointer[Atomic[DType.int64], MutAnyOrigin](
+        unsafe_from_address=work.gate
+    )[unsafe_offset=0]
+    while gate.load() == 0:
+        pass
+    # `close()` is the only thing here that can raise, and an `abi("C")`
+    # function may not -- so the verdict is recorded rather than propagated.
+    try:
+        consumer.close()
+        slots[unsafe_offset=work.index] = 0
+    except:
+        slots[unsafe_offset=work.index] = 1
+    return 0
+
+
+def test_racing_close_calls_close_the_consumer_exactly_once() raises:
+    """`close()` is documented safe to call more than once. That has to hold
+    across threads too.
+
+    It used to be a plain read of a `Bool` followed by a write, so every
+    thread could pass the check before any of them set it. **Measured, and
+    worse than it sounds:** with the compare-exchange reverted, all 8
+    threads reach `rd_kafka_consumer_close`, exactly one returns, and the
+    other 7 never come back -- concurrent closes of one consumer handle
+    deadlock inside librdkafka. Sequentially the second close merely returns
+    -197, which is what made this look like a cosmetic problem.
+
+    So note the failure mode: if this regresses **the run hangs rather than
+    fails**. That is the bug being caught, not a flaw in the test -- 3 runs
+    out of 3 hang with the fix reverted, and 3 out of 3 pass in well under a
+    second with it.
+
+    No broker: nothing listens on port 9, and an unsubscribed consumer has
+    no group to leave, so `close()` is local and prompt.
+    """
+    var libc = _open_libc()
+    var create = libc.get_function[Int32]("pthread_create")
+    var join = libc.get_function[Int32]("pthread_join")
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="race-close"
+    )
+    cfg.set("log_level", "0")
+    var consumer = Consumer(cfg)
+
+    var results = List[Int](length=_THREADS, fill=-1)
+    var gate = Atomic[DType.int64](0)
+    var work = List[_CloseWork](capacity=_THREADS)
+    var threads = List[Int](length=_THREADS, fill=0)
+    for t in range(_THREADS):
+        work.append(
+            _CloseWork(
+                Int(Pointer(to=consumer)),
+                Int(results.unsafe_ptr()),
+                t,
+                Int(Pointer(to=gate)),
+            )
+        )
+    for t in range(_THREADS):
+        var rc = create(
+            Int(threads.unsafe_ptr()) + t * PTR_STRIDE,
+            0,
+            _close_worker,
+            Int(Pointer(to=work[t])),
+        )
+        assert_equal(Int(rc), 0, "pthread_create failed")
+
+    # Every thread is now spinning on the barrier; release them together.
+    gate.store(1)
+
+    for t in range(_THREADS):
+        _ = join(threads[t], 0)
+
+    # **Load-bearing.** The consumer's last use would otherwise be
+    # `Pointer(to=consumer)` in the loop above, and Mojo destroys a value at
+    # its last use -- so it would be torn down *before* the threads ran, and
+    # every one of them would race on freed memory and return early. The
+    # first version of this test did exactly that and passed against the
+    # very bug it was written to catch.
+    _ = consumer^
+
+    var errors = 0
+    for r in results:
+        assert_true(r >= 0, "a close() thread never reported")
+        errors += r
+    assert_equal(
+        errors,
+        0,
+        String(errors)
+        + " of "
+        + String(_THREADS)
+        + " racing close() calls"
+        " reported an error; only one may reach rd_kafka_consumer_close",
+    )
+    print("    ", _THREADS, "racing close() calls, none reported an error")
 
 
 def main() raises:

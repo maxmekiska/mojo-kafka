@@ -7,7 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Dropping a `Consumer` without calling `close()` segfaulted.** Every
+  consumer, subscribed or not, whether or not it had rebalance handlers.
+
+  `Consumer.__deinit__` calls `rd_kafka_consumer_close`, which fires one last
+  revoke through the rebalance trampoline — and the trampoline reaches the
+  consumer's state by the raw address handed to `rd_kafka_conf_set_opaque`.
+  Mojo releases each field at its last use **inside the destructor body**,
+  not after the body returns, so a `_rebalance` box that the body never
+  mentions was already freed by the time `consumer_close` ran, and the
+  callback read dangling memory.
+
+  The whole test suite missed this because all 21 cases closed by hand.
+  `test_dropping_a_subscribed_consumer_does_not_fault` now covers the
+  destructor path; it faults 3 runs out of 3 with the fix reverted.
+
+  `Producer` had the same shape and survived only by accident — its
+  `_drain_until_empty` takes `mut self`, which borrows the whole struct and
+  so happens to cover its `_dr` box. Both are now pinned explicitly.
+
+- **Concurrent `Consumer.close()` calls deadlocked the process.** `close()`
+  read a `Bool` and then set it, so every thread calling it could pass the
+  check before any of them set it. Sequentially a second
+  `rd_kafka_consumer_close` merely returns -197, which made this look
+  cosmetic; concurrently it is not. Measured with 8 threads: all 8 reach the
+  C call, exactly one returns, and the other 7 never do.
+
+  The flag is now claimed with a compare-exchange, so exactly one caller
+  reaches librdkafka and the losers return immediately — documented as such,
+  since leaving a group is a network round trip and there is no blocking
+  primitive in Mojo 1.0 to wait on properly.
+  `test_racing_close_calls_close_the_consumer_exactly_once` guards it and
+  needs no broker. Note its failure mode: a regression **hangs** the run
+  rather than failing it, 3 times out of 3.
+
+- **`rd_kafka_new` failures reported a corrupted message.** The error buffer
+  was decoded after the intervening `rd_kafka_conf_destroy` call, by which
+  point Mojo had released it and the stack slot had been partly overwritten,
+  so a misconfiguration surfaced as
+
+      rd_kafka_new: \xef@\xb71      @st be >= `session.timeout.ms`
+
+  instead of ``​`max.poll.interval.ms`must be >= `session.timeout.ms` ``. The
+  tail survived, which made it look like an encoding problem rather than a
+  lifetime one. The text is now decoded before the destroy.
+
+- **`AdminClient.create_topic()` faulted instead of raising** when
+  `rd_kafka_queue_new` returned NULL — `rd_kafka_CreateTopics` dereferences
+  the queue. `Consumer.subscribe()` gained the matching NULL check on
+  `rd_kafka_topic_partition_list_new`.
+
 ### Changed
+- **`Producer` is now safe to drive from more than one thread.** `produce()`,
+  `produce_bytes()`, `poll()`, `flush()`, `failures()`, `take_failures()` and
+  `delivery_failures()` may all be called concurrently on one producer.
+
+  Two pieces of Mojo state were unsynchronised. The sequence counter is now
+  an `Atomic` — a plain `+= 1` loses increments under contention, and two
+  messages sharing a token mis-attributes their delivery reports to each
+  other, which is a correctness bug rather than a cosmetic one. The failure
+  list is now guarded by a spinlock built on `Atomic`, since Mojo 1.0 ships
+  no mutex; the delivery-report callback runs on whichever thread called
+  `poll` / `flush`, so several threads draining are several writers to it.
+
+  `last_error_kind()` is the one thing that does not become thread-safe,
+  and cannot: it is a single slot on the producer, so with two threads
+  producing a caller can read the other thread's rejection. That is not a
+  data race — the slot is atomic — but it is not attributable either. Branch
+  on `DeliveryReport.kind()`, which names its message.
+
+  `test_concurrent_produce_keeps_every_sequence_and_report` drives eight
+  real threads through `pthread_create` (Mojo 1.0 has no thread API, and MAX
+  is deliberately not a dependency here) and asserts every token is distinct
+  and every report survives. It fails 6 runs out of 6 with the
+  synchronisation reverted.
+
+- **`Consumer` is safe to drive from more than one thread too**, now that
+  `close()` is fixed. Its reading calls — `poll()`, `poll_event()` and the
+  control plane — hold no mutable Mojo state and were always fine.
+  `subscribe()` now writes the three rebalance handler slots under a latch
+  the trampoline reads them through; that one is a **reasoned** fix rather
+  than a measured one, and the docstring says so: the slots are aligned and
+  pointer-sized, so what the latch actually excludes is a torn *set* — the
+  new `on_assign` paired with the previous `on_revoke` — not a torn pointer.
+
+  This does not make one `Consumer` a work-sharing primitive: two threads
+  polling one consumer split a single assignment's records between them,
+  which is rarely the intent. One consumer per thread, or more members in
+  the group.
+
+  The lock itself moved to a new internal `_sync.mojo` now that both clients
+  need it, with the two rules that keep every use correct: no FFI call
+  inside a critical section, and never raise while holding one.
+
 - **Delivery reports now go through a `dr_msg_cb`** rather than librdkafka's
   event queue. No API change — `failures()`, `take_failures()` and
   `flush()`'s raise-on-rejection behave exactly as before — but the producer
@@ -19,7 +112,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   200k messages, throughput is indistinguishable — the run-to-run spread is
   far wider than the difference between the two paths.
 
+### Changed
+- **Rebalance handler slots are single atomic words, and the lock around them
+  is gone.** `subscribe()` writes three handler slots that the rebalance
+  trampoline reads on another thread. They were `Optional[RebalanceHandler]`
+  guarded by a spinlock, justified by the recorded reasoning that a slot was
+  "pointer-sized and aligned" and so could not tear.
+
+  Measured, that was wrong: `Optional[RebalanceHandler]` is **16 bytes** — a
+  discriminant plus the pointer — against 8 for the bare handler. An
+  unguarded read could therefore pair `has_value = True` with the other
+  value's payload and call through it, which is worse than the mispaired
+  handler the note described.
+
+  The lock excluded it but could not be tested: the trampoline reads a slot
+  only during a rebalance, which happens twice in a test against thousands of
+  writes, so the window is never hit — four threads hammering `subscribe()`
+  misbehaved 0 times in 5 unguarded. The slots now hold the bare code address
+  in an `Atomic`, where a single naturally-aligned word cannot tear, and the
+  lock is removed from the callback path. `test_a_handler_slot_is_one_word`
+  and `test_a_handler_survives_the_round_trip_through_its_slot` guard the
+  shape and the round trip, and both fail when broken.
+
 ### Added
+- **Transactions, producer side.** `Producer.init_transactions()`,
+  `begin_transaction()`, `commit_transaction()` and `abort_transaction()` —
+  exactly-once for atomic multi-topic writes. The shape follows
+  `confluent-kafka`; the state is entirely librdkafka's, and this package
+  tracks none of it.
+
+  **They return `Optional[KafkaError]` rather than raising.** `None` is
+  success. `confluent-kafka` raises, but its `KafkaException` carries a
+  `KafkaError` with `.fatal()`, `.retriable()` and `.txn_requires_abort()`
+  on it — and Mojo 1.0's `Error` is text only, so raising here would discard
+  exactly the three flags the caller must branch on. Branch with
+  `KafkaError.txn_action()`.
+
+  `commit_transaction()` and `abort_transaction()` default to `timeout_ms=-1`,
+  which librdkafka calls strongly recommended — it means the transaction's
+  remaining time, and other values risk internal state desynchronisation.
+  `commit_transaction()` flushes on its own; do not add a `flush()` before it.
+  `abort_transaction()` purges anything still queued, and each purged message
+  surfaces as an ordinary delivery failure — call `take_failures()` after an
+  abort to acknowledge them.
+
+- **`Producer.send_offsets_to_transaction()` and
+  `Consumer.consumer_group_metadata()`** — read-process-write exactly-once.
+  The consumer's offsets are committed *inside* the producer's transaction,
+  so input and output land together or not at all; a failed transaction
+  leaves the group uncommitted and the input replays.
+
+  Three librdkafka requirements fail silently and are documented on the
+  method: the offsets are the **next** message to consume (which is what
+  `Consumer.position()` reports, so hand it the assignment), the consumer
+  needs `enable.auto.commit=false`, and invalid offsets are skipped — a call
+  with none valid returns success having done nothing. Unlike the other
+  transactional calls this one is retriable but **not resumable**: retry with
+  identical offsets and metadata.
+
+  `ConsumerGroupMetadata` is not copyable (the handle is freed once) and is a
+  snapshot of the group generation, so take it inside the transaction that
+  sends the offsets rather than once at startup.
+
+  Note for anyone writing tests against this: librdkafka's **mock broker
+  accepts `TxnOffsetCommit` and never serves it back through `OffsetFetch`**,
+  so `committed()` there reports `OFFSET_INVALID` whether the transaction
+  committed or aborted. Assertions about the committed offset are therefore
+  vacuous on the mock and live in the real-broker suite.
+
+- **`MockCluster.push_request_errors()`**, over
+  `rd_kafka_mock_push_request_errors_array` — makes the mock broker answer
+  chosen requests with chosen error codes. This is how librdkafka tests its
+  own transactional error handling, and it is what makes the fatal and
+  abortable branches testable without Docker: the flags are set by the
+  *client* from the broker's code, so injecting at the mock exercises the
+  real classification rather than a stand-in for it.
+
+- **`KafkaError` now carries librdkafka's three error flags** — `is_fatal`,
+  `is_retriable` and `txn_requires_abort` — read off `rd_kafka_error_t` in
+  `Lib.take_error`, which is the only place they *can* be read: it is what
+  destroys the object holding them, and they do not live on the error code.
+
+  `KafkaError.txn_action()` reduces them to the three-way branch every
+  transactional call requires, as a `TxnAction` (`TXN_ABORT`, `TXN_RETRY`,
+  `TXN_FATAL`). The order is librdkafka's and is not the obvious one: abort
+  is tested **before** fatal, because the transactional producer treats most
+  of the idempotent producer's fatal errors as abortable — a transaction can
+  be aborted and replayed whole — so an error can carry both flags and the
+  abort is the correct response. An error with none of the three flags set
+  is `TXN_FATAL`, following librdkafka's explicit "treat all other errors as
+  fatal".
+
+  A `KafkaError` built from a bare `rd_kafka_resp_err_t` reports all three
+  False. That is the absence of an opinion, not a claim the operation was
+  survivable, so `txn_action()` is meaningful only on an error returned by a
+  transactional call.
+
+  This is step 0 of transactions: without the flags a transactional producer
+  cannot be driven correctly, and until now `take_error` read the code and
+  the string and threw them away. No public transactional API yet.
+
 - **Rebalance callbacks.** `subscribe()` now takes `on_assign`, `on_revoke`
   and `on_lost`, matching `confluent-kafka`'s signature and its semantics: a
   handler is an *opportunity* to intervene, not an obligation — one that does
@@ -85,8 +277,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than testing `timestamp != -1`: -1 is a legal `int64` millisecond value, so
   the type is the only field that answers whether there is a timestamp at all.
 
-  This is the **consume** half only. `produce()` still cannot set a timestamp;
-  librdkafka stamps each record with the current time.
+  This landed as the **consume** half first. The produce half — `produce(
+  timestamp=)` — followed in the same release; see its entry above. Together
+  they make event time round-trip, which is what either half alone could not.
 
 - **Typed `KafkaErrorKind`.** `kind_of(code)` classifies a librdkafka error
   into one of eight branchable tags, read from `KafkaError.kind()`,

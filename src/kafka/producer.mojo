@@ -1,5 +1,7 @@
 """High-level producer."""
 
+from std.atomic import Atomic
+
 from ._ffi import (
     Lib,
     MSG_ERR,
@@ -13,6 +15,7 @@ from ._ffi import (
     RD_KAFKA_RESP_ERR_NO_ERROR,
     RD_KAFKA_RESP_ERR__TIMED_OUT,
     KIND_OTHER,
+    KafkaError,
     KafkaErrorKind,
     kind_of,
     _c_string,
@@ -21,7 +24,10 @@ from ._ffi import (
     _load_word,
     _VuArray,
 )
+from ._sync import _Latch
 from .config import ProducerConfig
+from .group import ConsumerGroupMetadata
+from .partition import TopicPartition, _build_tpl
 from .header import Header
 
 # Let librdkafka choose the partition with the topic's partitioner, which is
@@ -117,17 +123,28 @@ struct _Field(Copyable, Movable):
         return self.pointer if self.pointer != 0 else placeholder
 
 
-@fieldwise_init
-struct _DrState(Copyable, Movable):
+struct _DrState(Movable):
     """What the delivery-report callback can reach.
 
     Lives in a one-element `List` on the `Producer`, so its address survives
     anything that moves the producer -- the same heap box `Lib` uses for its
     handle, and `Consumer` for its rebalance state.
+
+    `lock` guards `failures` and nothing else. librdkafka runs the callback
+    on whichever thread called `poll` / `flush`, so two threads producing and
+    draining are two unsynchronised writers to that list; the lock is what
+    makes them one. Not `Copyable`: an `Atomic` cannot be copied, and copying
+    a lock would be meaningless anyway.
     """
 
     var lib: Int
+    var lock: _Latch
     var failures: List[DeliveryReport]
+
+    def __init__(out self):
+        self.lib = 0
+        self.lock = _Latch()
+        self.failures = List[DeliveryReport]()
 
 
 def _delivery_trampoline(rk: Int, msg: Int, opaque: Int) abi("C"):
@@ -140,8 +157,9 @@ def _delivery_trampoline(rk: Int, msg: Int, opaque: Int) abi("C"):
 
     Called once per message from inside `poll()` or `flush()`, on the calling
     thread. librdkafka does not invoke callbacks from its background threads,
-    which is what makes touching Mojo state here safe -- and is also why
-    `Producer` is no more thread-safe than it was.
+    which is what makes touching Mojo state here safe at all -- and is also
+    why the failure list needs `_Latch`: several threads draining are several
+    threads running this body.
 
     **Only failures are retained.** A report per delivered message would grow
     without bound in a long-running producer that never reads them, and the
@@ -161,16 +179,26 @@ def _delivery_trampoline(rk: Int, msg: Int, opaque: Int) abi("C"):
         ]
         # `_private` is the token handed to produceva as
         # RD_KAFKA_VTYPE_OPAQUE, returned untouched.
-        state.failures.append(
-            DeliveryReport(
-                _load_word(msg + MSG_PRIVATE),
-                lib.topic_name(_load_word(msg + MSG_RKT)),
-                _load_i32(msg + MSG_PARTITION),
-                _load_i64(msg + MSG_OFFSET),
-                err,
-                String(lib.error(err)),
-            )
+        #
+        # The report is decoded *before* the lock is taken: decoding crosses
+        # into C for the topic name and the error string, and the rule that
+        # keeps `_Latch` safe is that no FFI call happens inside a critical
+        # section.
+        var report = DeliveryReport(
+            _load_word(msg + MSG_PRIVATE),
+            lib.topic_name(_load_word(msg + MSG_RKT)),
+            _load_i32(msg + MSG_PARTITION),
+            _load_i64(msg + MSG_OFFSET),
+            err,
+            String(lib.error(err)),
         )
+        # Nothing between these two lines can raise -- `List.append` is not
+        # `raises`, which the compiler confirms by rejecting a `try` around
+        # it as useless. That matters more than it looks: a lock leaked here
+        # would not crash, it would spin the next `flush()` forever.
+        state.lock.acquire()
+        state.failures.append(report^)
+        state.lock.release()
     except:
         # Nothing here is actionable, and librdkafka is mid-teardown of the
         # message. Losing one report is better than aborting the process.
@@ -195,6 +223,40 @@ struct Producer:
     to cache an `rd_kafka_topic_t` per topic name, and that unsynchronised
     `Dict` was the one thing making it unsafe to share across threads when
     librdkafka's own handle is not.
+
+    **Concurrency.** `produce()`, `produce_bytes()`, `poll()`, `flush()`,
+    `failures()`, `take_failures()` and `delivery_failures()` may be called
+    from more than one thread on the same producer. `rd_kafka_t` is itself
+    thread-safe, and the two pieces of Mojo state that were not are now: the
+    sequence counter is an `Atomic` (`fetch_add`, so no two messages can
+    claim the same token), and the failure list is guarded by `_Latch`.
+
+    Two caveats that are properties of the API rather than of the locking:
+
+    - `last_error_kind()` is a single slot on the producer and cannot be
+      attributed to a caller once two threads produce. Read
+      `DeliveryReport.kind()` instead, which names its message.
+    - `flush()` waits for *every* queued message, not for the ones this
+      thread produced, and it raises on any unacknowledged rejection --
+      including another thread's.
+
+    Note that the delivery-report callback runs on whichever thread called
+    `poll` / `flush`, never on a librdkafka background thread. That is what
+    makes it safe for the callback to touch Mojo state at all; it is also
+    why two threads draining are two writers to the failure list, which is
+    what `_Latch` exists for.
+
+    **Transactions.** With `transactional.id` set on the config, this is an
+    exactly-once producer: `init_transactions()` once, then
+    `begin_transaction()` / `commit_transaction()` around each batch, and
+    `abort_transaction()` to discard one. Unlike everything above, those four
+    **return** their error rather than raising it -- see the block comment
+    over them for why, and branch on `KafkaError.txn_action()`.
+
+    A transactional producer is not a concurrent one. The four calls are
+    sequential state on a single transaction, so one thread drives them; the
+    produce path stays thread-safe inside an open transaction, but the
+    begin/commit boundary is the caller's to serialise.
     """
 
     var _lib: Lib
@@ -203,14 +265,21 @@ struct Producer:
     # by address, and a `List`'s buffer does not move when the `Producer`
     # does. `failures()` and friends read through it.
     var _dr: List[_DrState]
-    var _next_sequence: Int
-    var _last_error_kind: KafkaErrorKind
+    # Atomic because two threads producing are two writers. `fetch_add`
+    # is what makes a token unique rather than merely distinct-looking:
+    # a plain `+= 1` loses one under contention and hands two messages the
+    # same sequence, which silently mis-attributes their delivery reports.
+    var _next_sequence: Atomic[DType.int64]
+    # Atomic for well-definedness rather than for meaning -- see
+    # `last_error_kind()`, which cannot attribute a kind to a caller once
+    # more than one thread is producing.
+    var _last_error_kind: Atomic[DType.int32]
 
     def __init__(out self, cfg: ProducerConfig) raises:
         self._lib = Lib()
 
         var state = List[_DrState](capacity=1)
-        state.append(_DrState(0, List[DeliveryReport]()))
+        state.append(_DrState())
         self._dr = state^
 
         var conf = cfg._build(self._lib)
@@ -226,8 +295,8 @@ struct Producer:
         # Sequences start at 1, not 0. The opaque travels as a `void *` and
         # comes back as `_private`, where 0 is indistinguishable from a
         # message produced without one.
-        self._next_sequence = 1
-        self._last_error_kind = KIND_OTHER
+        self._next_sequence = Atomic[DType.int64](1)
+        self._last_error_kind = Atomic[DType.int32](KIND_OTHER._tag)
         # Recorded after construction because it is the address of a field of
         # `self`, which is only final once the producer exists. `Producer` is
         # neither `Copyable` nor `Movable`, so it stays put from here on.
@@ -250,6 +319,14 @@ struct Producer:
                 self._lib.destroy(self._rk)
             except:
                 pass
+        # Keeps the callback's box alive across the drain above, which is
+        # where the delivery-report callback fires for anything that times
+        # out. Fields are released at their last use *inside* the destructor
+        # body, not after it -- `_drain_until_empty` takes `mut self`, so it
+        # borrows the whole struct and happens to cover `_dr` today, but that
+        # is an accident of its signature. `Consumer.__deinit__` had the same
+        # shape without the accident and segfaulted. Pin it explicitly.
+        _ = self._dr^
 
     # -- delivery reports -----------------------------------------------------
 
@@ -276,6 +353,20 @@ struct Producer:
             self._lib.flush(self._rk, timeout_ms) == RD_KAFKA_RESP_ERR_NO_ERROR
         )
 
+    def _state(self) -> Pointer[_DrState, MutAnyOrigin]:
+        """The callback's box, reached the way the callback reaches it.
+
+        `failures()` and `delivery_failures()` take `self` immutably -- they
+        are reads, and making them `mut` would break every caller holding a
+        `Producer` by reference -- but taking the lock needs mutable access
+        to the `Atomic` inside. The box is heap storage whose address is
+        already handed to C, so going through it here is the same aliasing
+        the `dr_msg_cb` does, not a new one.
+        """
+        return Pointer[_DrState, MutAnyOrigin](
+            unsafe_from_address=Int(self._dr.unsafe_ptr())
+        )
+
     def _raise_if_undelivered(self) raises:
         """Raise if any rejection is still unacknowledged.
 
@@ -284,12 +375,24 @@ struct Producer:
         count and a string -- exactly what per-message reports exist to
         replace. `take_failures()` is how they are acknowledged.
         """
-        if len(self._dr[0].failures) == 0:
+        ref state = self._state()[unsafe_offset=0]
+        # The message is built inside the critical section but raised outside
+        # it: a `raise` under the lock would leave it held forever.
+        var summary: String
+        state.lock.acquire()
+        var count = len(state.failures)
+        if count != 0:
+            summary = String(state.failures[0])
+        else:
+            summary = String("")
+        state.lock.release()
+
+        if count == 0:
             return
         raise Error(
-            String(len(self._dr[0].failures))
+            String(count)
             + " message(s) failed delivery; first was "
-            + String(self._dr[0].failures[0])
+            + summary
             + " (call take_failures() for all of them)"
         )
 
@@ -309,13 +412,196 @@ struct Producer:
                 else:
                     raise e
 
-        Only meaningful immediately after a `produce()` that raised.
+        Only meaningful immediately after a `produce()` that raised, **and
+        only when one thread is producing.** The kind is one slot on the
+        producer, so with two threads producing, a caller can read the kind
+        belonging to the other thread's rejection. That is not a data race --
+        the slot is atomic -- but it is not attributable either, and no
+        arrangement of this API fixes it: Mojo 1.0's `Error` carries only
+        text, so the kind cannot travel on the exception where it belongs.
+        A concurrent producer should branch on `DeliveryReport.kind()`, which
+        names its message.
         """
-        return self._last_error_kind
+        return KafkaErrorKind(self._last_error_kind.load())
+
+    # -- transactions -------------------------------------------------------
+    #
+    # Exactly-once, producer side. The shape follows `confluent-kafka`
+    # (`init_transactions` / `begin_transaction` / `commit_transaction` /
+    # `abort_transaction`) and the semantics are librdkafka's, which owns all
+    # the state -- this package tracks none of it and asks no questions the
+    # library already answers. Calling them out of order is librdkafka's
+    # `__STATE` to report, not ours to pre-empt.
+    #
+    # **They return their error instead of raising it, and that is not a
+    # style choice.** Raising collapses a `KafkaError` into a `String`,
+    # because Mojo 1.0's `Error` carries only text -- which discards exactly
+    # the three flags the caller is required to branch on.
+    # `confluent-kafka` does raise, but its `KafkaException` carries a
+    # `KafkaError` with `.retriable()`, `.txn_requires_abort()` and
+    # `.fatal()` on it; a Mojo `Error` has nowhere to put them. Returning the
+    # error is how the same information reaches the caller here.
+    # `Producer.last_error_kind()` is the side-channel this package already
+    # uses to work around that for `produce()`, and it is explicitly not
+    # attributable once two threads produce. A transactional call cannot take
+    # that compromise: a wrong branch corrupts a transaction rather than
+    # mis-reporting one rejection.
+    #
+    # `None` means success. On an error, branch with `txn_action()`:
+    #
+    #     var failure = p.commit_transaction()
+    #     if failure:
+    #         var action = failure.value().txn_action()
+    #         if action == TXN_ABORT:
+    #             _ = p.abort_transaction()      # then begin a new one
+    #         elif action == TXN_RETRY:
+    #             _ = p.commit_transaction()     # resumable; call it again
+    #         else:
+    #             raise Error(String(failure.value()))   # unusable producer
+
+    def init_transactions(
+        mut self, timeout_ms: Int32 = -1
+    ) raises -> Optional[KafkaError]:
+        """Acquire a producer id and fence older instances. Once, first.
+
+        Must be called before `begin_transaction()` or any `produce()`, and
+        requires `transactional.id` on the `ProducerConfig`:
+
+            var cfg = ProducerConfig(bootstrap_servers=...)
+            cfg.set("transactional.id", "orders-etl-1")
+
+        It completes or aborts whatever a previous producer with the same
+        `transactional.id` left behind, which is what makes the id -- not the
+        process -- the unit of exactly-once.
+
+        `timeout_ms` of -1 means `2 * transaction.timeout.ms`, librdkafka's
+        own default. A `TXN_RETRY` verdict here is **resumable**: the work
+        continues in the background and calling again picks it up rather than
+        starting over.
+        """
+        return self._txn_result(
+            self._lib.init_transactions(self._rk, timeout_ms)
+        )
+
+    def begin_transaction(mut self) raises -> Optional[KafkaError]:
+        """Open a transaction. Everything produced after this is in it.
+
+        The only one of the four with no timeout, because it changes local
+        state and makes no round trip. After it returns, one of `produce()`,
+        `commit_transaction()` or `abort_transaction()` has to happen within
+        `transaction.timeout.ms` or the broker times the transaction out.
+        """
+        return self._txn_result(self._lib.begin_transaction(self._rk))
+
+    def commit_transaction(
+        mut self, timeout_ms: Int32 = -1
+    ) raises -> Optional[KafkaError]:
+        """Flush, then commit everything produced since `begin_transaction()`.
+
+        **Pass -1.** librdkafka calls that "strongly recommended": it means
+        the transaction's remaining time, and any other value "risk[s]
+        internal state desynchronisation" if a protocol request fails
+        mid-commit. The default is -1 for that reason and there is no good
+        reason to override it.
+
+        The flush is librdkafka's own and needs nothing from the caller: the
+        warning in its docs about having to serve delivery reports on another
+        thread applies to `RD_KAFKA_EVENT_DR`, which this package stopped
+        using -- a `dr_msg_cb` is served on the flushing thread. Reports for
+        messages that failed permanently still land in `failures()`, and the
+        commit itself returns `TXN_ABORT` in that case.
+
+        A `TXN_RETRY` verdict is resumable: the commit continues in the
+        background and calling again resumes it.
+        """
+        return self._txn_result(
+            self._lib.commit_transaction(self._rk, timeout_ms)
+        )
+
+    def abort_transaction(
+        mut self, timeout_ms: Int32 = -1
+    ) raises -> Optional[KafkaError]:
+        """Discard the transaction. Also how you recover from `TXN_ABORT`.
+
+        **Every message still queued is purged**, and each surfaces as a
+        delivery failure with `__PURGE_QUEUE` or `__PURGE_INFLIGHT`. That is
+        the abort working, not a second problem -- but `failures()` is
+        retained until acknowledged, so a later `flush()` raises about
+        messages that were discarded on purpose. Call `take_failures()`
+        after an abort to acknowledge them, and only inspect them if you
+        want to know what was thrown away.
+
+        Pass -1 for the same reason `commit_transaction()` does.
+        """
+        return self._txn_result(
+            self._lib.abort_transaction(self._rk, timeout_ms)
+        )
+
+    def send_offsets_to_transaction(
+        mut self,
+        offsets: List[TopicPartition],
+        group_metadata: ConsumerGroupMetadata,
+        timeout_ms: Int32 = -1,
+    ) raises -> Optional[KafkaError]:
+        """Add a consumer's offsets to this transaction. Read-process-write.
+
+        This is what makes exactly-once end to end rather than
+        write-only: the offsets are committed to the consumer's group **only
+        if the transaction commits**, so a crash mid-transaction leaves the
+        input un-consumed and the output un-written together. Call it at the
+        end of the loop, before `commit_transaction()`.
+
+        Three things librdkafka requires, and all three fail quietly:
+
+        - **The offsets are the *next* message to consume**, i.e. last
+          processed + 1 -- not the offset you just handled. `Consumer.position()`
+          already reports exactly that, which is why it is the natural
+          argument; hand it the consumer's current assignment.
+        - **The consumer must have `enable.auto.commit=false`.** Otherwise it
+          commits on its own schedule and the transaction is no longer the
+          thing deciding what was consumed.
+        - **Invalid offsets are skipped silently.** `OFFSET_INVALID` entries
+          are ignored, and if *none* of the offsets are valid this returns
+          success having done nothing -- so a `position()` taken before
+          anything was read commits nothing and says it worked.
+
+        Unlike the other four, this call is **retriable but not resumable**:
+        a retry sends a fresh request, so retry with the *same* offsets and
+        the same `group_metadata` or the transaction and your idea of it
+        drift apart.
+        """
+        var list = _build_tpl(self._lib, offsets)
+        var err: Int
+        try:
+            err = self._lib.send_offsets_to_transaction(
+                self._rk,
+                list,
+                group_metadata._address(),
+                timeout_ms,
+            )
+        except e:
+            self._lib.topic_partition_list_destroy(list)
+            raise e
+        self._lib.topic_partition_list_destroy(list)
+        return self._txn_result(err)
+
+    def _txn_result(self, err: Int) raises -> Optional[KafkaError]:
+        """NULL is success; anything else is ours to read and destroy.
+
+        The reversed polarity `produceva` has. `take_error` does both, and
+        is where the three flags are read off the object before it goes.
+        """
+        if err == 0:
+            return None
+        return self._lib.take_error(err)
 
     def delivery_failures(self) -> Int:
         """Rejections tallied since the last `flush()`, without blocking."""
-        return len(self._dr[0].failures)
+        ref state = self._state()[unsafe_offset=0]
+        state.lock.acquire()
+        var count = len(state.failures)
+        state.lock.release()
+        return count
 
     def failures(self) -> List[DeliveryReport]:
         """Every unacknowledged rejection, each naming the sequence
@@ -327,7 +613,11 @@ struct Producer:
         did not make it -- needs only the failures. After a `flush()` that
         does not raise, every message produced before it was delivered.
         """
-        return self._dr[0].failures.copy()
+        ref state = self._state()[unsafe_offset=0]
+        state.lock.acquire()
+        var snapshot = state.failures.copy()
+        state.lock.release()
+        return snapshot^
 
     def take_failures(mut self) -> List[DeliveryReport]:
         """Acknowledge every rejection, returning what was outstanding.
@@ -341,8 +631,13 @@ struct Producer:
                 for report in p.take_failures():
                     print(report)
         """
-        var taken = self._dr[0].failures.copy()
-        self._dr[0].failures.clear()
+        ref state = self._state()[unsafe_offset=0]
+        # Copy and clear under one acquisition, or a report landing between
+        # the two is acknowledged without ever being returned.
+        state.lock.acquire()
+        var taken = state.failures.copy()
+        state.failures.clear()
+        state.lock.release()
         return taken^
 
     # -- producing ------------------------------------------------------------
@@ -415,9 +710,9 @@ struct Producer:
         keeps the topic name and the placeholder alive across it.
         """
         # Claimed before anything can fail, so a rejected message still has a
-        # token the caller can match its report against.
-        var sequence = self._next_sequence
-        self._next_sequence += 1
+        # token the caller can match its report against. `fetch_add` returns
+        # the value before the add, so the first message gets 1.
+        var sequence = Int(self._next_sequence.fetch_add(1))
 
         # Owned from here on: `produceva` adopts the header list only if it
         # succeeds, so every other exit has to destroy it.
@@ -463,7 +758,7 @@ struct Producer:
         var failure = self._lib.take_error(err)
         # Recorded because the raise cannot carry it: Mojo 1.0's `Error` is
         # text, so `except` has no type to match on. See `last_error_kind`.
-        self._last_error_kind = failure.kind()
+        self._last_error_kind.store(failure.kind()._tag)
         raise Error("produce(" + topic + "): " + String(failure))
 
     def produce(

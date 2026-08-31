@@ -493,6 +493,120 @@ def test_a_joining_member_triggers_a_live_revoke() raises:
     print("    a joining member drove a live revoke, and it committed")
 
 
+def test_transactional_offsets_are_visible_to_the_group() raises:
+    """Exactly-once, and the half the mock cannot witness.
+
+    `send_offsets_to_transaction` commits the consumer's offsets *inside* the
+    producer's transaction. Whether that actually happened is only readable
+    through `committed()`, and the mock answers `OFFSET_INVALID` there
+    regardless -- it accepts `TxnOffsetCommit` and never serves it back
+    through `OffsetFetch` (confirmed in plain C). So an assertion about the
+    committed offset passes unconditionally on the mock and belongs here.
+
+    Both directions, because one alone proves little:
+
+    - a **committed** transaction leaves the group at last-processed + 1, so
+      a restart resumes past the input; and
+    - an **aborted** one leaves it untouched, so a restart replays the input
+      rather than skipping records that were never written.
+
+    The second is the real exactly-once claim. An implementation that
+    committed offsets outside the transaction passes every other test in
+    every suite and fails only this one.
+    """
+    var topic_in = unique_topic() + "-in"
+    var topic_out = unique_topic() + "-out"
+    var admin = AdminClient(bootstrap())
+    admin.create_topic(topic_in, num_partitions=1, replication_factor=1)
+    admin.create_topic(topic_out, num_partitions=1, replication_factor=1)
+    _ = wait_for_topics(admin, [topic_in, topic_out])
+
+    var upstream = Producer(ProducerConfig(bootstrap_servers=bootstrap()))
+    for i in range(3):
+        _ = upstream.produce(topic=topic_in, value=String(i))
+    upstream.flush(15000)
+
+    var group = "mojo-kafka-eos-" + String(perf_counter_ns())
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap(),
+        group_id=group,
+        auto_offset_reset="earliest",
+    )
+    cfg.set("enable.auto.commit", "false")
+    cfg.set("isolation.level", "read_committed")
+    var consumer = Consumer(cfg)
+    consumer.subscribe([topic_in])
+
+    var seen = 0
+    var attempts = 0
+    while seen < 3 and attempts < 60:
+        attempts += 1
+        var maybe = consumer.poll(timeout_ms=1000)
+        if maybe:
+            seen += 1
+    assert_equal(seen, 3, "the input was not readable")
+
+    var assignment: List[TopicPartition] = [TopicPartition(topic_in, 0)]
+    assert_equal(
+        consumer.position(assignment)[0].offset,
+        3,
+        "position is not last-processed + 1",
+    )
+
+    var producer = Producer(_txn_config("mojo-kafka-eos-txn-" + group))
+    assert_true(not producer.init_transactions(30000), "init failed")
+
+    # --- the aborted transaction first: the group must be untouched --------
+    assert_true(not producer.begin_transaction(), "begin failed")
+    _ = producer.produce(topic=topic_out, value="discarded")
+    assert_true(
+        not producer.send_offsets_to_transaction(
+            consumer.position(assignment),
+            consumer.consumer_group_metadata(),
+            30000,
+        ),
+        "send_offsets failed on the transaction that gets aborted",
+    )
+    assert_true(not producer.abort_transaction(), "abort failed")
+    _ = producer.take_failures()
+
+    assert_equal(
+        consumer.committed(assignment)[0].offset,
+        OFFSET_INVALID,
+        "an aborted transaction committed the consumer's offsets anyway",
+    )
+    print("    aborted: group still uncommitted, so the input replays")
+
+    # --- then the committed one: the group must advance --------------------
+    assert_true(not producer.begin_transaction(), "second begin failed")
+    _ = producer.produce(topic=topic_out, value="kept")
+    assert_true(
+        not producer.send_offsets_to_transaction(
+            consumer.position(assignment),
+            consumer.consumer_group_metadata(),
+            30000,
+        ),
+        "send_offsets failed on the transaction that gets committed",
+    )
+    assert_true(not producer.commit_transaction(), "commit failed")
+
+    assert_equal(
+        consumer.committed(assignment)[0].offset,
+        3,
+        "a committed transaction did not commit the consumer's offsets",
+    )
+    consumer.close()
+    print("    committed: group advanced to 3, so the input is not replayed")
+
+
+def _txn_config(txn_id: String) raises -> ProducerConfig:
+    """A transactional producer config. Not a test case -- see the module
+    docstring on `TestSuite.discover_tests`."""
+    var cfg = ProducerConfig(bootstrap_servers=bootstrap())
+    cfg.set("transactional.id", txn_id)
+    return cfg^
+
+
 def main() raises:
     print("broker:", bootstrap())
     TestSuite.discover_tests[__functions_in_module()]().run()

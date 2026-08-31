@@ -1,4 +1,10 @@
 from ._ffi import (
+    API_KEY_ADD_OFFSETS_TO_TXN,
+    API_KEY_ADD_PARTITIONS_TO_TXN,
+    API_KEY_END_TXN,
+    API_KEY_INIT_PRODUCER_ID,
+    API_KEY_PRODUCE,
+    API_KEY_TXN_OFFSET_COMMIT,
     KIND_AUTHORIZATION,
     KIND_FATAL,
     KIND_MESSAGE_TOO_LARGE,
@@ -7,8 +13,15 @@ from ._ffi import (
     KIND_TIMED_OUT,
     KIND_TRANSPORT,
     KIND_UNKNOWN_TOPIC_OR_PARTITION,
+    RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+    RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+    RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
+    TXN_ABORT,
+    TXN_FATAL,
+    TXN_RETRY,
     KafkaError,
     KafkaErrorKind,
+    TxnAction,
     kind_of,
     librdkafka_version,
 )
@@ -24,6 +37,7 @@ from .consumer import (
     Rebalance,
     RebalanceHandler,
 )
+from .group import ConsumerGroupMetadata
 from .header import Header
 from .partition import (
     OFFSET_BEGINNING,

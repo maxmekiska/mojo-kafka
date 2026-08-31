@@ -64,8 +64,8 @@ Two consequences to work with rather than around:
   integration suite that gates a PR. A guard that can be written against the
   mock belongs there, not in `test_broker.mojo`.
 - **Nothing but you runs the Docker suites.** Run `test-broker` when touching
-  `AdminClient`, consumer-group behaviour (rebalance handlers, `committed`) or
-  anything time-based -- the mock fakes the group protocol and does not
+  `AdminClient`, consumer-group behaviour (rebalance handlers, `committed`),
+  `send_offsets_to_transaction`, or anything time-based -- the mock fakes the group protocol and does not
   implement ListOffsets-by-timestamp at all. Run `test-interop` when touching
   what goes on the wire -- keys, values, headers, timestamps, null versus
   empty. A symmetric produce/consume bug passes every suite CI runs.
@@ -179,6 +179,17 @@ Two runtime traps that cost real debugging time here:
   `MockCluster` in particular: a cluster touched only during setup is torn
   down before the first `produce()`, and the symptom is a misleading
   `1/1 brokers are down`. End such scopes with `_ = cluster^`.
+
+  It applies **inside `__deinit__` too**, per field -- see "Lifetimes". A
+  destructor that never mentions a field runs with that field already freed,
+  which is how every `close()`-less `Consumer` came to segfault.
+
+  And it applies **across a single call**, which is subtler: a stack buffer
+  handed to C, read back after some *other* call, can be read after the
+  compiler released it. `Lib.new_client` returned a half-overwritten
+  `rd_kafka_new` error for exactly this reason -- the errbuf was decoded
+  after the intervening `conf_destroy`. Decode straight after the call that
+  filled the buffer, then `_ = buf^`.
 - **`where` compiles but does not format.** It is a keyword in 1.0 (the
   `where conforms_to(...)` constraint clause), and `mojo format` refuses the
   file with `Cannot parse` — but the *compiler* still accepts it as a variable
@@ -196,6 +207,7 @@ examples/, tests/, integration/        user-facing Mojo
       src/kafka/header.mojo            Header, shared by both sides
       src/kafka/partition.mojo         TopicPartition, Watermarks, offsets
       src/kafka/testing.mojo           MockCluster — in-process broker
+      src/kafka/_sync.mojo             _Latch — the only lock in the package
         └── src/kafka/_ffi.mojo        the only file that touches C
               └── librdkafka.so        loaded at runtime, not linked
 ```
@@ -251,10 +263,28 @@ succeeds**; on every other path it is still ours to destroy.
 per C symbol. Each client owns a `Lib`; `dlopen` refcounts, so librdkafka is
 mapped once regardless of client count.
 
-Destructor ordering matters: `__deinit__` bodies run **before** fields are
-released, so `rd_kafka_destroy` completes while the library is still mapped.
-Moving that teardown out of the destructor body reintroduces a segfault at
-process exit.
+Destructor ordering matters, and the rule is narrower than it looks. A field
+is released at its **last use inside the destructor body** -- not after the
+body returns. `rd_kafka_destroy` completes while the library is still mapped
+because `self._lib.destroy(...)` *is* a use of `_lib`; move that teardown out
+of the body and the segfault at process exit comes back.
+
+The corollary bit hard, and is the reason both clients end their destructors
+with a `_ = self._box^` line: **a field the body never mentions is already
+gone by the first statement.** `Consumer.__deinit__` calls
+`rd_kafka_consumer_close`, which fires a final revoke into
+`_rebalance_trampoline`, which reaches the consumer's state through the raw
+address given to `rd_kafka_conf_set_opaque` -- so a `_rebalance` box with no
+use in the destructor was freed *before* the close that needs it, and every
+consumer dropped without an explicit `close()` faulted. The whole suite
+missed it because all 21 cases closed by hand;
+`test_dropping_a_subscribed_consumer_does_not_fault` is the guard now.
+
+So: **any state a C callback reaches by address must be pinned with an
+explicit `_ = ...^` at the end of the destructor that can trigger that
+callback.** `Producer` survives its drain only because
+`_drain_until_empty` takes `mut self` and therefore borrows the whole
+struct; that is an accident of one signature, so it is pinned too.
 
 Config ownership follows librdkafka's rule: `rd_kafka_new` adopts the
 `rd_kafka_conf_t` **only on success**. `Lib.new_client` destroys it on the
@@ -361,11 +391,66 @@ you touch them:
   assigned.
 - `test_produce_accepts_an_explicit_timestamp` (in the **smoke** suite, not
   the mock one) guards the `_VuArray` entry count without needing a broker.
+- `test_dropping_a_subscribed_consumer_does_not_fault` is the **only** case
+  that lets a consumer go without calling `close()`. Every other one closes
+  by hand, which is precisely why a destructor that faulted every single
+  time went unnoticed. Do not "tidy" it by adding a `close()`; the missing
+  close *is* the test.
+- `test_concurrent_produce_keeps_every_sequence_and_report` (**smoke**, no
+  broker) drives eight real threads at a dead port. Two things about it are
+  deliberate: the messages must **fail**, because the delivery-report
+  trampoline returns on the success path before it ever touches the shared
+  list, so a working broker would exercise nothing; and the 8x400 counts are
+  measured, not chosen -- at 4x50 it caught a reverted fix only 3 runs in 6.
+- `test_txn_action_orders_abort_before_fatal` (**smoke**) builds its errors
+  from values, because the both-flags cell it exists for cannot be produced
+  on demand even with injection. It fails with the branch order swapped.
+  `test_take_error_reads_the_flags_off_a_real_error` is the opposite: only a
+  real `rd_kafka_error_t` shows that the flags survive `take_error`, so it
+  spends 500ms on `init_transactions` against a dead port. Neither replaces
+  the other; keep both.
+- The six transaction cases in the **mock** suite are three pairs, and each
+  pair is worth less by half. `..._committed_transaction_is_visible...` and
+  `..._aborted_transaction_is_invisible...` are only meaningful because the
+  consumer is `read_committed` -- the default `read_uncommitted` reads the
+  records either way and cannot tell a commit from an abort.
+  `..._fatal_transaction_error_is_flagged_fatal` and
+  `..._abortable_transaction_error_asks_for_an_abort` inject at the mock so
+  the client does the classifying; the abortable one then *follows* its own
+  verdict -- abort, begin again, commit -- because a branch that names the
+  right action and cannot carry it out is not worth much.
+- The **read-process-write** pair on the mock (`..._read_process_write_loop_
+  completes`, `..._failed_offset_commit_asks_for_an_abort`) deliberately
+  asserts nothing about the committed offset, because the mock cannot answer
+  -- see the third bullet under "Testing". They cover the shape of the loop
+  and the abortable branch. The offset itself is
+  `test_transactional_offsets_are_visible_to_the_group` in
+  `test_broker.mojo`, which asserts **both** directions: committed leaves the
+  group at last-processed + 1, aborted leaves it `OFFSET_INVALID`. The second
+  is the exactly-once claim -- an implementation that committed offsets
+  outside the transaction passes every other test in every suite and fails
+  only that one.
+- **The aborted-transaction case proves absence with a barrier, not a
+  timeout.** It commits a marker record after the abort and reads until the
+  marker arrives; anything aborted sits earlier in the log and would be
+  delivered first. The first version polled for a fixed period instead: it
+  passed, took 60 seconds, and would have passed just as well against a
+  broker that was merely slow.
 
-Two things the mock does not implement, and both are silent about it:
+Three things the mock does not implement, and all three are silent about it:
 
 - **CreateTopics** -- so `AdminClient.create_topic()` is only reachable
   against a real broker.
+- **Transactional offset commits, on the read-back side.** It accepts
+  `TxnOffsetCommit` and answers success, but never serves those offsets
+  through `OffsetFetch`: `committed()` reports `OFFSET_INVALID` afterwards
+  whether the transaction committed or aborted. Confirmed in plain C against
+  librdkafka 2.15 with no Mojo in the picture, so it is the mock. This one is
+  the most dangerous of the three, because the natural assertion --
+  "an aborted transaction left the group uncommitted" -- **passes
+  unconditionally**. It was written that way once here and had to be moved;
+  `test_transactional_offsets_are_visible_to_the_group` in
+  `test_broker.mojo` is where it lives, and it asserts both directions.
 - **ListOffsets by timestamp** -- it answers *every* timestamp with
   `OFFSET_END`, including ones that plainly precede every record on the
   partition, and reports no error doing so. An `offsets_for_times` test
@@ -468,11 +553,52 @@ bullets below rather than that list, and do not "fix" the code to match it:
 
 - **Producing goes through `rd_kafka_produceva`.** Taking the topic by name is
   what retired the per-topic handle cache. Two things follow:
-  - `Producer` is still **not** thread-safe — `_dr[0].failures` and
-    `_next_sequence` are unsynchronised. The `dr_msg_cb` did not change that:
-    librdkafka runs it on whichever thread called `poll` / `flush`, so two
-    threads produce two unsynchronised writers. Do not document it as safe
-    until they are dealt with.
+  - `Producer` **is** thread-safe now, and the two pieces that were not are
+    dealt with: `_next_sequence` is an `Atomic` (`fetch_add`, so no two
+    messages can claim one token) and `_dr[0].failures` is guarded by
+    `_Latch`, a spinlock over `Atomic` because Mojo 1.0 has no mutex and no
+    `std.sync`. The `dr_msg_cb` is why the latch is needed at all:
+    librdkafka runs it on whichever thread called `poll` / `flush`, so
+    several threads draining are several writers.
+
+    Two rules keep it correct. **No FFI call inside a critical section** --
+    that is what stops the callback waiting on a lock its own caller holds,
+    so the trampoline decodes the report *before* acquiring. And **never
+    raise under the lock**: `_raise_if_undelivered` builds its message
+    inside and raises outside.
+
+    `last_error_kind()` is the one thing that stays unsafe, and no
+    arrangement fixes it: one slot on the producer cannot be attributed to a
+    caller once two threads produce, because Mojo 1.0's `Error` carries only
+    text and the kind cannot ride the exception. Say so rather than locking
+    it harder. `test_concurrent_produce_keeps_every_sequence_and_report`
+    drives eight real threads through `pthread_create` and fails 6/6 with
+    the synchronisation reverted.
+
+    **`Consumer` is thread-safe too, and `close()` is why it was not.** It
+    checked a `Bool` then set it, so every thread calling `close()` passed
+    the check before any set it -- and concurrent `rd_kafka_consumer_close`
+    on one handle **deadlocks**: measured at 8 threads, one returns and
+    seven never do. Sequentially the second call merely returns -197, which
+    is what made it look cosmetic. It is a compare-exchange now, and the
+    loser returns rather than waiting: leaving a group is a network round
+    trip and there is no blocking primitive in 1.0 to wait on properly.
+
+    Two honest notes on the rest of `Consumer`. The reading calls hold no
+    mutable Mojo state and never needed anything. And **the three
+    rebalance-handler slots hold raw code addresses in `Atomic` words, not
+    `Optional[RebalanceHandler]` behind a latch** -- see `_RebalanceState`.
+    An earlier note here said the latch was "reasoned, not measured" and
+    justified it by the slots being "aligned and pointer-sized". The second
+    half was **measured and is false**: `Optional[RebalanceHandler]` is 16
+    bytes against 8 for the bare handler, so an unguarded read could pair
+    `has_value = True` with the other value's payload and jump through it.
+    That is a worse bug than the mispaired *set* the note described, and no
+    test could provoke it -- the trampoline reads a slot only during a
+    rebalance, which happens twice in a test against thousands of writes, so
+    the window is never hit. One word per slot makes it impossible instead of
+    unlikely, and `test_a_handler_slot_is_one_word` is a guard that can
+    actually fail. Do not put a multi-word type back in those slots.
   - **Both timestamp halves have landed.** `produce(timestamp=)` is the
     record's CreateTime in milliseconds, and **0 means now** -- librdkafka's
     rule and `confluent-kafka`'s documented default -- so the `vu` entry is
@@ -595,6 +721,105 @@ Four things not to undo:
 destroys the partition list on return, which is why `_decode_tpl` copies
 every name out immediately.
 
+### Transactions, and exactly-once
+
+`init_transactions` / `begin_transaction` / `send_offsets_to_transaction` /
+`commit_transaction` / `abort_transaction` on `Producer`, plus the three
+`rd_kafka_error_t` predicates every one of them is branched on. Complete:
+read-process-write included. Nine things not to undo:
+
+- **They return their error; they do not raise it.** `confluent-kafka`
+  raises, but its `KafkaException` wraps a `KafkaError` carrying
+  `.retriable()`, `.txn_requires_abort()` and `.fatal()`. Mojo 1.0's `Error`
+  is text, so a raise here would discard exactly the three bits the caller is
+  required to branch on. `Optional[KafkaError]` -- `None` on success -- is how
+  the same information arrives. `last_error_kind()` is the side-channel this
+  package uses to work around the same limitation for `produce()`, and it is
+  explicitly not attributable once two threads produce; a transactional call
+  cannot take that compromise, because a wrong branch corrupts a transaction
+  rather than mis-reporting one rejection.
+
+- **`take_error` is the only place the flags can be read**, because it is what
+  destroys the object holding them. They are not on the error code, so once
+  the `rd_kafka_error_t` is gone they are unrecoverable -- which is what the
+  pre-step-0 version did, reading code and string and dropping the rest.
+
+- **`txn_action()`'s branch order is librdkafka's, and it is not the obvious
+  one.** Abort, then retriable, then everything else. Testing `is_fatal`
+  first reads correctly and is wrong: the transactional producer treats most
+  of the idempotent producer's fatal errors as abortable, since a transaction
+  can be aborted and replayed whole, so an error can carry both flags and the
+  abort is what to do. `rdkafka.h`'s own worked example branches in exactly
+  this order. An error with **none** of the three flags is `TXN_FATAL`,
+  following librdkafka's explicit "treat all other errors as fatal" -- not a
+  fourth tag no caller could handle.
+
+- **A `KafkaError` built from a bare code carries no flags**, and False there
+  means "no opinion", not "survivable": a `rd_kafka_resp_err_t` has nowhere to
+  keep one. So `txn_action()` is meaningful only on an error a transactional
+  call returned, exactly as librdkafka documents for `txn_requires_abort`.
+
+- **`commit_transaction` and `abort_transaction` default to `timeout_ms=-1`
+  and should stay that way.** librdkafka calls -1 "strongly recommended": it
+  means the transaction's remaining time, and any other value "risk[s]
+  internal state desynchronization" if a protocol request fails mid-commit.
+
+- **`commit_transaction` flushes on its own.** librdkafka's warning about
+  having to serve delivery reports from another thread during that flush
+  applies to `RD_KAFKA_EVENT_DR`, which this package no longer uses -- a
+  `dr_msg_cb` is served on the flushing thread. Do not add a `flush()` before
+  the commit; it is guessing at librdkafka's job.
+
+- **`abort_transaction` purges, and the purged messages surface as delivery
+  failures** (`__PURGE_QUEUE` / `__PURGE_INFLIGHT`). That is the abort
+  working, but failures are retained until acknowledged, so a later `flush()`
+  raises about messages discarded on purpose. The docstring tells callers to
+  `take_failures()` after an abort, and the mock test asserts on all three
+  reports rather than pretending they are not there.
+
+- **`send_offsets_to_transaction` is what makes it exactly-**once**, not
+  just atomic-write.** It commits the *consumer's* offsets inside the
+  producer's transaction, so input and output land together or not at all.
+  Three of its requirements fail **silently** and are in the docstring for
+  that reason: offsets are the *next* message to consume (`position()`
+  reports exactly that, which is why it is the natural argument); the
+  consumer needs `enable.auto.commit=false`; and invalid offsets are skipped,
+  so a call with nothing valid returns success having done nothing. It is
+  also the one call here that is retriable but **not resumable** -- a retry
+  must carry the same offsets and the same metadata.
+
+- **`ConsumerGroupMetadata` (`group.mojo`) is not copyable and is a
+  snapshot.** Not copyable because the handle is freed once in `__deinit__`
+  and a copy double-frees; a snapshot because it captures the group
+  generation, which a rebalance supersedes -- so it is taken inside the
+  transaction that sends the offsets, not once at startup. It lives in its
+  own module for the reason `header.mojo` does: it belongs to neither client
+  and both need it. `_build_tpl` moved to `partition.mojo` for the same
+  reason -- the producer needs it now, and importing it from `consumer.mojo`
+  would be the only edge between the two clients.
+
+Testing them needed one more binding, `rd_kafka_mock_push_request_errors_array`
+-- the **array** form, because the `..._errors` form is variadic and
+convention 5 rules it out. It is lazy like the other `rd_kafka_mock_*`
+symbols. It is how librdkafka tests its own transactional error handling
+(`tests/0105-transactions_mock.c`), and it is what closed the coverage gap
+step 0 left: the fatal and abortable flags are set by the **client**, from
+the code the coordinator returned, so injecting a code at the mock drives the
+real classification path rather than a simulation of it. Measured against
+librdkafka 2.15, and these are the two the mock suite uses:
+
+| inject | into | flags |
+|---|---|---|
+| `CLUSTER_AUTHORIZATION_FAILED` | `InitProducerId` (22) | `is_fatal` |
+| `TOPIC_AUTHORIZATION_FAILED` | `AddPartitionsToTxn` (24) | `txn_requires_abort` |
+| `GROUP_AUTHORIZATION_FAILED` | `AddOffsetsToTxn` (25) | `txn_requires_abort` |
+| `INVALID_TXN_STATE` | `AddOffsetsToTxn` (25) | `is_fatal` |
+
+One probe result worth keeping: a `send_offsets_to_transaction` naming a
+topic the mock does not have comes back **abortable**, not "unknown topic".
+Create the input topic in these tests even though nothing produces to it
+through the mock.
+
 ## What we build next
 
 Ordered by **leverage, not parity**. `confluent-kafka` is the reference for API
@@ -605,16 +830,70 @@ worth more in Mojo than they are in Python.
 
 ### 1. Batch `consume(n)`
 
-One call returning up to `n` messages, over `rd_kafka_consume_batch_queue`.
+One call returning up to `n` messages, over `rd_kafka_consume_batch_queue`
+on the queue from `rd_kafka_queue_get_consumer` — which is exactly how
+`confluent-kafka-python`'s `Consumer.consume()` is built, so the shape to copy
+is proven against the same primitive.
 
-**This is the item where Mojo beats a Python client, so it is worth more here
-than its position in `confluent-kafka` suggests.** `Consumer.poll()` crosses the
-FFI four times per message — `consumer_poll`, `topic_name`,
-`message_timestamp`, `message_destroy` — where a batch crosses once for the
-whole set and hands back a run of records that Mojo can then process without a
-per-message interpreter round trip. For the ML and data pipelines this package is aimed at,
-that is the difference between "a Kafka client in Mojo" and "a reason to use
-Mojo for Kafka". Ship it with a benchmark against `confluent-kafka`.
+**This is the item where Mojo beats a Python client**, but the reason is the
+batch it hands back, not the crossings it saves — see the arithmetic below.
+Mojo can process a run of records without a per-message interpreter round
+trip, which for the ML and data pipelines this package is aimed at is the
+difference between "a Kafka client in Mojo" and "a reason to use Mojo for
+Kafka". Ship it with a benchmark against `confluent-kafka`.
+
+**One batch call per consumer. This is not a style preference.** librdkafka's
+`INTRODUCTION.md` ("Note on Batch consume APIs"): using multiple instances of
+`rd_kafka_consume_batch()` / `rd_kafka_consume_batch_queue()` concurrently "is
+not thread safe and will result in undefined behaviour... This usecase is not
+supported and will not be supported in future as well." Three things about
+that, all checked:
+
+- **It is not in `rdkafka.h`.** Grepped against the installed 2.15 header:
+  the declaration carries nothing but `@sa rd_kafka_consume_batch()`. Since
+  `_ffi.mojo` is written against the header, the constraint is invisible from
+  where we work — which is the only reason it is written down here.
+- **The scope is per consumer, not global.** librdkafka's own listed
+  alternatives include "multiple consumers in same consumer group... each
+  consumer can run its own batch call". So N consumers each running a batch
+  call is the *recommended* scaling path, and the API needs no lock across
+  consumers. Parallelism goes **downstream** of the call — alternative 3 is
+  "read data from single batch call and process this data in parallel", which
+  is precisely the Mojo argument.
+- **There is no configuration where concurrent batch is defensible for us.**
+  The note's escape hatch is "don't use any of the **seek**, **pause**,
+  **resume** or **rebalancing** operation in conjunction with these API
+  calls". We have all four, and the rebalance trampoline is installed on
+  every consumer at construction. So `consume()` is single-instance per
+  `Consumer`, unconditionally.
+
+librdkafka raises no error for the violation — UB is silent — so enforcement
+is ours. Prefer a `_Latch` try-acquire that **raises** on a second concurrent
+entrant over one that serialises: serialising hides the caller's bug, and
+unlike the `subscribe()` latch under "Known coverage gaps" this one is a
+guard a test can actually fail.
+
+Two more things from the header, both load-bearing:
+
+- **`rd_kafka_queue_destroy()` MUST be called on the consumer queue before
+  `rd_kafka_consumer_close()`.** Given the "Lifetimes" rule that a field is
+  released at its last use *inside* the destructor body, a `_queue` field
+  held for batch consume has to be destroyed explicitly, before the close, in
+  both `close()` and `__deinit__`. That is the exact shape of the bug that
+  made every `close()`-less `Consumer` fault.
+- **Polling that queue counts as a consumer poll** and resets
+  `max.poll.interval.ms`, so batch consume feeds the liveness timer and
+  composes with the group protocol. No keepalive of our own.
+
+**The crossing arithmetic is `4n` → `1 + 3n`, not `4n` → `1`.** An earlier
+note here claimed the latter. A batch replaces only `consumer_poll`;
+`topic_name`, `message_timestamp` and `message_destroy` are still one call
+each per message (`consumer.mojo:662-718`), there is no bulk
+`rd_kafka_message_destroy` in the header, and the timestamp is not a field of
+the public `rd_kafka_message_t`. That is ~25%. Caching `topic_name` per
+`rkt` pointer across the batch — messages in one batch overwhelmingly share a
+topic handle — gets it to roughly `2n`, a real 2x. Design for that before
+writing the benchmark, or the number will disappoint.
 
 ### 2. Transactions, for exactly-once
 
@@ -628,22 +907,13 @@ wrong. Probed against librdkafka 2.15: a transactional producer pointed at
 `commit_transaction`, so the mock serves `InitProducerId`, `AddPartitionsToTxn`
 and `EndTxn`. Docker-free, and therefore CI-gatable.
 
-Build it in two steps:
+**This item is done** — see "Transactions, and exactly-once" under "Already
+built". `init_transactions`, `begin`, `send_offsets_to_transaction`, `commit`
+and `abort` are all public, the error predicates are bound and branched on by
+`txn_action()`, and the mock suite covers the happy path and both failure
+branches without Docker.
 
-- **Step 0, and a hard gate: bind the `rd_kafka_error_t` predicates** —
-  `rd_kafka_error_is_fatal`, `_is_retriable`, `_txn_requires_abort`. Every
-  transactional call returns an error object the caller must branch on three
-  ways (retry the call / abort the transaction / destroy the producer), and
-  `Lib.take_error` currently reads only code and string before destroying it,
-  throwing those bits away. Without them a transactional producer cannot be
-  used correctly. Small, and really the unfinished half of `KafkaErrorKind`.
-- **Then producer-only transactions** (atomic multi-topic write), which need
-  nothing else. `send_offsets_to_transaction` needs one more binding on top:
-  it takes a `rd_kafka_consumer_group_metadata_t*`, and
-  `rd_kafka_consumer_group_metadata` is the one piece of the consumer side
-  still unbound. Everything else read-process-write wants -- the TPL decode,
-  `committed`, the rebalance hooks -- has landed, so this does **not** wait on
-  item 1.
+That leaves item 1, batch `consume(n)`, as the next thing to build.
 
 ### Deliberately not chasing
 
@@ -657,7 +927,8 @@ Parity for its own sake costs more than it returns. Currently declined:
   large: an HTTP client, a schema cache and a codec. It belongs in a second
   package, which is where the upstream author put it too.
 - **Full `KafkaErrorKind` coverage** — the tag set stays small and lossy on
-  purpose. Only step 0 above extends it.
+  purpose. Step 0 was the one sanctioned extension and it is done; it added
+  no tags, because the flags are a separate axis from the kind.
 
 ### Known bugs
 
@@ -665,9 +936,54 @@ None outstanding.
 
 ### Known coverage gaps
 
-- **`on_lost` has no test.** The path exists and is documented -- a lost
-  assignment routes there instead of `on_revoke`, falling back to `on_revoke`
-  when it is unset -- but exercising it needs partitions genuinely lost to a
-  session timeout or a coordinator failure, which neither suite forces today.
-  It is the one branch of the rebalance trampoline nothing runs. Whoever
-  makes a broker fail over should add it.
+None outstanding. Both entries that stood here are closed, and the second one
+is worth reading before adding a lock anywhere in this package: when a guard
+cannot be tested, the fix is usually to remove the need for it, not to write
+a test that passes either way.
+
+**All four `txn_action()` arms are covered by
+real errors** -- `is_fatal` and `txn_requires_abort` by mock error injection,
+retriable and unflagged by `init_transactions` against a dead port in the
+smoke suite -- so the gap recorded here earlier is closed. Do not reopen it
+by "simplifying" the mock tests down to hand-built `KafkaError` values; the
+whole point is that the *client* classifies the broker's code.
+
+**The `subscribe()` handler slots were the other gap, and they are closed --
+by deleting the thing that could not be tested rather than by testing it.**
+They were three `Optional[RebalanceHandler]` under a `_Latch`, and no test
+that failed without the latch could be written. The reason turned out not to
+be the one recorded: measuring showed the slot was 16 bytes, not one word, so
+the hazard was a jump through a half-written pointer -- real, and *still*
+unprovokable, because the trampoline reads a slot only during a rebalance.
+So the slots became single `Atomic` words holding the bare code address,
+which is unable to tear, and the latch went. `test_a_handler_slot_is_one_word`
+and `test_a_handler_survives_the_round_trip_through_its_slot` guard the shape
+and the pun the safety now rests on, and both fail when broken.
+
+`on_lost` was the other one, and is now covered **on the mock**, which an earlier note here assumed impossible -- it claimed the path
+needed a coordinator failure no suite could force. It does not: exceeding
+`max.poll.interval.ms` is librdkafka's own *client-side* liveness timer, so
+a consumer that stops polling is thrown out of the group with its partitions
+genuinely marked lost, and the mock serves that like any other rebalance. No
+Docker, and it gates a PR.
+
+Three things about those two tests are load-bearing:
+
+- **`max.poll.interval.ms` may not be below `session.timeout.ms`** --
+  librdkafka rejects the client outright -- and **3000 is the floor** at
+  which the mock still completes a JoinGroup. At 1000 the JoinGroup request
+  itself times out, the group never forms, and nothing is ever assigned to
+  lose. The tests pin both to 3000 and sleep 4s.
+
+- **A thin handler cannot tick a counter**, and every Kafka-side side effect
+  the other rebalance tests observe through -- a commit, an assignment --
+  *fails by design* during a lost rebalance, because another member may
+  already own the partition (librdkafka logs `COMMITFAIL`). So the handlers
+  record through `setenv` / `getenv`: process-local, no filesystem, and the
+  key is a `comptime` constant, which is the one kind of state a thin `def`
+  can name.
+
+- **Both directions are tested.** One case asserts a lost assignment reaches
+  `on_lost` and *not* `on_revoke`; the other unsets `on_lost` and asserts the
+  documented fallback to `on_revoke`. Without the second, an `on_lost` that
+  was never reached and a lost event dropped on the floor look identical.

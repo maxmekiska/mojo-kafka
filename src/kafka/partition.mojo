@@ -10,6 +10,7 @@ comes back holding the answer.
 
 from ._ffi import (
     RD_KAFKA_OFFSET_BEGINNING,
+    Lib,
     RD_KAFKA_OFFSET_END,
     RD_KAFKA_OFFSET_INVALID,
     RD_KAFKA_OFFSET_STORED,
@@ -142,3 +143,36 @@ struct Watermarks(Copyable, Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("[", self.low, ", ", self.high, ")")
+
+
+def _build_tpl(lib: Lib, partitions: List[TopicPartition]) raises -> Int:
+    """Marshal `partitions` into a C list. The caller owns the result.
+
+    Lives here rather than in `consumer.mojo` because it has two callers on
+    opposite sides of the package: the consumer control plane, and the
+    transactional producer's `send_offsets_to_transaction`. A producer that
+    imported it from the consumer would be the only edge between those two
+    modules, for one helper that is really about `TopicPartition`.
+
+    The size is passed up front **and** each offset written as its element is
+    added, both deliberately: the list grows by reallocating `elems`, so an
+    element address kept across a second `add` dangles.
+    """
+    var list = lib.topic_partition_list_new(Int32(len(partitions)))
+    if list == 0:
+        raise Error("rd_kafka_topic_partition_list_new returned NULL")
+    try:
+        for tp in partitions:
+            var elem = lib.topic_partition_list_add(
+                list, tp.topic, tp.partition, tp.offset
+            )
+            if elem == 0:
+                raise Error(
+                    "rd_kafka_topic_partition_list_add("
+                    + String(tp)
+                    + ") returned NULL"
+                )
+    except e:
+        lib.topic_partition_list_destroy(list)
+        raise e
+    return list

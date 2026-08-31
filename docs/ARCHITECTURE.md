@@ -12,6 +12,7 @@ This is the longer write-up on how `mojo-kafka` is layered. Read [`README.md`](.
 │  Pythonic Mojo API                                     │
 │     src/kafka/__init__.mojo                            │
 │     src/kafka/{producer,consumer,admin,config}.mojo    │
+│     src/kafka/_sync.mojo   (_Latch — the only lock)    │
 ├────────────────────────────────────────────────────────┤  ← `OwnedDLHandle`
 │  raw FFI surface                                       │
 │     src/kafka/_ffi.mojo                                │
@@ -99,7 +100,9 @@ explicit path.
    Taking the topic by name is also what retired the per-topic
    `rd_kafka_topic_t` cache on `Producer`, and with it the unsynchronised
    `Dict` that was the headline reason a `Producer` could not be shared
-   across threads.
+   across threads. The rest followed later: the sequence counter is an
+   `Atomic` and the delivery-failure list is guarded by `_Latch`, so both
+   clients are now safe to drive from several threads. See `_sync.mojo`.
 
 4. **Every symbol is resolved once, in `Lib.__init__`.**
    `OwnedDLHandle.get_function` does a `dlsym` by string on each call, and

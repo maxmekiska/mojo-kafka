@@ -92,3 +92,30 @@ struct MockCluster:
             self._cluster, name, partition_count, replication_factor
         )
         self._lib.raise_if(rc, "mock_topic_create(" + name + ")")
+
+    def push_request_errors(self, api_key: Int16, errors: List[Int32]) raises:
+        """Make the next requests of `api_key` fail with `errors`, in order.
+
+        The mock answers the matching requests with these codes and then
+        goes back to behaving normally, one error consumed per request.
+        `api_key` is a Kafka wire-protocol request type -- use the
+        `API_KEY_*` constants:
+
+            cluster.push_request_errors(
+                API_KEY_INIT_PRODUCER_ID,
+                [RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED],
+            )
+
+        This is how librdkafka tests its own transactional error handling,
+        and it is the only way to reach the fatal and abortable branches of
+        `KafkaError.txn_action()` deterministically. It drives the real
+        classification path rather than simulating it: the mock returns the
+        broker code, and the *client* decides from it whether the error is
+        fatal, abortable or retriable -- which is precisely the logic under
+        test.
+
+        A code queued and never matched is simply never used; it does not
+        leak and does not fail the next test, because the cluster does not
+        outlive it.
+        """
+        self._lib.mock_push_request_errors(self._cluster, api_key, errors)

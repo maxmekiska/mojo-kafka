@@ -1,5 +1,7 @@
 """High-level consumer."""
 
+from std.atomic import Atomic
+
 from ._ffi import (
     Lib,
     RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS,
@@ -30,8 +32,14 @@ from ._ffi import (
     cstr,
 )
 from .config import ConsumerConfig
+from .group import ConsumerGroupMetadata
 from .header import Header, _text
-from .partition import OFFSET_INVALID, TopicPartition, Watermarks
+from .partition import (
+    OFFSET_INVALID,
+    TopicPartition,
+    Watermarks,
+    _build_tpl,
+)
 
 # rd_kafka_timestamp_type_t, re-exported so `Message.timestamp_type` can be
 # compared against something with a name.
@@ -242,7 +250,7 @@ struct Rebalance(Copyable, Movable):
         """
         Pointer[_RebalanceState, MutAnyOrigin](unsafe_from_address=self._state)[
             unsafe_offset=0
-        ].handled = 1
+        ].handled.store(1)
 
     def _library(self) raises -> Pointer[Lib, ImmutAnyOrigin]:
         if self._lib == 0:
@@ -319,44 +327,110 @@ struct Rebalance(Copyable, Movable):
 comptime RebalanceHandler = def(Rebalance) thin raises -> None
 
 
-@fieldwise_init
-struct _RebalanceState(Copyable, Movable):
+def _no_handler(event: Rebalance) raises:
+    """Seed value for a handler slot being overwritten. Never called."""
+    pass
+
+
+def _handler_word(handler: RebalanceHandler) raises -> Int:
+    """The eight bytes of a thin function pointer, as an integer.
+
+    `RebalanceHandler` is `thin`, so its whole representation is one code
+    address -- measured at 8 bytes, the same as `PTR_STRIDE`. Reading it as
+    an `Int` is what lets a handler slot be a single aligned word, which is
+    the entire safety argument in `_RebalanceState`.
+    """
+    var box = List[RebalanceHandler](capacity=1)
+    box.append(handler)
+    var word = Pointer[Int, ImmutAnyOrigin](
+        unsafe_from_address=Int(box.unsafe_ptr())
+    )[unsafe_offset=0]
+    _ = box^
+    return word
+
+
+def _handler_from_word(word: Int) raises -> RebalanceHandler:
+    """The inverse of `_handler_word`. Only ever given a word it produced."""
+    var box = List[RebalanceHandler](capacity=1)
+    box.append(_no_handler)
+    Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(box.unsafe_ptr()))[
+        unsafe_offset=0
+    ] = word
+    var out = box[0]
+    _ = box^
+    return out
+
+
+struct _RebalanceState(Movable):
     """What the C callback can see. Lives in a one-element `List` on the
     `Consumer`, so its address survives anything that moves the consumer.
 
     `handled` is read back after the handler returns to decide whether the
-    default assignment still has to be applied. It is an `Int32` written
-    through its address rather than a `Bool` field because the callback
-    reaches it as a raw pointer.
+    default assignment still has to be applied. It is written through its
+    address rather than being a `Bool` field because the callback reaches it
+    as a raw pointer, and it is `Atomic` because that callback runs on
+    whichever thread called `poll` / `close`.
+
+    **The three handler slots are raw code addresses in `Atomic` words, and
+    that is the whole point.** `subscribe()` writes them and the trampoline
+    reads them, on different threads. They were `Optional[RebalanceHandler]`
+    behind a `_Latch`, and the note here claimed a single slot could not tear
+    because it was "pointer-sized and aligned". **That was measured and it is
+    false**: `Optional[RebalanceHandler]` is **16** bytes -- a discriminant
+    plus the pointer -- against 8 for the bare handler. So an unguarded
+    reader could pair `has_value = True` with the *other* value's payload and
+    call through it. Not a mispaired handler: a call through a wrong address.
+
+    A lock excluded that, but nothing could test the lock. The reader only
+    runs during a rebalance, which happens twice in a test and thousands of
+    times less often than `subscribe()` can be called, so the window is never
+    hit -- a probe hammering four threads saw nothing in 5 runs. A guard that
+    cannot fail is worse than none, because it reads as protection.
+
+    Storing the code address instead makes the tearing **impossible rather
+    than unlikely**: one naturally-aligned word, one atomic store, one atomic
+    load, on the 64-bit targets this package already assumes for
+    `PTR_STRIDE`. 0 means "no handler", which is safe because no function has
+    address 0. `test_a_handler_slot_is_one_word` fails if anyone puts a
+    multi-word type back in these slots.
+
+    What this does *not* exclude is a torn **set** -- a rebalance seeing the
+    new `on_assign` beside the previous `on_revoke`. That is unchanged, still
+    benign, and now free: a caller racing `subscribe()` against a live
+    rebalance has no ordering guarantee to lose in the first place.
+
+    Not `Copyable`: an `Atomic` cannot be copied.
     """
 
     var lib: Int
-    var handled: Int32
-    var on_assign: Optional[RebalanceHandler]
-    var on_revoke: Optional[RebalanceHandler]
-    var on_lost: Optional[RebalanceHandler]
+    var handled: Atomic[DType.int32]
+    var on_assign: Atomic[DType.int64]
+    var on_revoke: Atomic[DType.int64]
+    var on_lost: Atomic[DType.int64]
 
+    def __init__(out self):
+        self.lib = 0
+        self.handled = Atomic[DType.int32](0)
+        self.on_assign = Atomic[DType.int64](0)
+        self.on_revoke = Atomic[DType.int64](0)
+        self.on_lost = Atomic[DType.int64](0)
 
-def _build_tpl(lib: Lib, partitions: List[TopicPartition]) raises -> Int:
-    """Marshal `partitions` into a C list. The caller owns the result."""
-    var list = lib.topic_partition_list_new(Int32(len(partitions)))
-    if list == 0:
-        raise Error("rd_kafka_topic_partition_list_new returned NULL")
-    try:
-        for tp in partitions:
-            var elem = lib.topic_partition_list_add(
-                list, tp.topic, tp.partition, tp.offset
-            )
-            if elem == 0:
-                raise Error(
-                    "rd_kafka_topic_partition_list_add("
-                    + String(tp)
-                    + ") returned NULL"
-                )
-    except e:
-        lib.topic_partition_list_destroy(list)
-        raise e
-    return list
+    def _publish(
+        mut self,
+        on_assign: Optional[RebalanceHandler],
+        on_revoke: Optional[RebalanceHandler],
+        on_lost: Optional[RebalanceHandler],
+    ) raises:
+        """Install a set of handlers. One atomic store per slot."""
+        self.on_assign.store(
+            Int64(_handler_word(on_assign.value())) if on_assign else Int64(0)
+        )
+        self.on_revoke.store(
+            Int64(_handler_word(on_revoke.value())) if on_revoke else Int64(0)
+        )
+        self.on_lost.store(
+            Int64(_handler_word(on_lost.value())) if on_lost else Int64(0)
+        )
 
 
 def _settle(lib: Lib, rk: Int, err: Int32, partitions: Int) raises:
@@ -411,7 +485,7 @@ def _rebalance_trampoline(
       handler took over, and `_settle` runs whenever it did not.
     """
     var sp = Pointer[_RebalanceState, MutAnyOrigin](unsafe_from_address=opaque)
-    sp[unsafe_offset=0].handled = 0
+    sp[unsafe_offset=0].handled.store(0)
 
     try:
         ref state = sp[unsafe_offset=0]
@@ -422,24 +496,37 @@ def _rebalance_trampoline(
         var event = Rebalance(
             _decode_tpl(lib, partitions), lost, state.lib, rk, opaque
         )
+
+        # One atomic load picks the handler. There is no lock here any more:
+        # a slot is a single aligned word, so the load either sees the whole
+        # old address or the whole new one -- see `_RebalanceState`. A lock
+        # would also have to be released before the call anyway, because a
+        # handler calls straight back into librdkafka and `_Latch` forbids
+        # holding it across FFI.
+        #
+        # A lost assignment goes to `on_lost` when there is one, and falls
+        # back to `on_revoke` when there is not -- which is what
+        # `confluent-kafka` documents for the same three callbacks.
+        var chosen = Int(0)
         if err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
-            if state.on_assign:
-                state.on_assign.value()(event)
+            chosen = Int(state.on_assign.load())
         elif err == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
-            # A lost assignment goes to `on_lost` when there is one, and
-            # falls back to `on_revoke` when there is not -- which is what
-            # `confluent-kafka` documents for the same three callbacks.
-            if lost and state.on_lost:
-                state.on_lost.value()(event)
-            elif state.on_revoke:
-                state.on_revoke.value()(event)
+            var lost_slot = Int(state.on_lost.load())
+            if lost and lost_slot != 0:
+                chosen = lost_slot
+            else:
+                chosen = Int(state.on_revoke.load())
+
+        # 0 is "no handler": no function lives at address 0.
+        if chosen != 0:
+            _handler_from_word(chosen)(event)
     except:
         # A handler that raised has already had its say. Settling below is
         # what keeps its mistake from stalling the group.
         pass
 
     try:
-        if sp[unsafe_offset=0].handled == 0:
+        if sp[unsafe_offset=0].handled.load() == 0:
             ref state = sp[unsafe_offset=0]
             ref lib = Pointer[Lib, ImmutAnyOrigin](
                 unsafe_from_address=state.lib
@@ -450,11 +537,29 @@ def _rebalance_trampoline(
 
 
 struct Consumer:
-    """A consumer group member over librdkafka."""
+    """A consumer group member over librdkafka.
+
+    **Concurrency.** `rd_kafka_t` is thread-safe, and the reading calls here
+    -- `poll()`, `poll_event()` and the control plane -- hold no mutable Mojo
+    state, so they may be driven from more than one thread. The two calls
+    that mutate are synchronised: `close()` claims its flag with a
+    compare-exchange, and `subscribe()` writes the rebalance handler slots
+    under a latch the trampoline reads them through.
+
+    `close()` is the one that mattered. It used to check a `Bool` and then
+    set it, so every thread calling it could pass the check before any set
+    it -- and concurrent `rd_kafka_consumer_close` calls on one handle
+    **deadlock**: measured at 8 threads, one returns and seven never do.
+
+    This does not make a single `Consumer` a work-sharing primitive. Two
+    threads polling one consumer get interleaved records from a single
+    assignment, which is rarely what anyone wants; librdkafka's own guidance
+    is one consumer per thread, or more consumers in the group.
+    """
 
     var _lib: Lib
     var _rk: Int
-    var _closed: Bool
+    var _closed: Atomic[DType.int32]
     # One element, on the heap: the C rebalance callback reaches this by
     # address, and a `List`'s buffer does not move when the `Consumer` does.
     var _rebalance: List[_RebalanceState]
@@ -468,7 +573,7 @@ struct Consumer:
         # with none set it simply applies librdkafka's own default, which is
         # what an unsubscribed or handler-free consumer needs anyway.
         var state = List[_RebalanceState](capacity=1)
-        state.append(_RebalanceState(0, 0, None, None, None))
+        state.append(_RebalanceState())
         self._rebalance = state^
 
         var conf = cfg._build(self._lib)
@@ -481,7 +586,7 @@ struct Consumer:
 
         self._rk = self._lib.new_client(RD_KAFKA_CONSUMER, conf)
         _ = self._lib.poll_set_consumer(self._rk)
-        self._closed = False
+        self._closed = Atomic[DType.int32](0)
         # Recorded now rather than in `__init__`'s field list because it is
         # the address of a field of `self`, which is only final once the
         # consumer is constructed. `Consumer` is neither `Copyable` nor
@@ -492,11 +597,27 @@ struct Consumer:
         # Destructors cannot raise; a failed close is not actionable here.
         if self._rk != 0:
             try:
-                if not self._closed:
+                # Same compare-exchange as `close()`: if the app
+                # already closed, this must not close again.
+                var expected = Int32(0)
+                if self._closed.compare_exchange(expected, 1):
                     _ = self._lib.consumer_close(self._rk)
                 self._lib.destroy(self._rk)
             except:
                 pass
+        # **Load-bearing, and not obvious.** `consumer_close` fires a final
+        # revoke through `_rebalance_trampoline`, which reaches this box by
+        # the address handed to `rd_kafka_conf_set_opaque`. Fields are
+        # released at their last use *inside the destructor body*, not after
+        # it -- so without a use down here, `_rebalance` is freed before
+        # `consumer_close` is even called, and the callback then reads a
+        # dangling box. That was a reliable segfault for any consumer
+        # dropped without an explicit `close()`; the whole test suite missed
+        # it because every case closed by hand.
+        #
+        # `_lib` needs no such line: `consumer_close` and `destroy` are uses
+        # of it, so it stays alive across exactly the window that matters.
+        _ = self._rebalance^
 
     def subscribe(
         mut self,
@@ -540,13 +661,18 @@ struct Consumer:
 
         This replaces any previous subscription, handlers included.
         """
-        self._rebalance[0].on_assign = on_assign
-        self._rebalance[0].on_revoke = on_revoke
-        self._rebalance[0].on_lost = on_lost
+        # Three atomic stores, one per slot. The trampoline reads them on
+        # whichever thread is polling, so a slot has to be publishable in one
+        # write -- which is why it holds a bare code address and not an
+        # `Optional`. See `_RebalanceState`; the previous shape needed a lock
+        # that no test could ever fail.
+        self._rebalance[0]._publish(on_assign, on_revoke, on_lost)
 
         # The list is owned here, and both the adds and the subscribe can
         # raise.
         var list = self._lib.topic_partition_list_new(Int32(len(topics)))
+        if list == 0:
+            raise Error("rd_kafka_topic_partition_list_new returned NULL")
         var rc: Int32
         try:
             for topic in topics:
@@ -697,6 +823,32 @@ struct Consumer:
     #   failure lands in that element's `err`, and reading only the return
     #   code reports a seek or a pause that never happened -- the same trap
     #   `AdminClient.create_topic` has with `rd_kafka_event_error`.
+
+    def consumer_group_metadata(self) raises -> ConsumerGroupMetadata:
+        """This consumer's group identity, for exactly-once.
+
+        Hand it to `Producer.send_offsets_to_transaction()` so a transaction
+        can commit the offsets this consumer read, atomically with whatever
+        the producer wrote. That is the whole read-process-write loop:
+
+            var work = consumer.poll()
+            ...
+            _ = producer.send_offsets_to_transaction(
+                consumer.position(assignment),
+                consumer.consumer_group_metadata(),
+            )
+            _ = producer.commit_transaction()
+
+        Take it **inside the transaction**, not once at startup: it captures
+        the group generation, and librdkafka rejects offsets sent under one
+        a rebalance has since superseded.
+
+        Raises if this consumer has no `group.id` -- there is no group to
+        commit to, and librdkafka answers NULL rather than an error code.
+        """
+        return ConsumerGroupMetadata(
+            self._lib.consumer_group_metadata(self._rk)
+        )
 
     def _tpl_build(self, partitions: List[TopicPartition]) raises -> Int:
         """Marshal `partitions` into a C list. The caller owns the result.
@@ -941,9 +1093,25 @@ struct Consumer:
         self._lib.raise_if(rc, "commit")
 
     def close(mut self) raises:
-        """Leave the group cleanly. Safe to call more than once."""
-        if self._closed:
+        """Leave the group cleanly. Safe to call more than once, from any
+        thread.
+
+        The flag is claimed with a compare-exchange rather than a read
+        followed by a write, so exactly one caller ever reaches
+        `rd_kafka_consumer_close`. Two threads racing a plain `if
+        self._closed` both passed the check and both closed, and the second
+        close reports an error for a consumer that had in fact shut down
+        cleanly.
+
+        A caller that loses the race returns **immediately** rather than
+        waiting for the winner to finish. Leaving a group is a network round
+        trip, and spinning a core for the length of one is worse than the
+        wrinkle it would fix -- and there is no blocking primitive in Mojo
+        1.0 to wait on properly. The close is in progress either way.
+        """
+        var expected = Int32(0)
+        if not self._closed.compare_exchange(expected, 1):
             return
-        var rc = self._lib.consumer_close(self._rk)
-        self._closed = True
-        self._lib.raise_if(rc, "close")
+        # Claimed before the call, so a close that fails still counts as
+        # done -- retrying it would only report the same failure twice.
+        self._lib.raise_if(self._lib.consumer_close(self._rk), "close")

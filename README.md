@@ -243,10 +243,10 @@ See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipel
 
 | Symbol | What it does |
 |---|---|
-| `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected |
+| `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, and `poll_event()` |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once |
 | `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
 | `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
 | `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
@@ -255,9 +255,11 @@ See [`examples/`](examples/) for runnable scripts, including [`examples/ml_pipel
 | `AdminClient` | Create / list topics |
 | `Message` | `topic`, `partition`, `offset`, `key`, `value` as `Optional[List[UInt8]]`, `headers` as `List[Header]`, `timestamp` + `timestamp_type`; `key_text()` / `value_text()` / `is_tombstone()` / `has_timestamp()` / `header()` / `header_text()` |
 | `Header` | One record header: `name`, plus an `Optional` byte `value` and `value_text()` |
-| `KafkaError` | Raised with `librdkafka` error code + human description; `kind()` for the branchable category |
+| `KafkaError` | An `librdkafka` error code + human description; `kind()` for the branchable category, `is_fatal` / `is_retriable` / `txn_requires_abort` for a transactional one |
 | `KafkaErrorKind` | Eight tags — `KIND_QUEUE_FULL`, `KIND_TIMED_OUT`, … — for handling rather than reporting |
-| `kafka.testing.MockCluster` | In-process broker for tests — no Docker |
+| `ConsumerGroupMetadata` | A consumer's group identity, from `Consumer.consumer_group_metadata()` — the bridge that lets a transaction commit that consumer's offsets |
+| `TxnAction` | What a failed transactional call needs: `TXN_ABORT`, `TXN_RETRY` or `TXN_FATAL`, from `KafkaError.txn_action()` |
+| `kafka.testing.MockCluster` | In-process broker for tests — no Docker; `push_request_errors()` makes it answer chosen requests with chosen errors |
 
 The named fields are Mojo-idiomatic (`bootstrap_servers` → `bootstrap.servers`, `auto_offset_reset` → `auto.offset.reset`). Anything else the C client supports is reachable through `set()`, which takes the **librdkafka property name verbatim**:
 
@@ -328,10 +330,13 @@ Known limitations today:
   message per call.
 - `AdminClient` does create and list only — no delete, alter, configs,
   partitions, consumer groups or ACLs.
-- Retiring the topic-handle cache removed the Mojo-side state that made
-  `produce()` unsafe to share across threads, but the delivery-failure
-  bookkeeping `poll()` and `flush()` maintain is still unsynchronised, so a
-  `Producer` is not yet a thread-safe object end to end.
+- `Producer.last_error_kind()` is a single slot on the producer, so with more
+  than one thread producing it cannot be attributed to a particular call.
+  Branch on `DeliveryReport.kind()` instead, which names its message. The
+  rest of `Producer` — and `Consumer` — is safe to share across threads.
+- A shared `Consumer` is not a work-sharing primitive: two threads polling one
+  consumer split a single assignment's records between them. Use one consumer
+  per thread, or more members in the group.
 - Dropping a `Producer` that still holds undeliverable messages blocks for up
   to 5s while they time out, and swallows their failures. Call `flush()`
   first to see the verdict and to choose the wait.
@@ -352,10 +357,12 @@ people do from a CLI or Terraform.
   written and an empty-but-present key was unreachable — so it came first, and
   the performance win is incidental. Also: each `librdkafka` symbol is
   resolved once at load rather than per call. Also: producing goes through
-  `rd_kafka_produceva`, which retired the per-topic handle cache — and with it
-  the one thing keeping `Producer` from being thread-safe — and unblocked
+  `rd_kafka_produceva`, which retired the per-topic handle cache and unblocked
   record **headers**, now carried on both sides, plus an explicit `partition`
-  on `produce()`. Also: `produce()` returns a sequence token and
+  on `produce()`. Also: both clients are now **thread-safe** — the producer's
+  sequence counter is atomic and its delivery-failure list is locked, and the
+  consumer's `close()` is compare-exchanged, which closed a reachable
+  deadlock. Both are verified by tests that drive eight real threads. Also: `produce()` returns a sequence token and
   `Producer.failures()` reports every rejection against it, so a message's
   verdict is addressable rather than a count plus the first failure string.
   Also: a typed `KafkaErrorKind`, so queue-full backpressure can be handled
@@ -371,15 +378,23 @@ people do from a CLI or Terraform.
   Mojo 1.0's `abi("C")` effect. Also: `produce(timestamp=)`, completing the
   event-time pair with `Message.timestamp`. Also: delivery reports moved from
   librdkafka's event queue to a `dr_msg_cb`, so both callback paths in the
-  package now work the same way.
+  package now work the same way. Also: **transactions on the producer side** —
+  `init_transactions()` / `begin_transaction()` / `commit_transaction()` /
+  `abort_transaction()`, which return `Optional[KafkaError]` rather than
+  raising, because Mojo 1.0's `Error` is text and would discard the fatal /
+  retriable / abortable flags a transactional caller has to branch on.
+  `KafkaError.txn_action()` reduces those to the three-way decision, in
+  librdkafka's order — abort before fatal. Also:
+  `send_offsets_to_transaction()` with `Consumer.consumer_group_metadata()`,
+  which completes **read-process-write** exactly-once: the consumer's offsets
+  commit inside the producer's transaction, so a failed transaction replays
+  the input rather than skipping it.
 - **v0.3 — batch `consume(n)`.** One FFI crossing for a whole batch instead of
   three per message. This is the item where Mojo beats a Python client, so it
   ranks higher here than its place in `confluent-kafka` would suggest; it ships
   with a benchmark.
-- **v0.4 — transactions, for exactly-once.** `init_transactions` / `begin` /
-  `send_offsets_to_transaction` / `commit` / `abort`. Gated on binding
-  librdkafka's error predicates (`is_fatal` / `is_retriable` /
-  `txn_requires_abort`), which a transactional caller must branch on.
+- **v0.4** — open. Transactions landed early (see above); suggestions
+  welcome in the issue tracker.
 - **v1.0** — API stable and production-ready. Not feature parity with
   `confluent-kafka-python`: deliberately no ACL / consumer-group / alter-config
   admin surface, and Schema Registry belongs in a second package.

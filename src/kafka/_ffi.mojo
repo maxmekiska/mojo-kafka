@@ -61,8 +61,21 @@ comptime RD_KAFKA_RESP_ERR__FENCED: Int32 = -144
 comptime RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART: Int32 = 3
 comptime RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE: Int32 = 10
 comptime RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED: Int32 = 29
+comptime RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED: Int32 = 30
+comptime RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED: Int32 = 31
 
 comptime RD_KAFKA_PARTITION_UA: Int32 = -1
+
+# Kafka protocol request types, for `Lib.mock_push_request_errors`. These are
+# wire-protocol ApiKeys defined by Kafka itself, not librdkafka constants --
+# they are stable across broker versions and are what the mock matches on.
+# Only the ones a transactional test needs to intercept are listed.
+comptime API_KEY_PRODUCE: Int16 = 0
+comptime API_KEY_INIT_PRODUCER_ID: Int16 = 22
+comptime API_KEY_ADD_PARTITIONS_TO_TXN: Int16 = 24
+comptime API_KEY_ADD_OFFSETS_TO_TXN: Int16 = 25
+comptime API_KEY_END_TXN: Int16 = 26
+comptime API_KEY_TXN_OFFSET_COMMIT: Int16 = 28
 
 # Tell librdkafka to copy the payload out of our buffer, so the caller's
 # key and value can be freed as soon as `produce()` returns. Emitted as a
@@ -382,8 +395,12 @@ struct _VuArray(Movable):
         librdkafka stores this `void *` and hands it back as `_private` on
         the delivery report without ever dereferencing it, so a plain integer
         token is a legitimate value: it never has to point at anything. That
-        is what makes per-message reports reachable without a `dr_msg_cb` at
-        all -- which Mojo 1.0 could supply, but this package does not need.
+        is what lets a sequence number address a report, rather than needing
+        the token to be a pointer to something that outlives the produce.
+
+        The report itself arrives at `_delivery_trampoline` -- see
+        `conf_set_dr_msg_cb`. This opaque is orthogonal to that: it says
+        *which message* a report is about, not how the report is delivered.
         """
         _store_word(self._entry(RD_KAFKA_VTYPE_OPAQUE) + VU_ARG0, token)
 
@@ -526,19 +543,125 @@ def kind_of(code: Int32) -> KafkaErrorKind:
 
 
 @fieldwise_init
+struct TxnAction(Copyable, ImplicitlyCopyable, Movable, Writable):
+    """What a transactional caller must do about a failed call.
+
+    Every call in librdkafka's transactional API returns an
+    `rd_kafka_error_t*` the application is required to branch three ways on,
+    and getting the branch wrong is not a cosmetic bug: retrying a call that
+    needed an abort corrupts the transaction, and aborting on a fatal error
+    loops forever on a producer that can never succeed again.
+
+    Three tags, not four, and the third is a catch-all on purpose -- see
+    `KafkaError.txn_action`.
+    """
+
+    var _tag: Int32
+
+    def __eq__(self, other: Self) -> Bool:
+        return self._tag == other._tag
+
+    def __ne__(self, other: Self) -> Bool:
+        return self._tag != other._tag
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(self._name())
+
+    def _name(self) -> StaticString:
+        if self._tag == 1:
+            return "RETRY"
+        if self._tag == 2:
+            return "ABORT"
+        return "FATAL"
+
+
+# The tags, module-level for the same reason `KIND_*` are: a struct cannot
+# hold a comptime alias of its own type.
+comptime TXN_RETRY = TxnAction(1)
+"""Retry the same call, preferably after a short grace period."""
+comptime TXN_ABORT = TxnAction(2)
+"""Abort the transaction; a new one may then be begun."""
+comptime TXN_FATAL = TxnAction(3)
+"""The producer is unusable and must be destroyed."""
+
+
 struct KafkaError(Copyable, Movable, Writable):
     """A `rd_kafka_resp_err_t` with the description librdkafka gives it.
 
     `Writable` rather than a `describe()` of its own, so `String(err)` and
     `print(err)` work the way they do for every other Mojo type.
+
+    The three flags come off `rd_kafka_error_t`, which is a richer object
+    than the bare `rd_kafka_resp_err_t` most of this API returns: librdkafka
+    decides them per error and the caller is meant to branch on them rather
+    than on the code. `Lib.take_error` is the only thing that can read them,
+    because it is what destroys the object they live on.
+
+    **An error built from a bare code carries no flags**, so all three are
+    False on one that `Lib.error()` produced. That is not a claim the
+    operation was neither fatal nor retriable -- it is the absence of an
+    opinion, because a `rd_kafka_resp_err_t` has nowhere to keep one. Only
+    calls returning `rd_kafka_error_t*` yield a flagged error, and
+    librdkafka documents `txn_requires_abort` as meaningful **only** for the
+    transactional ones.
     """
 
     var code: Int32
     var message: String
+    # The client instance is unusable and must be destroyed.
+    var is_fatal: Bool
+    # The same call may be retried, preferably after a grace period.
+    var is_retriable: Bool
+    # The transaction must be aborted; a new one may then be begun.
+    var txn_requires_abort: Bool
+
+    def __init__(
+        out self,
+        code: Int32,
+        message: String,
+        is_fatal: Bool = False,
+        is_retriable: Bool = False,
+        txn_requires_abort: Bool = False,
+    ):
+        """The flags default to False so a plain `KafkaError(code, message)`
+        still means "a code and its description, nothing claimed about it".
+        """
+        self.code = code
+        self.message = message
+        self.is_fatal = is_fatal
+        self.is_retriable = is_retriable
+        self.txn_requires_abort = txn_requires_abort
 
     def kind(self) -> KafkaErrorKind:
         """The branchable category, for handling rather than reporting."""
         return kind_of(self.code)
+
+    def txn_action(self) -> TxnAction:
+        """What a transactional caller must do about this error.
+
+        **The order is librdkafka's, and it is not the obvious one.**
+        Testing `is_fatal` first reads correctly and is wrong: the
+        transactional producer treats most of the idempotent producer's
+        fatal errors as abortable, because a transaction can be aborted and
+        replayed whole, so an error can be both fatal-flagged and abortable
+        and the abort is what to do about it. librdkafka's own worked
+        example in `rdkafka.h` branches abort, then retriable, then
+        everything else -- which is this, in this order.
+
+        The last branch is deliberately wide. librdkafka's guidance for an
+        error carrying none of the three flags is explicit -- "treat all
+        other errors as fatal" -- so an unflagged error lands on `TXN_FATAL`
+        rather than on a fourth tag no caller would know what to do with.
+        The consequence to be aware of: a `KafkaError` built from a bare
+        code reports `TXN_FATAL` here, correctly for a transactional call
+        and meaninglessly for anything else. Only ask a transactional call's
+        error what action it needs.
+        """
+        if self.txn_requires_abort:
+            return TXN_ABORT
+        if self.is_retriable:
+            return TXN_RETRY
+        return TXN_FATAL
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("KafkaError(", Int(self.code), "): ", self.message)
@@ -642,6 +765,18 @@ struct Lib(Movable):
     var _error_code: _DLCallable[Int32, ImmUntrackedOrigin]
     var _error_string: _DLCallable[Int, ImmUntrackedOrigin]
     var _error_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _init_transactions: _DLCallable[Int, ImmUntrackedOrigin]
+    var _begin_transaction: _DLCallable[Int, ImmUntrackedOrigin]
+    var _commit_transaction: _DLCallable[Int, ImmUntrackedOrigin]
+    var _abort_transaction: _DLCallable[Int, ImmUntrackedOrigin]
+    var _send_offsets_to_transaction: _DLCallable[Int, ImmUntrackedOrigin]
+    var _consumer_group_metadata: _DLCallable[Int, ImmUntrackedOrigin]
+    var _consumer_group_metadata_destroy: _DLCallable[
+        NoneType, ImmUntrackedOrigin
+    ]
+    var _error_is_fatal: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _error_is_retriable: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _error_txn_requires_abort: _DLCallable[Int32, ImmUntrackedOrigin]
     var _headers_new: _DLCallable[Int, ImmUntrackedOrigin]
     var _headers_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _header_add: _DLCallable[Int32, ImmUntrackedOrigin]
@@ -712,6 +847,36 @@ struct Lib(Movable):
         self._error_string = _bind[Int](self._box, "rd_kafka_error_string")
         self._error_destroy = _bind[NoneType](
             self._box, "rd_kafka_error_destroy"
+        )
+        self._init_transactions = _bind[Int](
+            self._box, "rd_kafka_init_transactions"
+        )
+        self._begin_transaction = _bind[Int](
+            self._box, "rd_kafka_begin_transaction"
+        )
+        self._commit_transaction = _bind[Int](
+            self._box, "rd_kafka_commit_transaction"
+        )
+        self._abort_transaction = _bind[Int](
+            self._box, "rd_kafka_abort_transaction"
+        )
+        self._send_offsets_to_transaction = _bind[Int](
+            self._box, "rd_kafka_send_offsets_to_transaction"
+        )
+        self._consumer_group_metadata = _bind[Int](
+            self._box, "rd_kafka_consumer_group_metadata"
+        )
+        self._consumer_group_metadata_destroy = _bind[NoneType](
+            self._box, "rd_kafka_consumer_group_metadata_destroy"
+        )
+        self._error_is_fatal = _bind[Int32](
+            self._box, "rd_kafka_error_is_fatal"
+        )
+        self._error_is_retriable = _bind[Int32](
+            self._box, "rd_kafka_error_is_retriable"
+        )
+        self._error_txn_requires_abort = _bind[Int32](
+            self._box, "rd_kafka_error_txn_requires_abort"
         )
         self._headers_new = _bind[Int](self._box, "rd_kafka_headers_new")
         self._headers_destroy = _bind[NoneType](
@@ -883,14 +1048,32 @@ struct Lib(Movable):
     # -- rd_kafka_t ---------------------------------------------------------
 
     def new_client(self, kind: Int32, conf: Int) raises -> Int:
-        """Create a client. Takes ownership of `conf` only on success."""
+        """Create a client. Takes ownership of `conf` only on success.
+
+        The error text is decoded **before** `conf_destroy`, and `errbuf` is
+        consumed straight after. Mojo releases a value at its last *use*, not
+        at the end of the scope, and a `def` call in between is free to reuse
+        the stack slot -- so reading the buffer after the destroy returned a
+        message with its first bytes overwritten:
+
+            rd_kafka_new: \\xef@\\xb71      @st be >= `session.timeout.ms`
+
+        for what librdkafka actually wrote:
+
+            `max.poll.interval.ms`must be >= `session.timeout.ms`
+
+        The tail survived, which is what made it look like an encoding
+        problem rather than a lifetime one.
+        """
         var errbuf = Array[UInt8, 512](fill=0)
         var rk = self._new(kind, conf, errbuf.unsafe_ptr(), 512)
+        var why = cstr(Int(errbuf.unsafe_ptr())) if rk == 0 else String("")
+        _ = errbuf^
         if rk == 0:
             # librdkafka only adopts conf when it succeeds, so on failure
             # the conf is still ours to free.
             self.conf_destroy(conf)
-            raise Error("rd_kafka_new: " + cstr(Int(errbuf.unsafe_ptr())))
+            raise Error("rd_kafka_new: " + why)
         return rk
 
     def destroy(self, rk: Int) raises:
@@ -939,29 +1122,100 @@ struct Lib(Movable):
         """
         return self._produceva(rk, vus, cnt)
 
+    # -- transactions -------------------------------------------------------
+
+    # All four share `produceva`'s reversed polarity: they answer with a
+    # `rd_kafka_error_t*` that is **NULL on success** and is the caller's to
+    # destroy, so a non-NULL result goes through `take_error` -- which is
+    # also the only place the three flags on it can be read.
+
+    def init_transactions(self, rk: Int, timeout_ms: Int32) raises -> Int:
+        """`rd_kafka_init_transactions`. Once, before anything else."""
+        return self._init_transactions(rk, timeout_ms)
+
+    def begin_transaction(self, rk: Int) raises -> Int:
+        """`rd_kafka_begin_transaction`. The only one with no timeout: it is
+        local state, not a round trip."""
+        return self._begin_transaction(rk)
+
+    def commit_transaction(self, rk: Int, timeout_ms: Int32) raises -> Int:
+        """`rd_kafka_commit_transaction`. Flushes before committing."""
+        return self._commit_transaction(rk, timeout_ms)
+
+    def abort_transaction(self, rk: Int, timeout_ms: Int32) raises -> Int:
+        """`rd_kafka_abort_transaction`. Purges anything still queued."""
+        return self._abort_transaction(rk, timeout_ms)
+
+    def send_offsets_to_transaction(
+        self, rk: Int, offsets: Int, cgmd: Int, timeout_ms: Int32
+    ) raises -> Int:
+        """`rd_kafka_send_offsets_to_transaction`. On the **producer**.
+
+        `offsets` is a `rd_kafka_topic_partition_list_t*` the caller still
+        owns afterwards, and `cgmd` a `rd_kafka_consumer_group_metadata_t*`
+        from the consumer that read them.
+        """
+        return self._send_offsets_to_transaction(rk, offsets, cgmd, timeout_ms)
+
+    def consumer_group_metadata(self, rk: Int) raises -> Int:
+        """The consumer's group identity, to hand to a transactional
+        producer. NULL if `rk` is not a consumer with a `group.id`.
+
+        Caller-owned -- `consumer_group_metadata_destroy` frees it, and
+        `ConsumerGroupMetadata` is the RAII wrapper that does.
+        """
+        return self._consumer_group_metadata(rk)
+
+    def consumer_group_metadata_destroy(self, cgmd: Int) raises:
+        _ = self._consumer_group_metadata_destroy(cgmd)
+
     # -- rd_kafka_error_t ---------------------------------------------------
 
     def take_error(self, err: Int) raises -> KafkaError:
         """Read a `rd_kafka_error_t*` and destroy it.
 
         The object is heap-allocated and the caller owns it, so reading it
-        without destroying it leaks. Both reads are guarded so the destroy
-        still happens if decoding the string raises.
+        without destroying it leaks. Every read is guarded so the destroy
+        still happens if one of them raises.
 
         `rd_kafka_error_string` is deliberately preferred over `err2str` on
         the code: it carries what actually went wrong ("Unknown topic ...")
         where `err2str` only names the code's category.
+
+        **The three flags are read here or nowhere.** They live on the
+        `rd_kafka_error_t` and not on its code, so once this destroys the
+        object they cannot be recovered from the `KafkaError` it returns --
+        which is what an earlier version of this method did, reading code
+        and string and throwing the rest away. A transactional caller
+        branches on the flags, so losing them makes the transactional API
+        impossible to use correctly. See `KafkaError.txn_action`.
+
+        All three predicates are NULL-safe in C and return 0 for a NULL
+        error, so this is safe on any pointer the caller has already
+        checked is non-NULL -- and harmless on one they have not.
         """
         var code: Int32
         var message: String
+        var fatal: Int32
+        var retriable: Int32
+        var requires_abort: Int32
         try:
             code = self._error_code(err)
             message = cstr(self._error_string(err))
+            fatal = self._error_is_fatal(err)
+            retriable = self._error_is_retriable(err)
+            requires_abort = self._error_txn_requires_abort(err)
         except e:
             _ = self._error_destroy(err)
             raise e
         _ = self._error_destroy(err)
-        return KafkaError(code, message)
+        return KafkaError(
+            code,
+            message,
+            is_fatal=fatal != 0,
+            is_retriable=retriable != 0,
+            txn_requires_abort=requires_abort != 0,
+        )
 
     # -- record headers -----------------------------------------------------
 
@@ -1346,6 +1600,31 @@ struct Lib(Movable):
         )
         _ = topic_c^
         return rc
+
+    def mock_push_request_errors(
+        self, mcluster: Int, api_key: Int16, errors: List[Int32]
+    ) raises:
+        """Queue `errors` to be returned for the next requests of `api_key`.
+
+        `rd_kafka_mock_push_request_errors_array` -- the **array** form. The
+        `..._errors` form of the same call is variadic and convention 5 rules
+        it out; this one is ordinary fixed arity, exactly as
+        `produceva` is to `producev`.
+
+        This is how librdkafka tests its own transactional error handling
+        (`tests/0105-transactions_mock.c`), and it is the only way to reach
+        the fatal and abortable branches of `KafkaError.txn_action()` without
+        a broken cluster: the flags are set by the *client* from the error
+        the coordinator returned, so injecting the code at the mock drives
+        the real classification path rather than a simulation of it.
+
+        `api_key` is the Kafka protocol request type -- `INIT_PRODUCER_ID`
+        and friends below. The errors are consumed one per matching request,
+        in order.
+        """
+        _ = self._box[0].get_function[NoneType](
+            "rd_kafka_mock_push_request_errors_array"
+        )(mcluster, api_key, len(errors), errors.unsafe_ptr())
 
 
 def librdkafka_version() raises -> String:

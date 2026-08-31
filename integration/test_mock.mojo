@@ -19,14 +19,24 @@ instead:
   `OFFSET_END` and against one that worked.
 """
 
+from std.os import getenv, setenv
 from std.testing import TestSuite, assert_equal, assert_true
+from std.time import sleep
 
 from kafka import (
+    API_KEY_ADD_OFFSETS_TO_TXN,
+    API_KEY_ADD_PARTITIONS_TO_TXN,
+    API_KEY_INIT_PRODUCER_ID,
     OFFSET_BEGINNING,
+    RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+    RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+    RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED,
     Rebalance,
     OFFSET_END,
     OFFSET_INVALID,
     TIMESTAMP_CREATE_TIME,
+    TXN_ABORT,
+    TXN_FATAL,
     AdminClient,
     Consumer,
     ConsumerConfig,
@@ -1119,6 +1129,621 @@ def test_on_revoke_can_commit_before_the_partitions_move() raises:
 
     second.close()
     print("    on_revoke committed offset 4 before leaving the group")
+    _ = cluster^
+
+
+def test_dropping_a_subscribed_consumer_does_not_fault() raises:
+    """A consumer may be dropped without `close()`. It used to segfault.
+
+    `Consumer.__deinit__` calls `rd_kafka_consumer_close`, which fires one
+    last revoke through `_rebalance_trampoline` -- and the trampoline reaches
+    the consumer's rebalance box by the raw address given to
+    `rd_kafka_conf_set_opaque`. Mojo releases each field at its last use
+    *inside the destructor body*, not after it, so a `_rebalance` that the
+    body never mentions was freed **before** `consumer_close` was called and
+    the callback read a dangling box.
+
+    Every other case in this file closes by hand, which is exactly why the
+    suite was green while `close()`-less teardown faulted every time. This
+    one deliberately does not close, so the destructor path is covered.
+
+    Reaching the assertion at all is the assertion: the failure mode is a
+    SIGSEGV, not a wrong value.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("drop-me", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(topic="drop-me", value="only")
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="drop-me-group",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["drop-me"])
+    # Poll to the point of a real assignment: the final revoke only has
+    # something to hand back if the consumer actually owns a partition.
+    var seen = len(_drain(consumer, 1))
+    assert_equal(seen, 1)
+
+    # No `close()`. `^` runs the destructor here rather than at the end of
+    # the function, so the fault -- if it comes back -- lands on this line.
+    _ = consumer^
+
+    assert_equal(seen, 1)
+    print("    a consumer dropped without close() tore down cleanly")
+    _ = cluster^
+
+
+# `on_lost` cannot be observed the way the other handlers are. The rebalance
+# handlers below it commit or assign, and the test then reads that back out
+# of Kafka -- but a *lost* assignment is precisely the case where those side
+# effects fail: another member may already own the partition, and librdkafka
+# logs `COMMITFAIL` for exactly that reason.
+#
+# A handler is also **thin**: it captures nothing, so it cannot tick a
+# counter the test owns. What it can do is name a compile-time constant, so
+# the marker goes in the environment of this process -- no filesystem, and
+# readable straight after the poll that triggered the rebalance.
+comptime LOST_MARKER = "MOJO_KAFKA_TEST_ON_LOST"
+comptime REVOKE_MARKER = "MOJO_KAFKA_TEST_ON_REVOKE"
+
+
+def _record_lost(event: Rebalance) raises:
+    """An `on_lost` that records that it ran, and what it was told."""
+    _ = setenv(
+        LOST_MARKER,
+        String(len(event.partitions)) + ":" + String(event.lost),
+        True,
+    )
+
+
+def _record_revoke(event: Rebalance) raises:
+    """An `on_revoke` that records the same, to prove routing went elsewhere."""
+    _ = setenv(
+        REVOKE_MARKER,
+        String(len(event.partitions)) + ":" + String(event.lost),
+        True,
+    )
+
+
+def test_on_lost_takes_over_from_on_revoke_for_a_lost_assignment() raises:
+    """Partitions lost involuntarily route to `on_lost`, not `on_revoke`.
+
+    The assignment is lost for real rather than simulated: exceeding
+    `max.poll.interval.ms` is librdkafka's own liveness check, and a
+    consumer that trips it is thrown out of the group with its partitions
+    marked lost. That is a client-side timer, so the mock broker serves it
+    like any other -- no Docker, and no coordinator failover to arrange.
+
+    The two timeouts are pinned together because librdkafka refuses a
+    `max.poll.interval.ms` below `session.timeout.ms`, and 3s is the floor
+    at which the mock still completes a JoinGroup: at 1s the request itself
+    times out and the group never forms, so nothing is ever assigned to
+    lose.
+
+    This is the branch of `_rebalance_trampoline` that nothing else runs.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("rb-lost", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="rb-lost", value="l-" + String(i))
+    producer.flush(10000)
+
+    _ = setenv(LOST_MARKER, "", True)
+    _ = setenv(REVOKE_MARKER, "", True)
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id="rb-lost-group",
+        auto_offset_reset="earliest",
+    )
+    cfg.set("max.poll.interval.ms", "3000")
+    cfg.set("session.timeout.ms", "3000")
+    cfg.set("heartbeat.interval.ms", "1000")
+    var consumer = Consumer(cfg)
+    consumer.subscribe(
+        ["rb-lost"], on_revoke=_record_revoke, on_lost=_record_lost
+    )
+
+    var got = _drain(consumer, 3)
+    assert_equal(len(got), 3)
+    assert_equal(getenv(LOST_MARKER), "", "nothing should be lost yet")
+
+    # Stop polling for longer than max.poll.interval.ms. librdkafka checks
+    # twice a second, so this overshoots rather than racing the timer.
+    sleep(4.0)
+
+    # The eviction surfaces on the next poll: it raises
+    # `__MAX_POLL_EXCEEDED` once, and the rebalance runs shortly after.
+    for _ in range(12):
+        try:
+            _ = consumer.poll(timeout_ms=500)
+        except:
+            # The MAXPOLL error itself is expected -- it is the mechanism.
+            pass
+        if getenv(LOST_MARKER) != "":
+            break
+
+    assert_equal(
+        getenv(LOST_MARKER),
+        "1:True",
+        "on_lost did not run with the lost partition",
+    )
+    assert_equal(
+        getenv(REVOKE_MARKER),
+        "",
+        "on_revoke ran; a lost assignment must not fall through to it",
+    )
+
+    consumer.close()
+    print("    a lost assignment routed to on_lost, not on_revoke")
+    _ = cluster^
+
+
+def test_a_lost_assignment_falls_back_to_on_revoke_when_on_lost_is_unset() raises:
+    """With no `on_lost`, a lost assignment goes to `on_revoke` instead.
+
+    The documented fallback, and `confluent-kafka`'s. It is the other half
+    of the routing rule above: without this, an `on_lost` that was never
+    reached and a lost event that was dropped on the floor look the same.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("rb-fallback", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="rb-fallback", value="f-" + String(i))
+    producer.flush(10000)
+
+    _ = setenv(LOST_MARKER, "", True)
+    _ = setenv(REVOKE_MARKER, "", True)
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id="rb-fallback-group",
+        auto_offset_reset="earliest",
+    )
+    cfg.set("max.poll.interval.ms", "3000")
+    cfg.set("session.timeout.ms", "3000")
+    cfg.set("heartbeat.interval.ms", "1000")
+    var consumer = Consumer(cfg)
+    # No `on_lost` this time -- that is the whole point.
+    consumer.subscribe(["rb-fallback"], on_revoke=_record_revoke)
+
+    var got = _drain(consumer, 3)
+    assert_equal(len(got), 3)
+
+    sleep(4.0)
+
+    for _ in range(12):
+        try:
+            _ = consumer.poll(timeout_ms=500)
+        except:
+            pass
+        if getenv(REVOKE_MARKER) != "":
+            break
+
+    # `lost` is still true on the context -- the fallback changes which
+    # handler runs, not what happened.
+    assert_equal(
+        getenv(REVOKE_MARKER),
+        "1:True",
+        "on_revoke did not receive the lost assignment",
+    )
+    assert_equal(getenv(LOST_MARKER), "", "on_lost is unset and must not run")
+
+    consumer.close()
+    print("    with no on_lost, the lost assignment fell back to on_revoke")
+    _ = cluster^
+
+
+# --- transactions -----------------------------------------------------------
+#
+# The mock serves InitProducerId, AddPartitionsToTxn and EndTxn, so the whole
+# producer side of exactly-once is reachable here with no Docker -- including
+# the two error branches, which `MockCluster.push_request_errors` drives by
+# making the coordinator answer with a chosen code. That matters more than it
+# looks: the fatal / abortable / retriable decision is made by the *client*
+# from the broker's code, so injecting at the mock exercises the real
+# classification rather than a stand-in for it.
+
+
+def _txn_producer(bootstrap: String, txn_id: String) raises -> Producer:
+    """A producer configured for transactions. Not a test case -- see `_drain`.
+    """
+    var cfg = ProducerConfig(bootstrap_servers=bootstrap)
+    cfg.set("transactional.id", txn_id)
+    return Producer(cfg)
+
+
+def _committed_reader(bootstrap: String, group: String) raises -> Consumer:
+    """A `read_committed` consumer, which is the only kind that can tell a
+    committed transaction from an aborted one."""
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id=group,
+        auto_offset_reset="earliest",
+    )
+    cfg.set("isolation.level", "read_committed")
+    return Consumer(cfg)
+
+
+def test_a_committed_transaction_is_visible_to_a_read_committed_consumer() raises:
+    """The happy path, end to end and observed through Kafka.
+
+    `read_committed` is the point: a consumer left on the default
+    `read_uncommitted` sees the records either way, so it cannot tell a
+    working commit from a missing one. This one and its aborted twin below
+    are a pair -- neither means much alone.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("txn-commit", partition_count=1)
+
+    var producer = _txn_producer(bootstrap, "txn-commit-id")
+    assert_true(
+        not producer.init_transactions(10000), "init_transactions failed"
+    )
+    assert_true(not producer.begin_transaction(), "begin_transaction failed")
+    for i in range(3):
+        _ = producer.produce(
+            topic="txn-commit", key="k" + String(i), value="v" + String(i)
+        )
+    # No flush() -- commit_transaction() flushes, and a caller who adds one
+    # is guessing at librdkafka's job.
+    assert_true(not producer.commit_transaction(), "commit_transaction failed")
+    assert_equal(
+        len(producer.failures()), 0, "a committed transaction lost a message"
+    )
+
+    var consumer = _committed_reader(bootstrap, "txn-commit-group")
+    consumer.subscribe(["txn-commit"])
+    var seen = _drain(consumer, 3)
+    assert_equal(len(seen), 3, "committed records were not readable")
+    for i in range(3):
+        assert_equal(_text_of(seen[i].value), "v" + String(i))
+    consumer.close()
+
+    print("    committed transaction: 3 records visible as read_committed")
+    _ = cluster^
+
+
+def test_an_aborted_transaction_is_invisible_to_a_read_committed_consumer() raises:
+    """The other half, and the one that proves the transaction is real.
+
+    An abort also **purges** everything still queued, and each purged
+    message surfaces as an ordinary delivery failure. That is documented
+    behaviour rather than a defect, but it is retained like any other
+    failure, so this asserts on it: a caller who does not `take_failures()`
+    after an abort meets them at the next `flush()`.
+
+    **Absence is proved with a barrier, not a timeout.** After the abort the
+    producer commits one marker record and the consumer reads until the
+    marker arrives; anything aborted sits *earlier* in the log, so it would
+    be delivered first. Polling for a fixed period instead proves nothing --
+    it passes whenever the broker was merely slower than the wait, and the
+    first version of this test spent 60 seconds doing that.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("txn-abort", partition_count=1)
+
+    var producer = _txn_producer(bootstrap, "txn-abort-id")
+    assert_true(
+        not producer.init_transactions(10000), "init_transactions failed"
+    )
+    assert_true(not producer.begin_transaction(), "begin_transaction failed")
+    for i in range(3):
+        _ = producer.produce(
+            topic="txn-abort", key="k" + String(i), value="v" + String(i)
+        )
+    assert_true(not producer.abort_transaction(), "abort_transaction failed")
+
+    # The purge is the abort working. Acknowledge it the way the docstring
+    # says to, and check the reports are addressable rather than a tally.
+    var purged = producer.take_failures()
+    assert_equal(len(purged), 3, "an abort must purge every queued message")
+    for report in purged:
+        assert_equal(report.topic, "txn-abort")
+        assert_true(report.error != "", "a purge report with no error text")
+    print("    abort purged 3 messages:", purged[0])
+
+    # The barrier: one committed record, behind the three aborted ones.
+    assert_true(
+        not producer.begin_transaction(), "could not begin after an abort"
+    )
+    _ = producer.produce(topic="txn-abort", key="marker", value="marker")
+    assert_true(not producer.commit_transaction(), "the marker did not commit")
+
+    var consumer = _committed_reader(bootstrap, "txn-abort-group")
+    consumer.subscribe(["txn-abort"])
+    var seen = _drain(consumer, 1)
+    assert_equal(len(seen), 1, "the marker never arrived")
+    assert_equal(
+        _text_of(seen[0].key),
+        "marker",
+        "an aborted record was readable as committed",
+    )
+    # And nothing behind it either.
+    var extra = consumer.poll(timeout_ms=1000)
+    assert_true(
+        not extra, "a second record followed the marker: " + String(len(seen))
+    )
+    consumer.close()
+
+    print("    aborted transaction: only the post-abort marker is readable")
+    _ = cluster^
+
+
+def test_a_fatal_transaction_error_is_flagged_fatal() raises:
+    """`is_fatal` off a real error, not a hand-built `KafkaError`.
+
+    `CLUSTER_AUTHORIZATION_FAILED` from the coordinator on InitProducerId is
+    one librdkafka classifies fatal: the producer can never acquire a
+    producer id, so there is nothing to retry and no transaction to abort.
+    The client is what decides that, from the code the mock returns -- which
+    is why injecting at the broker tests the real thing.
+
+    Guards the `TXN_FATAL` arm of `txn_action()` and, with the abortable
+    case below, the two flags that no other suite can set.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("txn-fatal", partition_count=1)
+    cluster.push_request_errors(
+        API_KEY_INIT_PRODUCER_ID,
+        [RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED],
+    )
+
+    var producer = _txn_producer(bootstrap, "txn-fatal-id")
+    var failure = producer.init_transactions(10000)
+    assert_true(Bool(failure), "init_transactions ignored an injected error")
+    ref err = failure.value()
+    assert_true(err.is_fatal, "the fatal flag was lost: " + String(err))
+    assert_true(not err.is_retriable, "a fatal error must not be retriable")
+    assert_true(
+        err.txn_action() == TXN_FATAL,
+        "expected TXN_FATAL, got " + String(err.txn_action()),
+    )
+    print("    fatal:", err, "->", err.txn_action())
+    _ = cluster^
+
+
+def test_an_abortable_transaction_error_asks_for_an_abort() raises:
+    """`txn_requires_abort` off a real error, and the recovery that follows.
+
+    `TOPIC_AUTHORIZATION_FAILED` on AddPartitionsToTxn puts the transaction
+    into the abortable state: this producer is still usable, but *this*
+    transaction is finished and must be aborted before another can begin.
+    That is the case `txn_action()`'s branch order exists for -- librdkafka
+    can flag an error both fatal and abortable, and answering `TXN_FATAL`
+    there tears down a producer that only needed an abort.
+
+    The test does not stop at the flag. It follows the verdict, because a
+    branch that names the right action and then cannot carry it out is not
+    worth much: it aborts, begins a second transaction and commits it.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("txn-abortable", partition_count=1)
+
+    var producer = _txn_producer(bootstrap, "txn-abortable-id")
+    assert_true(
+        not producer.init_transactions(10000), "init_transactions failed"
+    )
+
+    cluster.push_request_errors(
+        API_KEY_ADD_PARTITIONS_TO_TXN,
+        [RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED],
+    )
+    assert_true(not producer.begin_transaction(), "begin_transaction failed")
+    _ = producer.produce(topic="txn-abortable", key="k", value="v")
+
+    var failure = producer.commit_transaction()
+    assert_true(Bool(failure), "commit ignored an injected error")
+    ref err = failure.value()
+    assert_true(
+        err.txn_requires_abort,
+        "the abortable flag was lost: " + String(err),
+    )
+    assert_true(
+        err.txn_action() == TXN_ABORT,
+        "expected TXN_ABORT, got " + String(err.txn_action()),
+    )
+    print("    abortable:", err, "->", err.txn_action())
+
+    # Follow the verdict. This is what TXN_ABORT instructs, and it must work.
+    assert_true(not producer.abort_transaction(), "the prescribed abort failed")
+    _ = producer.take_failures()
+
+    assert_true(
+        not producer.begin_transaction(),
+        "the producer was unusable after an abortable error",
+    )
+    _ = producer.produce(topic="txn-abortable", key="k2", value="v2")
+    assert_true(
+        not producer.commit_transaction(),
+        "the transaction after the abort did not commit",
+    )
+
+    var consumer = _committed_reader(bootstrap, "txn-abortable-group")
+    consumer.subscribe(["txn-abortable"])
+    var seen = _drain(consumer, 1)
+    assert_equal(len(seen), 1, "the recovered transaction is not readable")
+    assert_equal(_text_of(seen[0].value), "v2")
+    assert_equal(
+        _text_of(seen[0].key), "k2", "the aborted record leaked through"
+    )
+    consumer.close()
+
+    print("    aborted, began again, committed; only the second record is up")
+    _ = cluster^
+
+
+# **A third thing the mock does not implement, and it is silent about it.**
+# It accepts `TxnOffsetCommit` and answers success, but never serves those
+# offsets back through `OffsetFetch`: `committed()` reports `OFFSET_INVALID`
+# afterwards whether the transaction committed or aborted. Confirmed in plain
+# C against librdkafka 2.15, with no Mojo involved, so it is the mock and not
+# this package. The consequence for tests here is sharp -- any assertion
+# about a committed offset passes unconditionally, which is worse than no
+# assertion. Those live in `test_broker.mojo`.
+
+
+def _eos_reader(bootstrap: String, group: String) raises -> Consumer:
+    """The input side of a read-process-write loop.
+
+    `enable.auto.commit=false` is not optional: librdkafka requires it, and
+    with it on the consumer would commit on its own schedule and the
+    transaction would no longer be what decides the input was consumed.
+    """
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id=group,
+        auto_offset_reset="earliest",
+    )
+    cfg.set("enable.auto.commit", "false")
+    cfg.set("isolation.level", "read_committed")
+    return Consumer(cfg)
+
+
+def test_a_read_process_write_loop_completes() raises:
+    """Read-process-write end to end, as far as the mock can witness it.
+
+    **What this cannot check is the committed offset**, and that is a mock
+    limitation rather than a choice -- see the note above `_eos_reader`. It
+    checks the shape of the loop instead: every call succeeds, the offsets
+    handed over are the ones `position()` reports, and the transformed output
+    is readable as `read_committed`. `test_transactional_offsets_are_visible_
+    to_the_group` in `test_broker.mojo` is the other half, and it needs a
+    real broker.
+
+    3 is the expected position, not 2: librdkafka wants the *next* message to
+    consume, which is what `position()` reports and what makes it the natural
+    argument.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("eos-in", partition_count=1)
+    cluster.create_topic("eos-out", partition_count=1)
+
+    var upstream = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = upstream.produce(
+            topic="eos-in", key="k" + String(i), value=String(i)
+        )
+    upstream.flush(10000)
+
+    var consumer = _eos_reader(bootstrap, "eos-group")
+    consumer.subscribe(["eos-in"])
+    var work = _drain(consumer, 3)
+    assert_equal(len(work), 3, "the input was not readable")
+
+    var producer = _txn_producer(bootstrap, "eos-txn-id")
+    assert_true(not producer.init_transactions(10000), "init failed")
+    assert_true(not producer.begin_transaction(), "begin failed")
+    for record in work:
+        _ = producer.produce(
+            topic="eos-out",
+            key=record.key_text(),
+            value=record.value_text() + "-done",
+        )
+
+    var assignment: List[TopicPartition] = [TopicPartition("eos-in", 0)]
+    var positions = consumer.position(assignment)
+    assert_equal(positions[0].offset, 3, "position is not last-consumed + 1")
+    assert_true(
+        not producer.send_offsets_to_transaction(
+            positions, consumer.consumer_group_metadata(), 10000
+        ),
+        "send_offsets_to_transaction failed",
+    )
+    assert_true(not producer.commit_transaction(), "commit failed")
+
+    # The output.
+    var reader = _committed_reader(bootstrap, "eos-out-group")
+    reader.subscribe(["eos-out"])
+    var out = _drain(reader, 3)
+    assert_equal(len(out), 3, "the transformed output is not readable")
+    for i in range(3):
+        assert_equal(_text_of(out[i].value), String(i) + "-done")
+    reader.close()
+
+    consumer.close()
+
+    print("    read-process-write: 3 in, 3 transformed out, offsets sent")
+    _ = cluster^
+
+
+def test_a_failed_offset_commit_asks_for_an_abort() raises:
+    """The failing side of read-process-write.
+
+    `GROUP_AUTHORIZATION_FAILED` on AddOffsetsToTxn is abortable, so the
+    verdict is `TXN_ABORT`, and the producer recovers by taking it.
+
+    An earlier version of this also asserted the group was left at
+    `OFFSET_INVALID` afterwards -- which is the property that actually
+    matters, and which **cannot be tested here**: the mock answers
+    `OFFSET_INVALID` whether or not anything was committed, so the assertion
+    passed unconditionally. It lives in `test_broker.mojo` now. Do not add it
+    back.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("eos-fail-in", partition_count=1)
+    cluster.create_topic("eos-fail-out", partition_count=1)
+
+    var upstream = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = upstream.produce(topic="eos-fail-in", value=String(i))
+    upstream.flush(10000)
+
+    var consumer = _eos_reader(bootstrap, "eos-fail-group")
+    consumer.subscribe(["eos-fail-in"])
+    var work = _drain(consumer, 3)
+    assert_equal(len(work), 3, "the input was not readable")
+
+    var producer = _txn_producer(bootstrap, "eos-fail-txn-id")
+    assert_true(not producer.init_transactions(10000), "init failed")
+    assert_true(not producer.begin_transaction(), "begin failed")
+    _ = producer.produce(topic="eos-fail-out", value="processed")
+
+    cluster.push_request_errors(
+        API_KEY_ADD_OFFSETS_TO_TXN,
+        [RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED],
+    )
+    var assignment: List[TopicPartition] = [TopicPartition("eos-fail-in", 0)]
+    var failure = producer.send_offsets_to_transaction(
+        consumer.position(assignment),
+        consumer.consumer_group_metadata(),
+        10000,
+    )
+    assert_true(Bool(failure), "send_offsets ignored an injected error")
+    ref err = failure.value()
+    assert_true(
+        err.txn_requires_abort, "the abortable flag was lost: " + String(err)
+    )
+    assert_true(
+        err.txn_action() == TXN_ABORT,
+        "expected TXN_ABORT, got " + String(err.txn_action()),
+    )
+    print("    offset-commit failure:", err, "->", err.txn_action())
+
+    assert_true(not producer.abort_transaction(), "the prescribed abort failed")
+    _ = producer.take_failures()
+    consumer.close()
+
+    print("    a failed offset commit asked for an abort, and took it")
     _ = cluster^
 
 

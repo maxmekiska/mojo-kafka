@@ -69,6 +69,12 @@ struct AdminClient:
         try:
             var topics = Array[Int, 1](fill=new_topic)
             queue = self._lib.queue_new(self._rk)
+            # Checked rather than assumed: `rd_kafka_CreateTopics` faults
+            # inside librdkafka when handed a NULL queue, so a failed
+            # allocation here has to become an exception before the call,
+            # not a crash inside it.
+            if queue == 0:
+                raise Error("rd_kafka_queue_new returned NULL")
             self._lib.create_topics(
                 self._rk, Int(topics.unsafe_ptr()), 1, queue
             )
