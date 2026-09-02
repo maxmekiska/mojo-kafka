@@ -47,6 +47,19 @@ pixi run -e interop test-interop
 
 See `integration/README.md` and `integration/interop/README.md`.
 
+The consume benchmark is a fourth local-only thing, in the same environment
+because it uses `confluent-kafka` as one of its peers:
+
+```bash
+pixi run broker-up
+pixi run -e interop bench --pin 5,6,7
+```
+
+It builds a **C** peer (needs `cc` and the conda `librdkafka` headers) and a
+**Rust** peer (needs `cargo`; first build fetches crates) and **skips** either
+if the toolchain is missing, so the table degrades rather than failing. See
+`benchmarks/README.md`.
+
 Override the broker with `MOJO_KAFKA_BOOTSTRAP`, the Kafka image tag with
 `KAFKA_VERSION`, and the library search with `MOJO_KAFKA_LIBRDKAFKA`.
 
@@ -243,6 +256,14 @@ its own fields, and `Lib` keeps its handle in a one-element `List` so the
 address survives a move. The four `rd_kafka_mock_*` symbols stay lazy on
 purpose — they are cold, and binding them eagerly would make *every* client
 fail to construct against a librdkafka built without the mock broker.
+
+Those 45-55 ns are a **warm** figure — one symbol resolved over and over. The
+cold cost of resolving 76 *distinct* symbols, which is what `Lib.__init__`
+actually does, is ~260-400 ns each: a `Lib` costs **~20 µs** to construct,
+against ~850 ns for the `dlopen` alone. Both numbers are real and neither
+supersedes the other. The cold one is why `_Freer` exists — see the
+`MessageBatch` note under "Batch `consume(n)`" — and it is worth checking
+before putting a `Lib()` on any path that runs more than once.
 
 **5. No variadic C calls.** Calling a C variadic through a fixed prototype is
 undefined on SysV and AAPCS (the `%al` vector-register count is never set), so
@@ -470,9 +491,13 @@ both suites above run us against a broker using **only our own code on both
 ends** — so a bug that is symmetric, produce and consume wrong in matching
 ways, round-trips cleanly and reports success. The peer is `confluent-kafka`.
 
-That is worth one paragraph of precision, because `confluent-kafka` wraps the
-same librdkafka `_ffi.mojo` binds. It is **not** an independent protocol
-implementation and cannot catch a bug in librdkafka's encoder. It **is** an
+That is worth one paragraph of precision, because `confluent-kafka` wraps
+librdkafka too. It is **not** an independent protocol implementation and
+cannot catch a bug in librdkafka's encoder. (It does not wrap the *same
+build*: its manylinux wheel bundles `librdkafka-c87086af.so.1` rather than
+loading the conda-forge library `_ffi.mojo` opens -- irrelevant to this
+suite, which tests wire behaviour, but see the benchmark notes, where it
+matters.) It **is** an
 independent binding layer — which is the layer this package actually is, and
 where every bug this suite has caught has lived. The encoder is out of scope by
 design: we reimplement no part of the protocol, so a wire-format bug is
@@ -784,51 +809,133 @@ queue from `rd_kafka_queue_get_consumer` -- the same construction
   is 1 for the whole batch. `_decode` is shared with `poll_event`, which is
   why it takes the topic name instead of reading it.
 
-- **The benchmark lives in `benchmarks/`, is local-only, and its cross-client
-  number is not settled.** `pixi run -e interop bench`, needs a real broker.
-  Two methodology points were learned the hard way and are written up in
-  `benchmarks/README.md`: the timed loop must drain a **warm local queue**
-  (without a prefetch pause every configuration measures fetch latency and
-  lands within 15% of the others, with batching apparently slower), and the
-  **median** must be reported, not the best (the spread is not one-sided, and
-  best-of-N rewards whichever client got luckiest). What reproduces is that
-  batching beats polling in both clients -- 1.44x here for us, 2.08x for
-  `confluent-kafka`.
+- **The benchmark lives in `benchmarks/`, is local-only, and it now has four
+  peers.** `pixi run -e interop bench`, needs a real broker. C, `rust-rdkafka`,
+  this package and `confluent-kafka`, all reading one topic and all asserting
+  on the same payload checksum. `benchmarks/README.md` has the numbers; what
+  belongs here is what is easy to undo.
 
-  **`consume_borrowed()` is where the win is, and it is measured.** All
-  three mojo modes and `confluent-kafka` return the same checksum over the
-  same topic, so the comparison is like for like and the speed is not
-  skipped work. Back to back in one session on one 50k topic: borrowed
-  17.4ms, our own `consume()` 35.7ms, `confluent-kafka`'s `consume()`
-  32.2ms. So **borrowed is ~2x our owned path and ~1.8-3.3x
-  `confluent-kafka`** -- the two runs disagree on magnitude, so quote
-  "roughly 2x". The owned path against `confluent-kafka` is **parity**,
-  which is what the code predicts: both copy every key and value, and only
-  the borrowed path does not.
+  **The harness was rebuilt because the old one could not measure.** Three
+  things are load-bearing and all three replaced a mistake:
 
-  **The owned-path cross-client ratio does not reproduce and must not be
-  quoted.** A
-  decomposition that removed our per-message decode work one piece at a time
-  produced a variant doing strictly less work that measured *slower* than the
-  one above it, and a single variant swinging 2.8x between runs -- so the
-  noise on this hardware exceeds the signal outright. The unmodified decode
-  reached 1,557,155 msg/s in that run, above the `confluent-kafka` median
-  from the published table. **Do not optimise our decode on the strength of
-  the 0.58x figure**; it is an artefact.
+  - **Repeats happen inside one process**, by seeking back to offset 0. One
+    drain per process left a spread that swamped every effect worth
+    measuring -- the 2.8x swing this file used to record as a reason to
+    distrust the owned-path numbers was the harness, not the hardware.
+  - **A stalled repeat is discarded, not averaged.** Every peer drains with
+    a **zero** timeout and counts empty returns; with the topic already in
+    the local queue there cannot be one before EOF, so a non-zero count
+    means that repeat went to the network. That is a detector, and it is
+    what makes the numbers trustworthy rather than the prefetch pause having
+    been guessed correctly.
+  - **The plan is interleaved across rounds**, so drift penalises every
+    configuration equally.
 
-  Parity is what the structure predicts anyway. `confluent-kafka`'s
-  `Message_new0` does, per message: `rd_kafka_topic_name` plus a Python str,
-  `PyBytes` for key and value, and `rd_kafka_message_timestamp`. We do the
-  same four with the topic name cached across the batch, plus **one** extra
-  crossing -- `rd_kafka_message_headers`, which it defers to `msg.headers()`.
-  That one call was measured and rejected as an explanation for any gap.
+  **Cross-binary comparisons are not trustworthy. Interleaved in-binary ones
+  are.** Two builds running the *same* work measured 143 ns/record apart.
+  Every A/B behind the changes below was done with both variants compiled
+  into one binary and run interleaved; a decomposition split across builds
+  produced a variant doing strictly less work that measured slower, which is
+  the artefact this file previously blamed on the hardware. Do not reopen
+  any of these questions with a before-and-after across two builds.
 
-- **`consume()` raises on a hard error and loses the batch with it;
-  `consume_events()` does not.** A Mojo `Error` is text and cannot carry the
-  records that arrived alongside. So the pair exists for the same reason
-  `poll`/`poll_event` does, and `consume_events` follows the control plane's
-  policy -- one bad entry must not hide the good ones beside it, so it raises
-  only when the error is the *only* thing in the batch.
+  What reproduces, over two full runs:
+
+  - **`consume_borrowed()` is 85-87% of C** -- +23.6 ns a record over
+    librdkafka driven directly. The tightest number in the table.
+  - **`consume_borrowed()` is ~2x `rust-rdkafka`'s `BorrowedMessage`** (1.99x,
+    2.07x), **but most of that is the API, not the language**:
+    `rust-rdkafka` exposes no batch consume, so it polls per record, and the
+    C peer prices that at ~111 ns a record (`c batch` 129.2 against `c poll`
+    240.0). Measured against C doing *the same* access pattern the honest
+    figure is +23.6 ns for us against +76.3 ns for Rust. Quote that one.
+  - **`consume()` beats `confluent-kafka`** 1.26x and 1.21x, and
+    `rust-rdkafka`'s `.detach()` 1.07x and 1.15x. Modest, consistent in
+    direction.
+  - **`consume(headers=False)` against `confluent-kafka`** measured 2.06x and
+    1.50x -- direction solid, magnitude not. Say 1.5x.
+
+  **`confluent-kafka` does not load the same librdkafka, and this file used
+  to claim it did.** Its manylinux wheel bundles its own build
+  (`librdkafka-c87086af.so.1` in `confluent_kafka.libs`); the version string
+  matches and the build need not. The Rust peer is pinned to the conda
+  library on purpose so that at least one cross-client row really is
+  binding-against-binding.
+
+  **`confluent-kafka` does *not* defer `rd_kafka_message_headers`, and this
+  file used to claim it did.** Counted with an `LD_PRELOAD` interposer:
+  **200,001 calls for 200,000 records**. It is eager, exactly as we are, so
+  that crossing is not a handicap we carry and it does not explain any gap.
+  What it *is* is expensive -- see the next bullet.
+
+- **The headers crossing costs ~117 ns a record even when the record has
+  none, and that is librdkafka's cost, not ours.** Measured in plain C with
+  no binding in the picture: `c batch` 129.2 ns a record against
+  `c batchhdr` 267.8. Our own wrapper around it adds only ~18 ns. No binding
+  can optimise this away; the only way not to pay it is not to call it,
+  which is what `consume(headers=False)` is for. It is a third of what the
+  owned decode does.
+
+- **`consume()` decodes straight into the `List[Message]` it returns.** It
+  used to call `consume_events()` and deep-copy every `Message` out of the
+  `PollEvent` wrapper, and that was worth **1.7x**. Do not route it back
+  through `consume_events()` for the sake of sharing the loop.
+
+  The cost is specifically **materialising a `PollEvent` into a `List`**, not
+  the `PollEvent` itself. Both variants in one binary: `poll()` decoding
+  straight into its `Optional` measured 733.7 ns against 720.7 through the
+  `PollEvent` -- **no gain**, because one that never reaches a container is
+  elided. So `poll()` is still written on `poll_event()` deliberately, and
+  the comment there says so; the same change that bought `consume()` 1.7x
+  buys `poll()` nothing.
+
+  The consequence is uncomfortable and is written up in
+  `benchmarks/README.md`: `consume_events()` (777.4 ns) is now **slower than
+  `consume()`** (431.6 ns) while doing strictly less, and `poll_event()`
+  (830.9) is the slowest thing here against a C poll of 240.0. Making
+  `PollEvent` cheap to store is the open piece of work.
+
+- **The fetch buffer lives on the `Consumer`, not in each call.**
+  `_fetch_slots` hands out one `List[Int]` that only grows, shared by all
+  three batch entry points -- safe precisely *because* they all hold
+  `_batch` for the whole fetch, so the latch that refuses a concurrent
+  `consume()` is also what makes one buffer enough.
+
+- **`MessageBatch` holds a `_Freer`, not a `Lib`, and the difference is
+  ~19.4 us per `consume_borrowed()` call.** A `Lib` resolves 76 symbols and
+  `dlsym` measures ~350 ns each here, so constructing one costs ~20 us
+  against ~850 ns for the `dlopen` alone -- and it was being built **per
+  fetch**. That is 19 ns a record at a batch of 1000 and 1.9 us a record at
+  a batch of 10, i.e. it punished exactly the small low-latency batches the
+  zero-copy path is best at. Measured after the fix: 194 ns/record at
+  batch=10, against roughly 2.1 us before.
+
+  `_Freer` keeps its own `OwnedDLHandle` and that is the point of it
+  existing rather than a bare function pointer -- a `MessageBatch` may
+  outlive the `Consumer` that made it, and the handle is what keeps
+  librdkafka mapped until the last message is freed. A raw address would be
+  a use-after-unload the compiler cannot see.
+
+- **`Consumer.reached_end()` is how `consume()` reports end-of-partition.**
+  `consume()` drops the EOF mark the way `poll()` does, so without it a
+  bounded drain cannot tell "finished" from "nothing right now" and has to
+  burn a whole `timeout_ms` guessing. It reflects the most recent batch call
+  only. `test_consume_reports_reaching_the_end_of_a_partition` asserts
+  **both** directions, and needs `n=1` to do it: with a batch big enough to
+  hold the topic the records and the EOF mark arrive in the same call, and
+  the "false while records are still coming" half can never fail.
+
+- **`consume()` and `consume_events()` have the *same* error policy, and the
+  note here used to say they did not.** Both raise only when the batch held
+  nothing usable, and both drop a hard error that arrived alongside good
+  records -- the control plane's policy, that one bad entry must not hide the
+  good ones beside it. Neither produces an entry for a hard error, so
+  `consume_events()` gives no per-entry verdict for one either; its own
+  docstring was right about this ("nothing at all where a hard error was
+  decoded") while `consume()`'s was not. What actually separates the two is
+  **end-of-partition marks** -- `consume_events()` returns them as entries,
+  `consume()` drops them and reports them through `reached_end()` -- and
+  cost, which is ~1.7x.
 
 ### Transactions, and exactly-once
 
@@ -1017,30 +1124,118 @@ its surface is administrative work people do from a CLI or Terraform. Build what
 unblocks a workload that is impossible today, and prefer the things that are
 worth more in Mojo than they are in Python.
 
-**Everything previously listed here is built.** Batch `consume(n)`,
-transactions end to end, and the borrowed zero-copy view all landed on
-`feat-mojo-1-0`; see "Already built" for each, and read those notes before
-touching any of it. There is no queued feature work, which means the next
-thing is a judgement call rather than a plan. Three candidates, none started:
+**Everything previously listed here is built**, and the two benchmark items
+that stood here are done: the `rust-rdkafka` peer exists, and the harness was
+rebuilt to the point where the numbers reproduce. See "Already built" and
+`benchmarks/README.md` before touching any of it. What is left is one queued
+item and three candidates.
+
+### TODO (next session): make `PollEvent` cheap to store
+
+**This is queued work, not a candidate.** The intention is to do it; what
+follows is everything needed to start, so the next session does not have to
+re-derive it.
+
+**Scope: this fixes `consume_events()`, not `poll_event()`.** They are two
+different problems that look like one, and conflating them will waste a
+session. `consume_events()` (777.4) against `consume()` (431.6) is **345.8 ns
+of pure container** -- same binary, same fetch mode, same decode, the only
+difference being that one materialises a `PollEvent` into a `List`. That is
+what this TODO removes. `poll_event()` (830.9 against a `c poll` of 240.0)
+does **not** store a `PollEvent` anywhere, and the A/B below shows an
+unstored one is elided outright -- so this change should be expected to buy
+it approximately nothing. See "the other half" at the end.
+
+**The problem**, and `consume_events()` is the row to look at:
+
+| path | ns/record | its C baseline |
+|---|---|---|
+| `poll_event()` | 830.9 | `c poll` 240.0 |
+| `consume_events()` | 777.4 | `c batch` 129.2 |
+| `consume()` | 431.6 | `c batchhdr` 267.8 |
+| `consume_borrowed()` | 152.8 | `c batch` 129.2 |
+
+**The cause is isolated, not suspected.** It is *materialising a `PollEvent`
+into a `List`* -- roughly 350 ns a record. `PollEvent` is an
+`Optional[Message]` beside an `Optional[TopicPartition]`, so it is a large
+struct with two discriminants, and every entry is moved into the list and
+destroyed out of it.
+
+**Two measurements bound it, and both were made with the variants compiled
+into one binary** (cross-binary before/after is worthless here -- see the
+benchmark notes):
+
+- Swapping `List[PollEvent]` for `List[Message]` in the batch loop, decode
+  otherwise identical: **-214.6 ns/record**. That is the change `consume()`
+  already took, and where its 1.7x came from.
+- Giving `poll()` a direct decode that never builds a `PollEvent`: **733.7 ns
+  against 720.7** -- no gain, so it was reverted and `poll()` is still written
+  on `poll_event()`. A `PollEvent` that never reaches a container is elided by
+  the compiler. **This is the load-bearing detail**: the fix has to target the
+  representation, and re-trying the "decode directly" trick anywhere it is not
+  going into a container will measure nothing.
+
+**Why it has not been done.** Both fields are public and read directly
+(`event.message`, `event.eof`) by examples, tests and users, so changing the
+representation is a **breaking change to a public type**. That is a decision
+about the API, not a performance question, which is why it was left rather
+than taken unilaterally.
+
+**Options, none chosen:**
+
+- Keep the two fields but shrink what they hold -- e.g. `eof` carrying the
+  partition without a `String` topic, since a batch is one topic and the
+  caller already knows it. Smaller, still source-compatible for the common
+  `if event.message:` shape, and it does not fix the `Optional[Message]` half.
+- Replace the pair with a tag plus accessor methods (`is_message()`,
+  `message()`, `eof()`). Breaks field access outright; a major-version change.
+- Leave `PollEvent` alone and document `consume()` as the throughput path,
+  which is what is done today. Cheapest, and dishonest only if the docs stop
+  saying so -- they currently do, in `benchmarks/README.md`, the
+  `consume_events()` docstring and the README's Status section.
+
+**The other half: why `poll_event()` is slow, which is a separate item.**
+It carries +590.9 ns over `c poll` while the batch path carries only
++163.8 ns over `c batchhdr` for the *same* owned decode. The difference is
+what the batch path amortises and the single-record path pays per record --
+and the first suspect is **`rd_kafka_topic_name`**, a crossing plus a
+`String` construction that `_consume_locked` caches across a batch
+(`last_rkt` / `last_name`) and `poll_event()` repeats for every record.
+Caching it on the `Consumer` is the obvious experiment and it has **not been
+run**; treat the attribution as a hypothesis, and test it the same way --
+both variants in one binary.
+
+**How to verify a fix.** `pixi run -e interop bench --pin <cpus>` and compare
+the `mojo batch` and `mojo poll` rows against `c batch` / `c poll`. Do the A/B
+with both variants in one binary. The mock suite's
+`test_consume_events_reports_end_of_partition` and
+`test_partition_eof_is_distinguishable_from_a_timeout` are the correctness
+guards, and both read `event.message` / `event.eof` directly -- if they still
+compile unchanged, the change was source-compatible. (`examples/consume.mojo`
+used to be that canary and no longer is: it moved to `consume()` +
+`reached_end()`, which is the path it always claimed to demonstrate.)
+
+### Candidates, none started
 
 - **A borrowed producer path.** `produce()` copies its key and value through
-  `RD_KAFKA_MSG_F_COPY`. The consume side just showed what removing a copy
-  per record is worth (~2x); the produce side has never been measured. Do
-  the measurement before the work -- `F_COPY` exists so the caller's buffer
-  can go out of scope immediately, and taking that away is a real API cost
-  that a number should justify.
+  `RD_KAFKA_MSG_F_COPY`. The consume side is now measured properly and the
+  borrowed view gives up only ~24 ns a record against C, so the produce side
+  is the remaining copy. Do the measurement before the work -- `F_COPY`
+  exists so the caller's buffer can go out of scope immediately, and taking
+  that away is a real API cost that a number should justify.
 
-- **Settle the cross-client benchmark somewhere quiet.** The numbers in
-  `benchmarks/README.md` are from a WSL2 laptop sharing a kernel with the
-  broker, and a single configuration swung 2.8x between runs there. The
-  borrowed result is large enough to survive that; the owned-path parity
-  claim is not. A quiet machine with `--repeat 9` would turn two ranges into
-  two numbers.
+- **Settle the numbers somewhere quiet.** The table is from a WSL2 laptop
+  sharing a kernel with the broker. The harness now detects a contaminated
+  run rather than averaging it, and the tight rows (`c batch`,
+  `mojo borrowed`) reproduce to within a few per cent -- but the
+  `consume(headers=False)` cross-client ratio still swings 1.50-2.06x. A
+  quiet machine with `--rounds 4 --repeat 9` would turn that range into a
+  number.
 
-- **A `rust-rdkafka` peer for the benchmark.** `cargo` is on this machine.
-  It would answer the question the borrowed view was built to answer --
-  whether we are actually level with a zero-copy Rust binding, rather than
-  merely faster than a copying Python one.
+- **A borrowed path for the owned decode's two copies.** `consume()` spends
+  ~146 ns a record on the key and value `malloc`+`memcpy` pair. An arena per
+  batch would cut it, but `Message` owns its `List[UInt8]`s by contract, so
+  this is a type change and not a local one. Measure before designing.
 
 ### Deliberately not chasing
 

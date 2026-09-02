@@ -15,7 +15,9 @@ sound, so a failure in an `X` cell can be attributed to us rather than to the
 scaffolding.
 
 What an `X` cell can and cannot prove is worth stating plainly, because
-`confluent-kafka` wraps the same librdkafka `src/kafka/_ffi.mojo` binds. It is
+`confluent-kafka` wraps librdkafka too (its own bundled build, not the one
+`src/kafka/_ffi.mojo` opens -- irrelevant here, where the subject is wire
+behaviour). It is
 not an independent *protocol* implementation and cannot catch a bug in
 librdkafka's encoder. It is an independent *binding* layer, and that is the
 layer this package actually is -- every bug this suite has caught lived there,

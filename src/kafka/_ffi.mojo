@@ -706,7 +706,14 @@ def _bind[
     against librdkafka 2.15 on this machine: 45-55 ns/call resolving per call
     against 1.2-1.5 ns/call resolving once, and through the wrappers below an
     idle `Producer.poll(0)` -- one crossing and nothing else -- went from
-    97-110 ns to 54-56 ns. `Consumer.poll()` crosses four times per message
+    97-110 ns to 54-56 ns.
+
+    Those 45-55 ns are a **warm** figure: one symbol looked up over and over,
+    with the loader's caches hot. Resolving 76 *distinct* symbols cold, which
+    is what `Lib.__init__` does, measures ~260-400 ns each -- so a `Lib`
+    costs ~20 us to construct against ~850 ns for the `dlopen` alone. Both
+    numbers are real and neither supersedes the other; the cold one is why
+    `_Freer` exists. `Consumer.poll()` crosses four times per message
     (`consumer_poll`, `topic_name`, `message_timestamp`, `message_destroy`),
     so name lookup was most of what this binding charged per message.
 
@@ -735,6 +742,42 @@ def _bind[
             unsafe_from_address=Int(box.unsafe_ptr())
         ),
     )
+
+
+struct _Freer(Movable):
+    """Just enough of `Lib` to free a message: one symbol, one handle.
+
+    `MessageBatch` holds one of these rather than a whole `Lib`, and the
+    difference is not small. `Lib.__init__` resolves 76 symbols, and a
+    a cold `dlsym` here measures ~260-400 ns -- not the 45-55 ns `_bind`
+    records, which is a warm per-call figure for one symbol -- so a `Lib`
+    costs ~20 us to build against ~850 ns for the `dlopen` alone. `consume_borrowed()` built one **per
+    call**: 26 ns a record at a batch of 1000, and 2.6 us a record at a
+    batch of 10, which is a fixed cost that punishes exactly the small
+    low-latency batches the zero-copy path is otherwise best at.
+
+    It keeps its own `OwnedDLHandle` for the same reason `Lib` does, and
+    that is the whole reason this type exists rather than a bare function
+    pointer: a `MessageBatch` may outlive the `Consumer` that produced it,
+    and the handle is what keeps librdkafka mapped until the last message
+    is freed. A raw address would be a use-after-unload the compiler cannot
+    see -- fabricated pointers carry no provenance, as "The origin research"
+    in CLAUDE.md records.
+    """
+
+    var _box: List[OwnedDLHandle]
+    var _message_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
+
+    def __init__(out self) raises:
+        var box = List[OwnedDLHandle](capacity=1)
+        box.append(_open_librdkafka())
+        self._box = box^
+        self._message_destroy = _bind[NoneType](
+            self._box, "rd_kafka_message_destroy"
+        )
+
+    def message_destroy(self, msg: Int) raises:
+        _ = self._message_destroy(msg)
 
 
 struct Lib(Movable):

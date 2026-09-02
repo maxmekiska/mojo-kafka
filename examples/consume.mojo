@@ -5,6 +5,12 @@
 `consume(n)` returns a run of records from one call into librdkafka, and
 hands back owned `Message`s -- safe to keep, unlike the borrowed views in
 `pipeline.mojo`. That is the trade: copy once, keep forever.
+
+It drops end-of-partition marks the way `poll()` does, so `reached_end()` is
+how a bounded drain like this one knows to stop. `consume_events()` is the
+other way -- it returns the mark as an entry -- but it costs about 1.7x for
+the privilege, so reach for it when you need a verdict per record rather
+than by default.
 """
 
 from kafka import Consumer, ConsumerConfig
@@ -26,15 +32,8 @@ def main() raises:
     var seen = 0
     while seen < 20:
         # One crossing into C for the whole batch, not one per record.
-        var events = consumer.consume_events(32, timeout_ms=1000)
-        for ref event in events:
-            if event.eof:
-                print("reached the end of", TOPIC)
-                consumer.close()
-                return
-            if not event.message:
-                continue
-            ref m = event.message.value()
+        var records = consumer.consume(32, timeout_ms=1000)
+        for ref m in records:
             print(
                 m.topic,
                 "[",
@@ -45,6 +44,10 @@ def main() raises:
                 m.value_text(default="<null>"),
             )
             seen += 1
+        if consumer.reached_end():
+            print("reached the end of", TOPIC)
+            consumer.close()
+            return
 
     # Commit where we stopped, so a restart resumes rather than replays.
     consumer.commit()

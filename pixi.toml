@@ -46,7 +46,8 @@ pytest = ">=8,<9"
 
 [feature.interop.tasks]
 test-interop = "pytest integration/interop -q"
-# Local only, like the Docker suites: needs a real broker and both clients.
+# Local only, like the Docker suites: needs a real broker. Builds its C and
+# Rust peers on the fly and skips either if `cc` / `cargo` is missing.
 bench = "python benchmarks/run.py"
 
 [environments]

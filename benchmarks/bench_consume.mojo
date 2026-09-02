@@ -1,43 +1,56 @@
-"""Time this package's two consume paths over one topic.
+"""Time this package's consume paths over one topic.
 
-    mojo run -I src benchmarks/bench_consume.mojo \
-        <bootstrap> <topic> <group> <poll|batch|borrowed> <batch_size> <prefetch_ms>
+    bench_consume <bootstrap> <topic> <group> <mode> <batch> <prefetch_ms>
+                  <repeats>
 
-Prints one machine-readable line:
+Prints one line per repeat, the shape every peer prints:
 
-    RESULT mojo <mode> <messages> <nanoseconds>
+    RESULT mojo <mode> <repeat> <messages> <nanoseconds> <stalls> <checksum>
 
-**The run terminates on end-of-partition, not on a count.** Both this and the
-`confluent-kafka` side set `enable.partition.eof`, so both stop at exactly the
-same place for exactly the same reason -- a benchmark that stopped after *n*
-messages would let a client that returned fewer look faster.
+Five modes, and each one exists to answer a different question:
 
-Only the drain is timed, and **`prefetch_ms` is what makes that meaningful**.
-librdkafka fetches on its own background thread into a local queue, so a pause
-before the clock starts lets the whole topic land in memory; the timed loop
-then dequeues and decodes with no broker in it. Without that pause every
-configuration measures the same fetch latency and comes out identical, which
-is what the first version of this benchmark did -- four numbers within 15% of
-each other and batching apparently *slower* than polling.
+    poll          poll_event(), one record per call
+    batch         consume_events(), the lossless batch API
+    consume       consume(), the batch API most callers use
+    consume-nohdr consume(headers=False), the same without the headers crossing
+    borrowed      consume_borrowed(), zero copy
 
-The queue sizes below are raised to match: they have to hold the whole topic
-or the drain wanders back onto the network partway and the number becomes a
-blend of two things again.
+**Repeats happen inside one process, by seeking back to the start.** Every
+repeat re-reads the same partition, so the JIT, the allocator, the page cache
+and the group membership are all warm and identical across them -- and the
+spread that is left is this machine's, not the harness's. An earlier version
+ran one drain per process and the spread swamped every effect worth
+measuring: a 2.8x swing between runs of one configuration, which is what
+`CLAUDE.md` records as the reason not to trust the owned-path numbers it had.
+
+**The drain polls with a zero timeout and counts the times it comes back
+empty.** With the whole topic already in the local queue a zero-timeout call
+never comes back empty before EOF, so a non-zero `stalls` means that repeat
+went to the network mid-drain and is not measuring the decode path at all.
+That is a *detector*, and it replaces the guesswork the prefetch pause used
+to be: `run.py` discards a repeat that stalled instead of averaging it in.
+Reporting a median over contaminated runs hides exactly the runs that need
+throwing away.
 """
 
 from std.sys import argv
 from std.time import perf_counter_ns, sleep
 
-from kafka import Consumer, ConsumerConfig
+from kafka import (
+    Consumer,
+    ConsumerConfig,
+    OFFSET_BEGINNING,
+    TopicPartition,
+)
 
 
 def _config(bootstrap: String, group: String) raises -> ConsumerConfig:
-    """The same knobs the Python side sets, spelled the same way.
+    """The knobs every peer sets, spelled the same way in all four.
 
-    `enable_partition_eof` is what ends the run. The fetch sizes are raised
-    together on both sides so neither client is measured against a different
-    prefetch policy -- the difference under test is per-message work in the
-    binding layer, not how much librdkafka was allowed to buffer.
+    The fetch sizes are raised together across the peers so none of them is
+    measured against a different prefetch policy -- the difference under
+    test is per-record work in the binding, not how much librdkafka was
+    allowed to buffer.
     """
     var cfg = ConsumerConfig(
         bootstrap_servers=bootstrap,
@@ -54,46 +67,24 @@ def _config(bootstrap: String, group: String) raises -> ConsumerConfig:
     return cfg^
 
 
-def main() raises:
-    var args = argv()
-    if len(args) != 7:
-        raise Error(
-            "usage: bench_consume <bootstrap> <topic> <group> <mode> <batch>"
-            " <prefetch_ms>"
-        )
-    var bootstrap = String(args[1])
-    var topic = String(args[2])
-    var group = String(args[3])
-    var mode = String(args[4])
-    var batch = Int(String(args[5]))
-    var prefetch_ms = Int(String(args[6]))
+def _drain(
+    mut c: Consumer, mode: String, batch: Int
+) raises -> Tuple[Int, Int, Int]:
+    """One full pass over the partition. Returns (seen, checksum, stalls).
 
-    var consumer = Consumer(_config(bootstrap, group))
-    consumer.subscribe([topic])
-
-    # Warm up outside the clock: join the group and land the first fetch, so
-    # the rebalance round trip is not charged to the per-message path.
+    Every mode reads the first payload byte of every record into the
+    checksum, so no mode can look fast by skipping the payload -- and the
+    checksum is printed, so a run that read nothing is visible rather than
+    merely quick.
+    """
     var seen = 0
-    var warm = 0
-    while warm < 200:
-        warm += 1
-        var event = consumer.poll_event(timeout_ms=1000)
-        if event.message:
-            seen += 1
-            break
-        if event.eof:
-            break
-
-    # Let the background fetcher pull the topic into the local queue, so the
-    # timed loop below is dequeue-and-decode and nothing else.
-    sleep(Float64(prefetch_ms) / 1000.0)
-
     var checksum = 0
-    var started = perf_counter_ns()
+    var stalls = 0
     var done = False
-    if mode == "poll":
-        while not done:
-            var event = consumer.poll_event(timeout_ms=10000)
+
+    while not done:
+        if mode == "poll":
+            var event = c.poll_event(timeout_ms=0)
             if event.message:
                 ref payload = event.message.value().value
                 if payload:
@@ -101,29 +92,12 @@ def main() raises:
                 seen += 1
             elif event.eof:
                 done = True
-            elif event.is_timeout():
-                done = True
-    elif mode == "borrowed":
-        # The zero-copy path. Every record is summed *through the span*, in
-        # librdkafka's own buffer -- no owned `Message`, no copy. Touching
-        # the bytes is deliberate: a loop that only counted would let a
-        # decoder that never read the payload look fastest.
-        while not done:
-            var records = consumer.consume_borrowed(batch, timeout_ms=10000)
-            if records.reached_end() or len(records) == 0:
-                done = True
-            for i in range(len(records)):
-                var record = records[i]
-                var payload = record.value()
-                if payload:
-                    checksum += Int(payload.value()[0])
-                seen += 1
-            _ = records^
-    elif mode == "batch":
-        while not done:
-            var events = consumer.consume_events(batch, timeout_ms=10000)
+            else:
+                stalls += 1
+        elif mode == "batch":
+            var events = c.consume_events(batch, timeout_ms=0)
             if len(events) == 0:
-                done = True
+                stalls += 1
             for ref event in events:
                 if event.message:
                     ref payload = event.message.value().value
@@ -132,12 +106,80 @@ def main() raises:
                     seen += 1
                 elif event.eof:
                     done = True
-    else:
-        raise Error("mode must be 'poll', 'batch' or 'borrowed', got " + mode)
-    var elapsed = perf_counter_ns() - started
+        elif mode == "consume" or mode == "consume-nohdr":
+            var msgs = c.consume(
+                batch, timeout_ms=0, headers=(mode == "consume")
+            )
+            if len(msgs) == 0 and not c.reached_end():
+                stalls += 1
+            for ref m in msgs:
+                if m.value:
+                    checksum += Int(m.value.value()[0])
+                seen += 1
+            if c.reached_end():
+                done = True
+        elif mode == "borrowed":
+            # Every record is summed *through the span*, in librdkafka's own
+            # buffer -- no owned `Message`, no copy.
+            var records = c.consume_borrowed(batch, timeout_ms=0)
+            if len(records) == 0 and not records.reached_end():
+                stalls += 1
+            if records.reached_end():
+                done = True
+            for i in range(len(records)):
+                var record = records[i]
+                var payload = record.value()
+                if payload:
+                    checksum += Int(payload.value()[0])
+                seen += 1
+            _ = records^
+        else:
+            raise Error(
+                "mode must be poll, batch, consume, consume-nohdr or"
+                " borrowed, got "
+                + mode
+            )
+        if stalls > 5000000:
+            done = True
+    return (seen, checksum, stalls)
 
+
+def main() raises:
+    var args = argv()
+    if len(args) != 8:
+        raise Error(
+            "usage: bench_consume <bootstrap> <topic> <group> <mode> <batch>"
+            " <prefetch_ms> <repeats>"
+        )
+    var bootstrap = String(args[1])
+    var topic = String(args[2])
+    var group = String(args[3])
+    var mode = String(args[4])
+    var batch = Int(String(args[5]))
+    var prefetch_ms = Int(String(args[6]))
+    var repeats = Int(String(args[7]))
+
+    var consumer = Consumer(_config(bootstrap, group))
+    # `assign`, not `subscribe`: the repeats below seek back to the start,
+    # and an explicit assignment means no rebalance round trip between them.
+    consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING)])
+
+    for r in range(repeats):
+        consumer.seek([TopicPartition(topic, 0, 0)])
+        # Let the background fetcher pull the topic into the local queue, so
+        # the timed loop below is dequeue-and-decode and nothing else.
+        sleep(Float64(prefetch_ms) / 1000.0)
+        var started = perf_counter_ns()
+        var got = _drain(consumer, mode, batch)
+        var elapsed = perf_counter_ns() - started
+        print(
+            "RESULT",
+            "mojo",
+            mode,
+            r,
+            got[0],
+            elapsed,
+            got[2],
+            got[1],
+        )
     consumer.close()
-    # Printed so the checksum cannot be optimised away, and so a run that
-    # read no payloads is visible rather than merely fast.
-    print("CHECKSUM", checksum)
-    print("RESULT", "mojo", mode, seen, elapsed)

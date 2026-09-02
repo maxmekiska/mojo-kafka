@@ -89,7 +89,7 @@ together and `mojo -> mojo` stays green on `null-header-value` while the two
 crossing cells fail.
 
 `confluent-kafka` is the client this package's API is measured against. It
-wraps the same librdkafka we bind, so it cannot catch a bug in librdkafka's
+wraps librdkafka too, so it cannot catch a bug in librdkafka's
 encoder — but it is an independent *binding* layer, which is the layer this
 package is and where every bug this suite has caught has lived. See
 `interop/README.md`.

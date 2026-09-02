@@ -15,7 +15,7 @@ This is the longer write-up on how `mojo-kafka` is layered. Read [`README.md`](.
 │     src/kafka/_sync.mojo   (_Latch — the only lock)    │
 ├────────────────────────────────────────────────────────┤  ← `OwnedDLHandle`
 │  raw FFI surface                                       │
-│     src/kafka/_ffi.mojo                                │
+│     src/kafka/_ffi.mojo   (Lib, _Freer)                │
 ├────────────────────────────────────────────────────────┤  ← C ABI
 │  librdkafka.so / .dylib   (BSD-2-Clause, dynamic)      │
 └────────────────────────────────────────────────────────┘
@@ -225,8 +225,13 @@ that.
   with an independent client on one end, so it is the only one that can catch
   a bug that is symmetric across produce and consume. Local only, same
   reason.
-- **Lint** — `mojo format` over `src/`, `examples/`, `tests/`, with CI failing
-  on drift.
+- **Consume benchmark** (`benchmarks/`) — `pixi run -e interop bench`. Four
+  peers over one topic: C (the ceiling), `rust-rdkafka`, this package and
+  `confluent-kafka`, all asserting on the same payload checksum. Not a test
+  and not a gate; it is how the consume path's cost is known rather than
+  guessed. Local only, same reason.
+- **Lint** — `mojo format` over `src/`, `examples/`, `tests/`,
+  `integration/` and `benchmarks/`, with CI failing on drift.
 
 Three of the mock tests exist specifically as regression guards:
 

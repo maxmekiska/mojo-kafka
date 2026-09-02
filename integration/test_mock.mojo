@@ -2259,6 +2259,153 @@ def _drain(mut consumer: Consumer, want: Int) raises -> List[Message]:
     return got^
 
 
+def test_consume_without_headers_keeps_every_other_field() raises:
+    """`headers=False` must drop the headers and **nothing else**.
+
+    It exists for speed -- `rd_kafka_message_headers` costs ~117ns a record
+    even when the record has none, measured in plain C, and that is a third
+    of what the owned decode does. A flag that quietly cost a key or
+    collapsed a null value onto an empty one would be trading correctness
+    for that, so this asserts the whole record either way and compares the
+    two decodes field by field.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("nohdr", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(
+        topic="nohdr",
+        key="k1",
+        value="v1",
+        headers=[Header("trace", "abc"), Header("null", None)],
+    )
+    _ = producer.produce(topic="nohdr", key=None, value="")
+    producer.flush(10000)
+
+    var with_headers = _drain_consume("nohdr", bootstrap, "nohdr-a", True)
+    var without = _drain_consume("nohdr", bootstrap, "nohdr-b", False)
+
+    assert_equal(len(with_headers), 2, "headers=True lost a record")
+    assert_equal(len(without), 2, "headers=False lost a record")
+
+    assert_equal(
+        len(with_headers[0].headers), 2, "headers=True returned no headers"
+    )
+    assert_equal(
+        len(without[0].headers),
+        0,
+        "headers=False still populated headers",
+    )
+
+    # Everything that is not a header has to survive both ways, including
+    # the null/empty distinction -- asserted on `key` / `value`, never the
+    # text helpers, which collapse null onto their default.
+    for i in range(2):
+        assert_equal(without[i].topic, with_headers[i].topic, "topic differed")
+        assert_equal(
+            without[i].offset, with_headers[i].offset, "offset differed"
+        )
+        assert_equal(
+            Bool(without[i].key), Bool(with_headers[i].key), "key presence"
+        )
+        assert_equal(
+            Bool(without[i].value),
+            Bool(with_headers[i].value),
+            "value presence",
+        )
+    assert_equal(_text_of(without[0].key), "k1")
+    assert_equal(_text_of(without[0].value), "v1")
+    assert_true(not without[1].key, "a null key came back present")
+    assert_true(
+        Bool(without[1].value) and len(without[1].value.value()) == 0,
+        "an empty value came back null",
+    )
+    print("    headers=False dropped only the headers")
+    _ = cluster^
+
+
+def _drain_consume(
+    topic: String, bootstrap: String, group: String, headers: Bool
+) raises -> List[Message]:
+    """Read a small topic to the end with `consume()`. Helper, not a case."""
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id=group,
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe([topic])
+    var got = List[Message]()
+    var attempts = 0
+    while len(got) < 2 and attempts < 30:
+        attempts += 1
+        for ref m in consumer.consume(10, timeout_ms=1000, headers=headers):
+            got.append(m.copy())
+    consumer.close()
+    return got^
+
+
+def test_consume_reports_reaching_the_end_of_a_partition() raises:
+    """`consume()` drops the EOF mark, so `reached_end()` is the only way.
+
+    Without it a bounded drain cannot tell "the topic is finished" from
+    "nothing arrived this time", and has to burn a whole `timeout_ms` on
+    every empty call to guess. This asserts both directions: false while
+    records are still coming, true once the end is reached -- a
+    `reached_end()` stuck at true would pass a test that only checked the
+    end.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("consume-eof", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(3):
+        _ = producer.produce(topic="consume-eof", value="r" + String(i))
+    producer.flush(10000)
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers=bootstrap,
+        group_id="consume-eof-group",
+        auto_offset_reset="earliest",
+        enable_partition_eof=True,
+    )
+    var consumer = Consumer(cfg^)
+    consumer.subscribe(["consume-eof"])
+
+    # `n=1`, deliberately: with a batch big enough to hold the whole topic
+    # the records and the EOF mark arrive in the *same* call, and then
+    # "reached_end() was false while records were still coming" is never
+    # observed and the stuck-at-true half of this test cannot fail. One
+    # record at a time separates them.
+    var seen = 0
+    var hit_end = False
+    var saw_records_without_end = False
+    var attempts = 0
+    while not hit_end and attempts < 40:
+        attempts += 1
+        var batch = consumer.consume(1, timeout_ms=1000)
+        seen += len(batch)
+        if consumer.reached_end():
+            hit_end = True
+        elif len(batch) != 0:
+            # A record arrived and the end was *not* claimed -- the half a
+            # flag stuck at true would fail.
+            saw_records_without_end = True
+
+    assert_equal(seen, 3, "consume() did not return every record")
+    assert_true(hit_end, "reached_end() never reported the end of the log")
+    assert_true(
+        saw_records_without_end,
+        "reached_end() was true on a batch that still had records coming",
+    )
+    consumer.close()
+    print("    consume() reported end-of-partition through reached_end()")
+    _ = cluster^
+
+
 def _text_of(field: Optional[List[UInt8]]) raises -> String:
     """Decode a present field; raises rather than papering over a null one."""
     if not field:

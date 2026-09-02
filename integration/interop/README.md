@@ -24,7 +24,10 @@ is the right peer on grounds of relevance alone: if the two disagree about what
 a message is, the one that is wrong is almost certainly us.
 
 What it can and cannot prove is worth stating plainly, because it wraps the
-same librdkafka `src/kafka/_ffi.mojo` binds.
+librdkafka too. (Not the same *build*: its manylinux wheel bundles
+`librdkafka-c87086af.so.1` rather than loading the conda-forge library
+`_ffi.mojo` opens. That does not matter here, where the subject is wire
+behaviour, but it does in `benchmarks/`.)
 
 - It is **not** an independent protocol implementation, so it cannot catch a
   bug in librdkafka's encoder. Both sides would be wrong in the same way.

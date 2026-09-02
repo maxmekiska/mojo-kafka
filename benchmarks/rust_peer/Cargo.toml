@@ -1,0 +1,21 @@
+[package]
+name = "bench_consume_rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench_consume_rs"
+path = "src/main.rs"
+
+[dependencies]
+# `dynamic-linking` makes this link the *same* librdkafka the Mojo and C
+# peers load, rather than rdkafka-sys's vendored copy. That is the whole
+# point of having a Rust peer: if the library underneath differed, the
+# comparison would be measuring two librdkafkas and not two bindings.
+rdkafka = { version = "0.39", default-features = false, features = ["dynamic-linking"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

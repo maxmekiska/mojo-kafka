@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A four-peer consume benchmark**: C, `rust-rdkafka`, this package and
+  `confluent-kafka`, all reading one topic and all asserting on the same
+  payload checksum. `run.py` builds the C and Rust peers itself and skips
+  either if the toolchain is missing. The C peer is the ceiling — nothing
+  calling librdkafka can beat it — and the Rust peer is what makes the
+  zero-copy claim falsifiable, since beating a copying Python client proves
+  nothing about a span.
+
+- **`Consumer.consume(n, headers=False)`** skips reading record headers.
+  `rd_kafka_message_headers` costs ~117ns per record *even when the record
+  has none* — measured in plain C, so it is librdkafka's cost and no binding
+  can optimise it away. It is roughly a third of the owned decode. Default
+  stays `True`, so nothing changes for a caller who does not ask.
+
+- **`Consumer.reached_end()`** reports whether the last batch call ran off
+  the end of a partition. `consume()` drops the EOF mark the way `poll()`
+  does, so a bounded drain previously could not tell "finished" from
+  "nothing right now" and had to burn a whole `timeout_ms` guessing.
+  `MessageBatch.reached_end()` already answered this for the borrowed path.
+
+### Changed
+- **`consume()` is ~1.7x faster.** It decoded through `consume_events()` and
+  then deep-copied every `Message` out of the `PollEvent` wrapper it did not
+  want; it now decodes straight into the `List[Message]` it returns. The cost
+  was specifically *materialising a `PollEvent` into a `List`* — a
+  `PollEvent` that never reaches a container is elided by the compiler, which
+  is why the same change applied to `poll()` measured 733.7ns against
+  720.7ns and was reverted rather than kept.
+
+- **`consume_borrowed()` no longer costs ~19.4µs per call.** `MessageBatch`
+  held a `Lib`, and constructing one resolves 76 symbols at ~350ns each. It
+  now holds a `_Freer`, which resolves one. That was 19ns a record at a batch
+  of 1000 and ~1.9µs a record at a batch of 10 — it punished exactly the
+  small low-latency batches the zero-copy path is best at. At batch=10 the
+  path went from roughly 2.1µs a record to 194ns.
+
+- **The batch fetch buffer lives on the `Consumer`** rather than being
+  allocated and zero-filled on every call. Safe to share between all three
+  batch entry points because they all hold the `_batch` latch for the whole
+  fetch.
+
+- **The benchmark harness was rebuilt**, because the old one could not
+  measure what it claimed to. Repeats now happen inside one process by
+  seeking back to offset 0; each peer drains with a **zero** timeout and
+  counts empty returns, so a repeat that went to the network mid-drain is
+  *detected and discarded* rather than averaged in; and the plan is
+  interleaved across rounds so machine drift penalises every configuration
+  equally. The 2.8x swing the notes previously blamed on the hardware was the
+  harness.
+
+### Fixed
+- **Two claims in the project notes were wrong, and are corrected.**
+  `confluent-kafka` does **not** defer `rd_kafka_message_headers` to
+  `msg.headers()` — an `LD_PRELOAD` interposer counted 200,001 calls for
+  200,000 records, so it is eager exactly as we are. And it does **not** load
+  the same librdkafka build: its manylinux wheel bundles
+  `librdkafka-c87086af.so.1` rather than the conda-forge library. The version
+  string matches; the build need not. The Rust peer is pinned to the conda
+  library so that at least one cross-client row is genuinely
+  binding-against-binding.
+
+
 ### Fixed
 - **Dropping a `Consumer` without calling `close()` segfaulted.** Every
   consumer, subscribed or not, whether or not it had rebalance handlers.
@@ -159,11 +222,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   freed before the read, which is a use-after-free that looks correct
   because `free()` does not scrub.
 
-  Measured against `confluent-kafka` on the same topic, with every client
-  computing the same checksum: **~2x our own `consume()`** (17.4ms vs 35.7ms
-  for 50k records) and **~2x `confluent-kafka`'s `consume()`**. The owned
-  path remains at parity with `confluent-kafka`, which is what the code
-  predicts — both copy every key and value.
+  Measured against C, `rust-rdkafka` and `confluent-kafka` on one topic with
+  every client computing the same checksum: **85-87% of C driven directly**
+  (152.8ns a record against 129.2ns) and **~2x `rust-rdkafka`'s
+  `BorrowedMessage`**. Most of that 2x is API rather than language —
+  `rust-rdkafka` exposes no batch consume, which the C peer prices at ~111ns a
+  record; measured against C doing the *same* access pattern the honest
+  figure is +23.6ns for us against +76.3ns for Rust. See
+  `benchmarks/README.md`; these numbers supersede an earlier, less careful
+  measurement made before the harness could detect a contaminated run.
 
   No headers on a borrowed view: each is a separate name and value that
   would have to be copied out, which is the cost this avoids.

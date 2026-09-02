@@ -1,112 +1,157 @@
 # Consume benchmark
 
-`consume(n)` against `poll()`, in this package and in `confluent-kafka`.
+Four clients, one librdkafka, one topic: **C**, **Rust** (`rust-rdkafka`),
+**Mojo** (this package) and **Python** (`confluent-kafka`).
 
 ```bash
 pixi run broker-up
-pixi run -e interop bench            # --count, --repeat, --batch, --prefetch-ms
+pixi run -e interop bench          # --count --batch --repeat --rounds --pin
 pixi run broker-down
 ```
 
-Local only, like the Docker suites: it needs a real broker and both clients.
-CI runs none of it.
+Local only, like the Docker suites. CI runs none of it. `run.py` builds the C
+and Rust peers itself and **skips** either one if the toolchain is missing,
+so the table degrades rather than failing.
 
-## What it does and does not measure
+## Why four peers
 
-**Both clients wrap the same librdkafka build** — 2.15.0 here, checked with
-`confluent_kafka.libversion()`. So nothing below is a protocol or a fetch-path
-comparison; the only thing that differs is the binding layer, which is the
-layer this package is.
+Each one bounds a claim the others cannot.
 
-Two methodology choices are load-bearing, and both were arrived at by getting
-them wrong first:
+| peer | what it bounds |
+|---|---|
+| `c` | The ceiling. Nothing that calls librdkafka can beat it, so "close to native" means "close to this". |
+| `rust` | `rust-rdkafka`, a zero-copy binding in a systems language. The peer that makes the borrowed-view claim falsifiable instead of merely flattering — beating a copying Python client proves nothing about a span. |
+| `mojo` | This package. |
+| `confluent` | `confluent-kafka`, the client this package's API shape follows. |
 
-- **The timed loop drains a warm local queue.** librdkafka fetches on a
-  background thread, so each run pauses `--prefetch-ms` after joining the
-  group and before starting the clock, with the queue sizes raised to hold the
-  whole topic. Without that pause the benchmark measures fetch latency and
-  nothing else: the first version reported all four configurations within 15%
-  of each other, at ~37k msg/s, with batching apparently *slower* than
-  polling. With it, every number is 10–50x higher and the batch effect is
-  plainly visible. If you change the config, re-check that the spread column
-  stays tight — a wide spread means the prefetch is not finishing.
+**Three of the four load the same librdkafka. `confluent-kafka` does not** —
+and the previous version of this file claimed otherwise. Its manylinux wheel
+bundles its own build: `ldd` on `cimpl…so` names
+`librdkafka-c87086af.so.1` out of `confluent_kafka.libs`, not the conda-forge
+library. The version string matches (2.15.0); the compiler and flags need
+not. So read `mojo`/`c`/`rust` as binding-against-binding, and the
+`confluent` row as client-against-client. The Rust peer is pinned to the
+conda library on purpose (`features = ["dynamic-linking"]`) so that its row
+*is* binding-against-binding.
 
-- **The median is reported, not the best.** The spread here is not one-sided:
-  a run whose prefetch did not complete drains part of the topic off the
-  network and comes out several times slower. Best-of-N therefore rewards
-  whichever client got luckiest, and an early run of this benchmark had one
-  client vary 3.2x across three attempts with its best reported as its speed.
+## Methodology, in the order the mistakes were made
 
-**Read the within-client column first.** "Batching is Nx polling in the same
-client" is the claim the design actually makes, and it is measured against a
-fixed everything-else. The cross-client number is reported too and is worth
-less: it moves with payload size, with how much work the caller does per
-record — this loop does none, it counts — and with which client happens to
-defer work the other does eagerly.
-
-## Terminating on EOF, not on a count
-
-Both sides set `enable.partition.eof` and stop at the mark. A benchmark that
-stopped after *n* messages would let a client that returned fewer look faster,
-and the runner additionally asserts every run read exactly the seeded count
-before it is allowed into the table.
+- **Repeats happen inside each peer process**, by seeking back to offset 0
+  and re-draining. One drain per process left a spread that swamped every
+  effect worth measuring — `CLAUDE.md` recorded a single configuration
+  swinging 2.8x between runs, and that is why the owned-path numbers here
+  were previously marked untrustworthy.
+- **A stalled repeat is discarded, not averaged.** Every peer drains with a
+  **zero** timeout and counts the calls that come back empty. If the whole
+  topic is already in the local queue, a zero-timeout call cannot come back
+  empty before EOF — so a non-zero count means that repeat went to the
+  network mid-drain and is measuring the broker. That is a *detector*. It
+  replaces the guesswork that `--prefetch-ms` used to be: the pause still
+  primes the queue, but nothing rests on having guessed it right, because a
+  repeat that stalled is thrown away and reported in the `bad` column.
+- **The plan is interleaved across rounds.** A machine that drifts slower
+  over time now penalises every configuration equally instead of whichever
+  ran last.
+- **The median of clean repeats is reported**, with `min/max` beside it.
+  Best-of-N rewards whichever client got luckiest.
+- **Every peer sums the first payload byte of every record** and prints a
+  checksum; `run.py` refuses to print a table unless all four agree. A
+  client cannot look fast by skipping the payload.
+- **Cross-binary comparisons are not trustworthy; interleaved ones are.**
+  Two builds running the *same* work measured 143 ns/record apart here. Every
+  number below comes from one interleaved run, and every A/B in the commit
+  that produced them was done with both variants compiled into one binary.
 
 ## What it measured here
 
 WSL2 laptop, Docker broker on localhost, librdkafka 2.15.0, 200k x 100B,
-`--batch 1000 --repeat 5 --prefetch-ms 15000`, median:
+`--batch 1000 --repeat 5 --rounds 2 --pin 5,6,7`, median of 10 clean runs,
+0 discarded, checksum agreed by all four:
 
-| client / mode | msg/s | vs own poll | min/max |
+| client / mode | msg/s | ns/msg | vs C batch |
 |---|---|---|---|
-| mojo poll | 594,236 | 1.00x | 0.56 |
-| mojo batch | 724,656 | 1.22x | 0.25 |
-| **mojo borrowed** | **4,905,405** | **8.25x** | 0.52 |
-| confluent poll | 623,311 | 1.00x | 0.41 |
-| confluent batch | 1,490,397 | 2.39x | 0.28 |
+| **c batch** | **7,741,906** | **129.2** | **1.00x** |
+| mojo borrowed | 6,542,810 | 152.8 | 0.85x |
+| c poll | 4,167,534 | 240.0 | 0.54x |
+| c batchhdr | 3,733,818 | 267.8 | 0.48x |
+| rust borrowed | 3,162,025 | 316.3 | 0.41x |
+| mojo consume-nohdr | 2,865,349 | 349.0 | 0.37x |
+| mojo consume | 2,316,982 | 431.6 | 0.30x |
+| rust owned | 2,021,552 | 494.7 | 0.26x |
+| confluent batch | 1,907,846 | 524.2 | 0.25x |
+| mojo batch (`consume_events`) | 1,286,333 | 777.4 | 0.17x |
+| mojo poll | 1,203,505 | 830.9 | 0.16x |
+| confluent poll | 806,983 | 1239.2 | 0.10x |
 
-**Every client computes the same checksum**, and that is the first thing to
-check before believing any of it: all three mojo modes and `confluent-kafka`
-returned `CHECKSUM 2399952` over the same 50k topic. The borrowed path is not
-fast because it skips work.
+### What reproduces, and what does not
 
-Because the medians above still carry this machine's noise, the borrowed
-claim was also spot-checked back to back in one session on one topic, which
-is the cleanest comparison available here:
+Run twice, back to back. **Quote the first two; the third is a range.**
 
-| | ns for 50k | msg/s |
+- **`consume_borrowed()` is 85-87% of C.** 0.87x and 0.85x. The tightest
+  number in the table, and the one worth caring about: the zero-copy path
+  gives up ~24 ns a record against librdkafka driven directly.
+- **`consume_borrowed()` is ~2x `rust-rdkafka`'s `BorrowedMessage`.** 1.99x
+  and 2.07x. See the caveat below before quoting it as a language result.
+- **`consume()` beats `confluent-kafka`'s `consume()`** by 1.26x and 1.21x,
+  and **`rust-rdkafka`'s `.detach()`** by 1.07x and 1.15x. Consistent in
+  direction, modest in size.
+- **`consume(headers=False)` against `confluent-kafka`** measured 2.06x and
+  1.50x. The direction is solid, the magnitude is not — **say 1.5x**.
+
+**Quote the default `--count 200000` configuration and nothing smaller.** The
+cross-client ratios inflate badly on short runs: at `--count 50000 --repeat 2`
+the same `mojo consume` vs `confluent batch` pair measured **3.02x** against
+1.21x at 200k, because fixed per-process cost is amortised over a quarter of
+the records and `confluent-kafka` carries the most of it. Short runs are for
+checking that the harness works, not for numbers.
+
+### The caveat on the Rust rows
+
+**`rust-rdkafka` exposes no batch consume**, so `rust borrowed` and
+`rust owned` are one `rd_kafka_consumer_poll` per record while the Mojo rows
+batch. The C peer measures exactly what that is worth: `c batch` 129.2 against
+`c poll` 240.0, so the fetch mode alone is ~111 ns a record. Most of the 2x
+is the API, not the language.
+
+Measured against C doing **the same access pattern**, which is the honest
+binding-to-binding comparison:
+
+| binding | its C baseline | overhead per record |
 |---|---|---|
-| mojo poll | 76,343,844 | 654,935 |
-| mojo batch | 35,666,830 | 1,401,857 |
-| confluent batch | 32,168,661 | 1,554,313 |
-| **mojo borrowed** | **17,448,781** | **2,865,527** |
+| mojo `consume_borrowed()` | c batch, 129.2 | **+23.6 ns** |
+| rust `BorrowedMessage` | c poll, 240.0 | **+76.3 ns** |
 
-Two things reproduce across both:
+That comparison still favours this package, and it is the one to make.
 
-- **`consume_borrowed()` is about 2x our own `consume()`** -- 17.4ms against
-  35.7ms for the same records in the same process. That is the two payload
-  copies and the per-record allocations, and it is the clearest signal in
-  this whole benchmark because nothing else differs between the two runs.
-- **`consume_borrowed()` beats `confluent-kafka`'s `consume()`** by 1.84x in
-  the back-to-back check and 3.29x in the 5-repeat median. Both directions
-  agree; the magnitude does not, so quote "roughly 2x" and not the larger
-  number.
+### The one that does not favour us
 
-`consume()` against `confluent-kafka`'s `consume()` remains **parity** --
-0.90x and 0.49x in two runs of the same configuration, which is a range that
-says "the same, plus noise" rather than a deficit. Both copy every key and
-value; only the borrowed path does not.
+**Our single-record path is the slowest thing we ship.** `mojo poll`
+(`poll_event()`) is 830.9 ns a record against `c poll` at 240.0 — an
+overhead of ~590 ns, far worse than the borrowed path's 24. `consume_events()`
+is nearly as bad at 777.4, and it is *slower than `consume()`* (431.6) doing
+strictly more work per record. Both are the same cause: a `PollEvent` is an
+`Optional[Message]` beside an `Optional[TopicPartition]`, and materialising
+one **into a `List`** costs ~350 ns a record in this Mojo version.
 
-That is the shape you would predict from the code and it is worth stating,
-because it is the reason to trust the result: `confluent-kafka` and our owned
-path do the same per-message work, so they measure the same. `rust-rdkafka`'s
-`BorrowedMessage` does what `consume_borrowed()` does, and that is where the
-2x lives -- not in the language, in the copy.
+It is specifically the container. Measured with both variants in one binary,
+`poll()` decoding straight into its `Optional` came out at 733.7 ns against
+720.7 through the `PollEvent` — no gain, because a `PollEvent` that never
+reaches a container is elided by the compiler. `consume()` got 1.7x from the
+same change precisely because its `PollEvent`s were going into a `List`.
+
+So: **use `consume()` for throughput, and `consume_events()` when you want
+end-of-partition marks as entries** — which is the only thing that actually
+separates them, since their error policy is identical. It costs about 1.7x.
+Making `PollEvent` cheaper to store is the open piece of work here, and is
+written up as a TODO in `CLAUDE.md`.
 
 ## Files
 
 | | |
 |---|---|
 | `seed.mojo` | fills a fresh topic; handles `KIND_QUEUE_FULL` by draining and retrying **the same record**, so the count is exact |
-| `bench_consume.mojo` | this package's `poll_event()` and `consume_events()` |
+| `bench_consume.mojo` | `poll_event`, `consume_events`, `consume`, `consume(headers=False)`, `consume_borrowed` |
+| `bench_consume.c` | the ceiling: `rd_kafka_consumer_poll` and `rd_kafka_consume_batch_queue`, plus a `batchhdr` mode that adds the headers call |
 | `bench_consume.py` | `confluent-kafka`'s `poll()` and `consume()`, mirrored call for call |
-| `run.py` | seeds, runs every combination `--repeat` times, prints the table |
+| `rust_peer/` | `rust-rdkafka`'s `BorrowedMessage` and `.detach()`, linked against the conda librdkafka |
+| `run.py` | builds the peers, seeds, runs the interleaved plan, checks the checksums, prints the table |

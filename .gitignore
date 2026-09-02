@@ -13,3 +13,5 @@ dist/
 __pycache__/
 .vscode/
 .idea/
+benchmarks/.build/
+benchmarks/rust_peer/target/

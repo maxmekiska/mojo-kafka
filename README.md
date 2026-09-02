@@ -260,7 +260,7 @@ there, every record crosses back into the interpreter before you touch it.
 | `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads; `consume_borrowed(n)` for zero-copy reads |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads, `consume(n, headers=False)` to skip the headers crossing, `reached_end()` to detect end-of-partition; `consume_borrowed(n)` for zero-copy reads |
 | `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
 | `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
 | `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
@@ -283,6 +283,46 @@ var cfg = ProducerConfig(bootstrap_servers="localhost:9092")
 cfg.set("message.max.bytes", "1000000")
 cfg.set("log_level", "3")          # librdkafka spells this one with an underscore
 ```
+
+## Performance
+
+Four clients, one topic, one librdkafka where possible. 200k x 100B records,
+batch 1000, median of 10 clean runs, every client asserting the same payload
+checksum. Full method and caveats in [`benchmarks/README.md`](benchmarks/README.md).
+
+| client / mode | msg/s | ns/record | vs C |
+|---|---|---|---|
+| **C** (`rd_kafka_consume_batch_queue`) | 7,741,906 | 129.2 | 1.00x |
+| **mojo `consume_borrowed(n)`** | **6,542,810** | **152.8** | **0.85x** |
+| C (`rd_kafka_consumer_poll`) | 4,167,534 | 240.0 | 0.54x |
+| `rust-rdkafka` `BorrowedMessage` | 3,162,025 | 316.3 | 0.41x |
+| **mojo `consume(n, headers=False)`** | 2,865,349 | 349.0 | 0.37x |
+| **mojo `consume(n)`** | 2,316,982 | 431.6 | 0.30x |
+| `rust-rdkafka` `.detach()` | 2,021,552 | 494.7 | 0.26x |
+| `confluent-kafka` `consume(n)` | 1,907,846 | 524.2 | 0.25x |
+
+Three things worth reading off that table:
+
+- **The zero-copy path gives up ~24ns a record against C.** That is the
+  number the borrowed view was built to earn, and it is the one that
+  reproduces most tightly across runs.
+- **`rust-rdkafka` exposes no batch consume**, so its rows poll per record.
+  The C peer prices that difference at ~111ns, so most of the 2x gap is the
+  API rather than the language. Measured against C doing the *same* access
+  pattern, the honest comparison is +23.6ns for us against +76.3ns for Rust.
+- **`headers=False` is worth ~83ns a record** because
+  `rd_kafka_message_headers` costs ~117ns *even for a record with no
+  headers* — librdkafka's cost, confirmed in plain C, and one that
+  `confluent-kafka` pays too (200,001 calls for 200,000 records, counted with
+  an `LD_PRELOAD` interposer).
+
+The single-record path (`poll_event()`, 831ns) is the slowest thing here and
+is a known weak spot: a `PollEvent` is expensive to materialise into a
+`List`. Use `consume()` for throughput.
+
+Numbers are from a WSL2 laptop sharing a kernel with the broker. Re-run them
+yourself with `pixi run -e interop bench`; the harness discards any run that
+touched the network mid-drain rather than averaging it in.
 
 ## Architecture
 
@@ -320,9 +360,12 @@ Docker.
 
 Two further suites run against a real `apache/kafka:3.7.0` in Docker: one for
 the Topic Admin API, which the mock does not implement, and one that produces
-with this client and consumes with `confluent-kafka` in both directions. Both
-are **local** — Docker is a local tool in this project, not a CI dependency.
-See [`integration/README.md`](integration/README.md).
+with this client and consumes with `confluent-kafka` in both directions. A
+four-peer consume benchmark (C, `rust-rdkafka`, this package,
+`confluent-kafka`) lives beside them. All are **local** — Docker is a local
+tool in this project, not a CI dependency. See
+[`integration/README.md`](integration/README.md) and
+[`benchmarks/README.md`](benchmarks/README.md).
 
 Testing your own Kafka code is a supported use case:
 
@@ -341,8 +384,12 @@ transposed the key and value of every message it produced, and both
 
 Known limitations today:
 
-- No transactional producer, and no batch `consume(n)` — `poll()` is still one
-  message per call.
+- The single-record path is the slowest thing here. `poll_event()` costs
+  ~831ns a record against ~240ns for a C poll, and `consume_events()` (~777ns)
+  is *slower than* `consume()` (~432ns) while doing strictly less. Both are
+  the same cause — materialising a `PollEvent` into a `List` — and fixing it
+  means changing a public type. Use `consume()` for throughput; see
+  [`benchmarks/README.md`](benchmarks/README.md).
 - `AdminClient` does create and list only — no delete, alter, configs,
   partitions, consumer groups or ACLs.
 - `Producer.last_error_kind()` is a single slot on the producer, so with more
@@ -402,16 +449,20 @@ people do from a CLI or Terraform.
   librdkafka's order — abort before fatal. Also: **batch and zero-copy
   consume** — `consume(n)` returns a run of records from one FFI crossing, and
   `consume_borrowed(n)` lends `Span`s straight into librdkafka's buffer with
-  the lifetime compiler-enforced, measuring ~2x `confluent-kafka`'s
-  `consume()` on identical records (see `benchmarks/`). Also:
+  the lifetime compiler-enforced, reaching **85-87% of C driven directly**
+  and ~2x `rust-rdkafka`'s `BorrowedMessage` (see `benchmarks/`). Also:
   `send_offsets_to_transaction()` with `Consumer.consumer_group_metadata()`,
   which completes **read-process-write** exactly-once: the consumer's offsets
   commit inside the producer's transaction, so a failed transaction replays
   the input rather than skipping it.
 - **v0.4** — open. Everything previously planned here has landed: batch
   `consume(n)`, transactions end to end, and a zero-copy `consume_borrowed(n)`
-  that measures ~2x `confluent-kafka`'s `consume()` on the same records.
-  Suggestions welcome in the issue tracker.
+  that reaches 85-87% of C driven directly. The consume path was then
+  measured against four peers — C, `rust-rdkafka`, `confluent-kafka` and
+  itself — and rebuilt where the numbers said to: `consume()` is 1.7x faster,
+  `consume(headers=False)` skips a librdkafka call that costs ~117ns a record,
+  and `consume_borrowed()` no longer pays ~19µs of symbol resolution per
+  call. Suggestions welcome in the issue tracker.
 - **v1.0** — API stable and production-ready. Not feature parity with
   `confluent-kafka-python`: deliberately no ACL / consumer-group / alter-config
   admin surface, and Schema Registry belongs in a second package.
