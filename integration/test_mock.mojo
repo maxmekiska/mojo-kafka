@@ -2347,6 +2347,96 @@ def _drain_consume(
     return got^
 
 
+def _drain_poll(
+    topic: String, bootstrap: String, group: String, headers: Bool
+) raises -> List[Message]:
+    """Read a small topic to the end with `poll()`. Helper, not a case."""
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id=group,
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe([topic])
+    var got = List[Message]()
+    var attempts = 0
+    while len(got) < 2 and attempts < 40:
+        attempts += 1
+        var maybe = consumer.poll(timeout_ms=1000, headers=headers)
+        if maybe:
+            got.append(maybe.value().copy())
+    consumer.close()
+    return got^
+
+
+def test_poll_without_headers_keeps_every_other_field() raises:
+    """`poll(headers=False)` must drop the headers and **nothing else**.
+
+    The single-record counterpart of
+    `test_consume_without_headers_keeps_every_other_field`, and it exists
+    for the same reason: the flag is there for speed -- measured at 75-157
+    ns a record, because `rd_kafka_message_headers` costs that even for a
+    record with none -- and a flag that quietly cost a key, or collapsed a
+    null value onto an empty one, would be trading correctness for it.
+
+    So both decodes are compared field by field, and the null/empty
+    assertions read `key` / `value` rather than the text helpers, which
+    collapse null onto their default and would pass under exactly the
+    conflation being guarded.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("poll-nohdr", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    _ = producer.produce(
+        topic="poll-nohdr",
+        key="pk",
+        value="pv",
+        headers=[Header("trace", "xyz"), Header("null", None)],
+    )
+    _ = producer.produce(topic="poll-nohdr", key=None, value="")
+    producer.flush(10000)
+
+    var with_headers = _drain_poll(
+        "poll-nohdr", bootstrap, "poll-nohdr-a", True
+    )
+    var without = _drain_poll("poll-nohdr", bootstrap, "poll-nohdr-b", False)
+
+    assert_equal(len(with_headers), 2, "headers=True lost a record")
+    assert_equal(len(without), 2, "headers=False lost a record")
+    assert_equal(
+        len(with_headers[0].headers), 2, "headers=True returned no headers"
+    )
+    assert_equal(
+        len(without[0].headers), 0, "headers=False still populated headers"
+    )
+
+    for i in range(2):
+        assert_equal(without[i].topic, with_headers[i].topic, "topic differed")
+        assert_equal(
+            without[i].offset, with_headers[i].offset, "offset differed"
+        )
+        assert_equal(
+            Bool(without[i].key), Bool(with_headers[i].key), "key presence"
+        )
+        assert_equal(
+            Bool(without[i].value),
+            Bool(with_headers[i].value),
+            "value presence",
+        )
+    assert_equal(_text_of(without[0].key), "pk")
+    assert_equal(_text_of(without[0].value), "pv")
+    assert_true(not without[1].key, "a null key came back present")
+    assert_true(
+        Bool(without[1].value) and len(without[1].value.value()) == 0,
+        "an empty value came back null",
+    )
+    print("    poll(headers=False) dropped only the headers")
+    _ = cluster^
+
+
 def test_consume_reports_reaching_the_end_of_a_partition() raises:
     """`consume()` drops the EOF mark, so `reached_end()` is the only way.
 

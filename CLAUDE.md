@@ -1127,93 +1127,82 @@ worth more in Mojo than they are in Python.
 **Everything previously listed here is built**, and the two benchmark items
 that stood here are done: the `rust-rdkafka` peer exists, and the harness was
 rebuilt to the point where the numbers reproduce. See "Already built" and
-`benchmarks/README.md` before touching any of it. What is left is one queued
-item and three candidates.
+`benchmarks/README.md` before touching any of it. The queued `PollEvent`
+item is now done too -- see the section below for what worked and, more
+usefully, for the four things that were measured and rejected. What is left
+is three candidates.
 
-### TODO (next session): make `PollEvent` cheap to store
+### `PollEvent` was made cheaper to store -- and most of the plan was wrong
 
-**This is queued work, not a candidate.** The intention is to do it; what
-follows is everything needed to start, so the next session does not have to
-re-derive it.
+**Done.** The queued item is closed, but almost none of it closed the way
+the write-up here predicted, so what follows is the measurements rather than
+the plan they replaced. Every number is from variants compiled into **one
+binary** and interleaved, which is the only comparison this project trusts.
 
-**Scope: this fixes `consume_events()`, not `poll_event()`.** They are two
-different problems that look like one, and conflating them will waste a
-session. `consume_events()` (777.4) against `consume()` (431.6) is **345.8 ns
-of pure container** -- same binary, same fetch mode, same decode, the only
-difference being that one materialises a `PollEvent` into a `List`. That is
-what this TODO removes. `poll_event()` (830.9 against a `c poll` of 240.0)
-does **not** store a `PollEvent` anywhere, and the A/B below shows an
-unstored one is elided outright -- so this change should be expected to buy
-it approximately nothing. See "the other half" at the end.
+**What shipped, and it is three lines.** `_consume_locked` appends an empty
+`PollEvent` and then *constructs the real one into that slot* through
+`unsafe_write`, instead of building a 208-byte `PollEvent` on the stack and
+moving it in:
 
-**The problem**, and `consume_events()` is the row to look at:
+    out.append(PollEvent())
+    out.unsafe_ptr().unsafe_offset(len(out) - 1).unsafe_write(
+        PollEvent(self._decode(raw, last_name))
+    )
 
-| path | ns/record | its C baseline |
-|---|---|---|
-| `poll_event()` | 830.9 | `c poll` 240.0 |
-| `consume_events()` | 777.4 | `c batch` 129.2 |
-| `consume()` | 431.6 | `c batchhdr` 267.8 |
-| `consume_borrowed()` | 152.8 | `c batch` 129.2 |
+Measured three times: **-66, -112 and -74 ns a record**. Direction solid,
+magnitude 66-112 -- so `consume_events()` is now ~1.6x `consume()` where it
+was ~1.8x. Three things make it sound and all three are in the comment at
+the site: the list cannot reallocate (`capacity=count`, at most `count`
+appends), the overwritten placeholder owns nothing so skipping its
+destructor leaks nothing, and a decode that raises **pops the placeholder**
+-- without that it survives as a phantom timeout entry, which is a
+correctness bug the first draft had.
 
-**The cause is isolated, not suspected.** It is *materialising a `PollEvent`
-into a `List`* -- roughly 350 ns a record. `PollEvent` is an
-`Optional[Message]` beside an `Optional[TopicPartition]`, so it is a large
-struct with two discriminants, and every entry is moved into the list and
-destroyed out of it.
+**Four things were measured and rejected. Do not retry them without reading
+this.**
 
-**Two measurements bound it, and both were made with the variants compiled
-into one binary** (cross-binary before/after is worthless here -- see the
-benchmark notes):
+- **Assigning into the slot through a `ref`** (`slot.message = ...`) is
+  worth **nothing** -- 786.9 against 781.0, i.e. noise. A move-assign has to
+  destroy the old value first, so the win is specifically
+  *construction-in-place*, not avoiding the `append`.
+- **A lazy container was *worse* than the fix that shipped**: 713.1 against
+  673.3 in the same run. Storing `List[Message]` (144 bytes) plus a one-byte
+  tag per entry and building the `PollEvent` on demand -- reverse-stored so
+  `pop()` yields forward order, which is safe and needs no unsafe code -- is
+  a real 64-bytes-an-entry saving that the move-out at access time more than
+  gives back. **So the footprint was never the problem**, which is what the
+  earlier note here assumed. It also means no API change is needed: the fix
+  that won is source-compatible and keeps `List[PollEvent]`.
+- **The same trick applied to `consume()` makes it slower** -- 467.9 against
+  426.9. `Message` has no cheap default, so the placeholder costs an empty
+  `String` and an empty `List`, and `append(self._decode(...))` was already
+  being built in place. The trick is worth something only where the element
+  is big *and* has a free default.
+- **`poll_event()`'s slowness is not `rd_kafka_topic_name`.** That was the
+  recorded first suspect and it is **false**: caching the name and its
+  `String` across calls on the consumer measured **1119.3 against 904.3 --
+  a 215 ns regression**. The hypothesis is now tested; do not re-run it.
 
-- Swapping `List[PollEvent]` for `List[Message]` in the batch loop, decode
-  otherwise identical: **-214.6 ns/record**. That is the change `consume()`
-  already took, and where its 1.7x came from.
-- Giving `poll()` a direct decode that never builds a `PollEvent`: **733.7 ns
-  against 720.7** -- no gain, so it was reverted and `poll()` is still written
-  on `poll_event()`. A `PollEvent` that never reaches a container is elided by
-  the compiler. **This is the load-bearing detail**: the fix has to target the
-  representation, and re-trying the "decode directly" trick anywhere it is not
-  going into a container will measure nothing.
+**What did help `poll_event()` was giving it the escape hatch `consume()`
+already had.** `poll(headers=False)` / `poll_event(headers=False)` skip the
+`rd_kafka_message_headers` crossing, measured at **-75, -157 and -212 ns a
+record** across three runs -- direction solid, magnitude not. That crossing costs ~117 ns even for a record with
+no headers and the cost is librdkafka's, not ours, so not calling it is the
+only way not to pay it. `test_poll_without_headers_keeps_every_other_field`
+in the mock suite is the guard, and it compares both decodes field by field
+because a flag that quietly dropped a key would be trading correctness for
+the time.
 
-**Why it has not been done.** Both fields are public and read directly
-(`event.message`, `event.eof`) by examples, tests and users, so changing the
-representation is a **breaking change to a public type**. That is a decision
-about the API, not a performance question, which is why it was left rather
-than taken unilaterally.
+**What is left, and why it was not taken.** `consume_events()` still costs
+~1.6x `consume()`, and the remainder really is the 208-byte
+`Optional[Message]` + `Optional[TopicPartition]` pair -- that is the floor
+for a *stored* `PollEvent`, measured: `Message` is 144, `Optional[Message]`
+152, `TopicPartition` 48, `Optional[TopicPartition]` 56, `PollEvent` 208.
+Going below it means changing what the two public fields hold, which is a
+breaking change to a public type and a decision about the API rather than a
+performance question. The lazy-container result above says it would buy less
+than it looks like anyway.
 
-**Options, none chosen:**
-
-- Keep the two fields but shrink what they hold -- e.g. `eof` carrying the
-  partition without a `String` topic, since a batch is one topic and the
-  caller already knows it. Smaller, still source-compatible for the common
-  `if event.message:` shape, and it does not fix the `Optional[Message]` half.
-- Replace the pair with a tag plus accessor methods (`is_message()`,
-  `message()`, `eof()`). Breaks field access outright; a major-version change.
-- Leave `PollEvent` alone and document `consume()` as the throughput path,
-  which is what is done today. Cheapest, and dishonest only if the docs stop
-  saying so -- they currently do, in `benchmarks/README.md`, the
-  `consume_events()` docstring and the README's Status section.
-
-**The other half: why `poll_event()` is slow, which is a separate item.**
-It carries +590.9 ns over `c poll` while the batch path carries only
-+163.8 ns over `c batchhdr` for the *same* owned decode. The difference is
-what the batch path amortises and the single-record path pays per record --
-and the first suspect is **`rd_kafka_topic_name`**, a crossing plus a
-`String` construction that `_consume_locked` caches across a batch
-(`last_rkt` / `last_name`) and `poll_event()` repeats for every record.
-Caching it on the `Consumer` is the obvious experiment and it has **not been
-run**; treat the attribution as a hypothesis, and test it the same way --
-both variants in one binary.
-
-**How to verify a fix.** `pixi run -e interop bench --pin <cpus>` and compare
-the `mojo batch` and `mojo poll` rows against `c batch` / `c poll`. Do the A/B
-with both variants in one binary. The mock suite's
-`test_consume_events_reports_end_of_partition` and
-`test_partition_eof_is_distinguishable_from_a_timeout` are the correctness
-guards, and both read `event.message` / `event.eof` directly -- if they still
-compile unchanged, the change was source-compatible. (`examples/consume.mojo`
-used to be that canary and no longer is: it moved to `consume()` +
-`reached_end()`, which is the path it always claimed to demonstrate.)
 
 ### Candidates, none started
 

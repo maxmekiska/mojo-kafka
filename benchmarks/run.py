@@ -175,7 +175,7 @@ def main() -> None:
     plan = [
         ("c", "batch"), ("c", "batchhdr"), ("c", "poll"),
         ("mojo", "borrowed"), ("mojo", "consume-nohdr"), ("mojo", "consume"),
-        ("mojo", "batch"), ("mojo", "poll"),
+        ("mojo", "batch"), ("mojo", "poll"), ("mojo", "poll-nohdr"),
         ("rust", "borrowed"), ("rust", "owned"),
         ("confluent", "batch"), ("confluent", "poll"),
     ]

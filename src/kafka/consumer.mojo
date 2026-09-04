@@ -942,12 +942,17 @@ struct Consumer:
         self._lib.topic_partition_list_destroy(list)
         self._lib.raise_if(rc, "subscribe")
 
-    def poll(self, timeout_ms: Int32 = 1000) raises -> Optional[Message]:
+    def poll(
+        self, timeout_ms: Int32 = 1000, headers: Bool = True
+    ) raises -> Optional[Message]:
         """Fetch the next message.
 
         Returns `None` on timeout and at end-of-partition -- neither is a
         message. Any other broker error is raised. Use `poll_event` where
         the difference between the two matters.
+
+        `headers=False` skips reading them, worth 75-157 ns a record; see
+        `poll_event`.
         """
         # `take()` rather than a copy: `poll` is the hot path, and the
         # message owns its key, value and headers.
@@ -961,17 +966,28 @@ struct Consumer:
         # elides it. The batch path is different because the `PollEvent`
         # goes into a `List` and has to be materialised. Do not "fix" this
         # one to match; it is the same change, and here it buys nothing.
-        var event = self.poll_event(timeout_ms)
+        var event = self.poll_event(timeout_ms, headers)
         if not event.message:
             return None
         return Optional[Message](event.message.take())
 
-    def poll_event(self, timeout_ms: Int32 = 1000) raises -> PollEvent:
+    def poll_event(
+        self, timeout_ms: Int32 = 1000, headers: Bool = True
+    ) raises -> PollEvent:
         """Fetch the next message, saying which of the three things happened.
 
         The decode both this and `poll` run; `poll` just drops the EOF half.
         See `PollEvent` for why the distinction exists and what it costs to
         get at (an `enable_partition_eof=True` consumer).
+
+        `headers=False` skips the `rd_kafka_message_headers` crossing, the
+        same escape hatch `consume()` has and for the same reason: it costs
+        real time even for a record that has none, because the cost is
+        librdkafka's rather than this binding's. Measured interleaved in one
+        binary twice, **-75 and -157 ns a record** (904.3 -> 829.7 and
+        1070.3 -> 913.5): direction solid, magnitude not. `Message.headers`
+        comes back empty for every record, exactly as
+        `consume(headers=False)` leaves it.
         """
         var raw = self._lib.consumer_poll(self._rk, timeout_ms)
         if raw == 0:
@@ -1007,7 +1023,7 @@ struct Consumer:
         var msg: Message
         try:
             msg = self._decode(
-                raw, self._lib.topic_name(_load_word(raw + MSG_RKT))
+                raw, self._lib.topic_name(_load_word(raw + MSG_RKT)), headers
             )
         except e:
             self._lib.message_destroy(raw)
@@ -1288,13 +1304,19 @@ struct Consumer:
         `position` / `committed` / `offsets_for_times`: one bad partition
         must not hide the good answers beside it.
 
-        **It costs about 1.7x `consume()`, and that is not the extra
-        information -- it is the container.** 777 ns a record against 432,
+        **It costs about 1.6x `consume()`, and that is not the extra
+        information -- it is the container.** 817 ns a record against 507,
         while doing strictly less work per record, because a `PollEvent` is
-        an `Optional[Message]` beside an `Optional[TopicPartition]` and
-        materialising one into a `List` is expensive in this Mojo version.
-        `consume()` got its 1.7x by not doing that. Reach for this when you
-        need the per-entry verdict; reach for `consume()` when you need
+        an `Optional[Message]` beside an `Optional[TopicPartition]` --
+        measured at 208 bytes against a `Message`'s 144 -- and storing one
+        in a `List` costs what that size implies.
+
+        It was ~1.8x until the entries started being **constructed into the
+        list's slot** rather than built on the stack and moved in; see the
+        comment in `_consume_locked`. Storing something smaller was tried
+        and is *worse*, so the remaining gap is not worth another attempt
+        without reading `benchmarks/README.md` first. Reach for this when
+        you need the per-entry verdict; reach for `consume()` when you need
         throughput.
 
         Same one-at-a-time rule as `consume()`; see there.
@@ -1390,7 +1412,34 @@ struct Consumer:
                     if not failure:
                         failure = self._lib.error(err_code)
                 else:
-                    out.append(PollEvent(self._decode(raw, last_name)))
+                    # **Built into the list's slot, not moved into it.**
+                    # `out.append(PollEvent(...))` materialises a 208-byte
+                    # `PollEvent` on the stack and then moves it in; writing
+                    # it through a pointer to the slot lets the compiler
+                    # construct it at its final address instead. Measured
+                    # interleaved in one binary three times: -66, -112 and
+                    # -74 ns a record. Direction solid, magnitude 66-112.
+                    # Assigning into the slot through a `ref` instead
+                    # measured **nothing** -- a move-assign has to destroy
+                    # the old value first, so the win is specifically
+                    # construction-in-place, not avoiding the append.
+                    #
+                    # Three things make it sound. The list was created with
+                    # `capacity=count` and is appended to at most `count`
+                    # times, so it never reallocates; the pointer is taken
+                    # *after* the append regardless. The placeholder being
+                    # overwritten owns nothing, so skipping its destructor
+                    # leaks nothing. And a decode that raises must not leave
+                    # that placeholder behind as a phantom timeout entry,
+                    # which is what the `pop()` is for.
+                    out.append(PollEvent())
+                    try:
+                        out.unsafe_ptr().unsafe_offset(
+                            len(out) - 1
+                        ).unsafe_write(PollEvent(self._decode(raw, last_name)))
+                    except e:
+                        _ = out.pop()
+                        raise e
             except e:
                 if not failure:
                     failure = KafkaError(-1, String(e))

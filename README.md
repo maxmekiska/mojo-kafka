@@ -287,25 +287,25 @@ cfg.set("log_level", "3")          # librdkafka spells this one with an undersco
 ## Performance
 
 Four clients, one topic, one librdkafka where possible. 200k x 100B records,
-batch 1000, median of 10 clean runs, every client asserting the same payload
+batch 1000, median of 21 clean runs, every client asserting the same payload
 checksum. Full method and caveats in [`benchmarks/README.md`](benchmarks/README.md).
 
 | client / mode | msg/s | ns/record | vs C |
 |---|---|---|---|
-| **C** (`rd_kafka_consume_batch_queue`) | 7,741,906 | 129.2 | 1.00x |
-| **mojo `consume_borrowed(n)`** | **6,542,810** | **152.8** | **0.85x** |
-| C (`rd_kafka_consumer_poll`) | 4,167,534 | 240.0 | 0.54x |
-| `rust-rdkafka` `BorrowedMessage` | 3,162,025 | 316.3 | 0.41x |
-| **mojo `consume(n, headers=False)`** | 2,865,349 | 349.0 | 0.37x |
-| **mojo `consume(n)`** | 2,316,982 | 431.6 | 0.30x |
-| `rust-rdkafka` `.detach()` | 2,021,552 | 494.7 | 0.26x |
-| `confluent-kafka` `consume(n)` | 1,907,846 | 524.2 | 0.25x |
+| **C** (`rd_kafka_consume_batch_queue`) | 6,984,942 | 143.2 | 1.00x |
+| **mojo `consume_borrowed(n)`** | **6,201,492** | **161.3** | **0.89x** |
+| C (`rd_kafka_consumer_poll`) | 3,240,118 | 308.6 | 0.46x |
+| `rust-rdkafka` `BorrowedMessage` | 2,870,823 | 348.3 | 0.41x |
+| **mojo `consume(n, headers=False)`** | 2,717,384 | 368.0 | 0.39x |
+| **mojo `consume(n)`** | 1,971,575 | 507.2 | 0.28x |
+| `rust-rdkafka` `.detach()` | 1,687,215 | 592.7 | 0.24x |
+| `confluent-kafka` `consume(n)` | 1,613,296 | 619.8 | 0.23x |
 
 Three things worth reading off that table:
 
-- **The zero-copy path gives up ~24ns a record against C.** That is the
+- **The zero-copy path gives up ~18ns a record against C.** That is the
   number the borrowed view was built to earn, and it is the one that
-  reproduces most tightly across runs.
+  reproduces most tightly across runs (18-24ns over three).
 - **`rust-rdkafka` exposes no batch consume**, so its rows poll per record.
   The C peer prices that difference at ~111ns, so most of the 2x gap is the
   API rather than the language. Measured against C doing the *same* access
@@ -384,11 +384,12 @@ transposed the key and value of every message it produced, and both
 
 Known limitations today:
 
-- The single-record path is the slowest thing here. `poll_event()` costs
-  ~831ns a record against ~240ns for a C poll, and `consume_events()` (~777ns)
-  is *slower than* `consume()` (~432ns) while doing strictly less. Both are
-  the same cause — materialising a `PollEvent` into a `List` — and fixing it
-  means changing a public type. Use `consume()` for throughput; see
+- The single-record path is the slowest thing here, and it is the one place
+  `rust-rdkafka` beats us: an owned record per call costs ~969ns with
+  `poll_event(headers=False)` against ~593ns for its `.detach()`. The batch
+  and borrowed paths both win — `rust-rdkafka` has no batch consume, and we
+  are 2.16x its `BorrowedMessage` — so reach for `consume()` or
+  `consume_borrowed()` where throughput matters. See
   [`benchmarks/README.md`](benchmarks/README.md).
 - `AdminClient` does create and list only — no delete, alter, configs,
   partitions, consumer groups or ACLs.
@@ -462,7 +463,10 @@ people do from a CLI or Terraform.
   itself — and rebuilt where the numbers said to: `consume()` is 1.7x faster,
   `consume(headers=False)` skips a librdkafka call that costs ~117ns a record,
   and `consume_borrowed()` no longer pays ~19µs of symbol resolution per
-  call. Suggestions welcome in the issue tracker.
+  call. Since then `consume_events()` has taken another ~66-112ns a record
+  by constructing its entries in place, and `poll()` / `poll_event()` have
+  gained the same `headers=False` escape hatch, worth ~75-212ns.
+  Suggestions welcome in the issue tracker.
 - **v1.0** — API stable and production-ready. Not feature parity with
   `confluent-kafka-python`: deliberately no ACL / consumer-group / alter-config
   admin surface, and Schema Registry belongs in a second package.

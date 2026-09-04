@@ -7,9 +7,10 @@ Prints one line per repeat, the shape every peer prints:
 
     RESULT mojo <mode> <repeat> <messages> <nanoseconds> <stalls> <checksum>
 
-Five modes, and each one exists to answer a different question:
+Six modes, and each one exists to answer a different question:
 
     poll          poll_event(), one record per call
+    poll-nohdr    poll_event(headers=False), the same without the crossing
     batch         consume_events(), the lossless batch API
     consume       consume(), the batch API most callers use
     consume-nohdr consume(headers=False), the same without the headers crossing
@@ -83,8 +84,8 @@ def _drain(
     var done = False
 
     while not done:
-        if mode == "poll":
-            var event = c.poll_event(timeout_ms=0)
+        if mode == "poll" or mode == "poll-nohdr":
+            var event = c.poll_event(timeout_ms=0, headers=(mode == "poll"))
             if event.message:
                 ref payload = event.message.value().value
                 if payload:
@@ -135,8 +136,8 @@ def _drain(
             _ = records^
         else:
             raise Error(
-                "mode must be poll, batch, consume, consume-nohdr or"
-                " borrowed, got "
+                "mode must be poll, poll-nohdr, batch, consume,"
+                " consume-nohdr or borrowed, got "
                 + mode
             )
         if stalls > 5000000:

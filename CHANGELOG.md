@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`Consumer.poll(headers=False)` / `Consumer.poll_event(headers=False)`**
+  skip the `rd_kafka_message_headers` crossing, the same escape hatch
+  `consume()` already had. Measured interleaved in one binary three times at
+  **-75, -157 and -212 ns a record**: the crossing costs that even for a
+  record with no headers, because the cost is librdkafka's rather than this
+  binding's, so not calling it is the only way not to pay it. Default stays
+  `True`. `Message.headers` comes back empty for every record when it is
+  off, exactly as `consume(headers=False)` leaves it.
+
 - **A four-peer consume benchmark**: C, `rust-rdkafka`, this package and
   `confluent-kafka`, all reading one topic and all asserting on the same
   payload checksum. `run.py` builds the C and Rust peers itself and skips
@@ -29,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MessageBatch.reached_end()` already answered this for the borrowed path.
 
 ### Changed
+- **`consume_events()` is ~10-15% faster**, and costs ~1.6x `consume()`
+  where it was ~1.8x. Its entries are now **constructed into the list's
+  slot** rather than built on the stack and moved in — a `PollEvent` is 208
+  bytes, measured, against a `Message`'s 144. Interleaved in one binary
+  three times: **-66, -112 and -74 ns a record**. No API change: the same
+  `List[PollEvent]` comes back with the same entries in the same order.
+
+  Four alternatives were measured and rejected, and they are written up in
+  `benchmarks/README.md` so nobody retries them: a lazy container that
+  stores `Message`s and builds the `PollEvent` on demand is *worse* (so the
+  208-byte footprint was never the problem); assigning into the slot through
+  a `ref` is worth nothing; the same trick on `consume()` is worse; and
+  caching `rd_kafka_topic_name` across `poll_event()` calls — the long-
+  recorded suspect for that path's cost — is a **215 ns regression**.
+
 - **`consume()` is ~1.7x faster.** It decoded through `consume_events()` and
   then deep-copied every `Message` out of the `PollEvent` wrapper it did not
   want; it now decodes straight into the `List[Message]` it returns. The cost
