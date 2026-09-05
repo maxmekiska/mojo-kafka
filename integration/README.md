@@ -80,6 +80,24 @@ to `.`, and a listener name containing an underscore would need the
 double-underscore escape. SSL against a real broker needs certificate
 generation and is not set up here.
 
+## Soak — local only, no broker
+
+```bash
+pixi run soak            # 120 s per path
+pixi run soak 600        # the number the README quotes
+```
+
+`integration/soak.mojo` runs every consume path, produce with headers and a
+read-process-write transaction loop, each for the given number of seconds,
+in rounds of a fixed record count against a **fresh `MockCluster` per
+round** (the mock keeps every record in this process, so one cluster would
+grow RSS with no leak anywhere). Every record read is checked against its
+key, and peak RSS is sampled every 10 s after a 20 s warm-up; a path fails
+if the last sample is more than 10% *and* more than 16 MB above the first.
+For a leak check under valgrind, `pixi run soak-build` makes a binary and
+the module docstring has the command. What it last reported, and when, is
+in the README's status section.
+
 ## Interop suite — against `confluent-kafka`
 
 ```bash

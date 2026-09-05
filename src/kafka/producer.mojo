@@ -755,6 +755,18 @@ struct Producer:
         without `take_logs()` being called. Cumulative."""
         return self._state()[unsafe_offset=0].telemetry.logs_dropped()
 
+    def queue_length(self) raises -> Int:
+        """Messages and requests still in flight, per `rd_kafka_outq_len`.
+
+        What `flush()` waits to reach zero: produced messages not yet
+        acknowledged, plus delivery reports and callbacks not yet served.
+        A number that climbs across a long run while `flush()` keeps
+        returning cleanly is a broker falling behind the producer, which
+        is the other way a job dies slowly -- so a soak prints it beside
+        RSS. Cheap: a counter read, no round trip.
+        """
+        return Int(self._lib.outq_len(self._rk))
+
     # -- producing ------------------------------------------------------------
 
     def _headers_handle(self, headers: List[Header]) raises -> Int:

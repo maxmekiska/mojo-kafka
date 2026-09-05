@@ -18,6 +18,13 @@ test-mock = "mojo run -I src integration/test_mock.mojo"
 test-broker = "mojo run -I src integration/test_broker.mojo"
 broker-up = "docker compose -f integration/docker-compose.yml up -d --wait"
 broker-down = "docker compose -f integration/docker-compose.yml down -v"
+# Local only, like the Docker suites, but needs no broker: every consume
+# path, produce with headers and a transaction loop, each for N seconds
+# (default 120; `pixi run soak 600` is the number to quote) against a fresh
+# mock cluster per round, watching peak RSS. `soak-build` makes the binary
+# for a run under valgrind -- see integration/soak.mojo.
+soak = "mojo run -I src integration/soak.mojo"
+soak-build = "mkdir -p dist && mojo build -I src integration/soak.mojo -o dist/soak"
 
 # The package is pure Mojo over a C library -- it does not use MAX, so the
 # environment is just the compiler plus librdkafka.
