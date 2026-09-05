@@ -18,9 +18,13 @@ services:
       # bootstraps fine and then times out.
       - "9092:9092"
     healthcheck:
-      test:
-        ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
+      # A port probe, not `kafka-topics.sh --list`. That spawns a JVM per
+      # check, which on a slow machine outlives the timeout; Docker then
+      # starts another every `interval`, the container never reports
+      # healthy, and the JVM storm drowns out any benchmark sharing the
+      # cores. Kafka opens 9092 only once request processing is enabled.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9092' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
       start_period: 10s

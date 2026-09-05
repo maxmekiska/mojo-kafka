@@ -2503,5 +2503,72 @@ def _text_of(field: Optional[List[UInt8]]) raises -> String:
     return String(unsafe_from_utf8=Span(field.value()))
 
 
+def test_a_borrowed_batch_names_each_records_own_topic() raises:
+    """A multi-topic subscription mixes topics in one fetch, and every
+    borrowed record must name its own.
+
+    The batch used to resolve `rd_kafka_topic_name` once, from its first
+    record, and label every record with it -- so a consumer of two topics
+    saw the second topic's records reported under the first. The other
+    borrowed tests read one topic each, which is why none of them could
+    see it. Each record's key is its topic name, so the assertion is one
+    comparison per record and holds whichever partition was served first.
+
+    `timeout_ms` on a batch call is how long librdkafka waits to **fill**
+    it, so asking for exactly the whole record count is what makes both
+    topics land in one batch rather than one per call.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("lent-alpha", partition_count=1)
+    cluster.create_topic("lent-beta", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(20):
+        _ = producer.produce(
+            topic="lent-alpha", key="lent-alpha", value="a" + String(i)
+        )
+        _ = producer.produce(
+            topic="lent-beta", key="lent-beta", value="b" + String(i)
+        )
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="lent-both",
+            auto_offset_reset="earliest",
+        )
+    )
+    consumer.subscribe(["lent-alpha", "lent-beta"])
+
+    var seen = 0
+    var alpha = 0
+    var attempts = 0
+    while seen < 40 and attempts < 30:
+        attempts += 1
+        var batch = consumer.consume_borrowed(40, timeout_ms=5000)
+        for i in range(len(batch)):
+            var record = batch[i]
+            var topic = String(unsafe_from_utf8=record.topic())
+            var key = record.key()
+            if not key:
+                raise Error("every record here was produced with a key")
+            assert_equal(
+                topic,
+                String(unsafe_from_utf8=key.value()),
+                "a borrowed record was labelled with another record's topic",
+            )
+            if topic == "lent-alpha":
+                alpha += 1
+            seen += 1
+        _ = batch^
+    assert_equal(seen, 40, "the borrowed path did not read both topics")
+    assert_equal(alpha, 20, "the two topics were not both read in full")
+    consumer.close()
+    print("    40 borrowed records over 2 topics, each named its own")
+    _ = cluster^
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

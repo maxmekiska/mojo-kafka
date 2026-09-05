@@ -801,7 +801,12 @@ queue from `rd_kafka_queue_get_consumer` -- the same construction
   segfault, 1 run in 1. `poll()` after `close()` does not crash, so this is
   the batch path's alone. `test_consume_after_close_raises_instead_of_faulting`
   is the guard, and like the racing-close case it **crashes rather than
-  fails** if the check is removed.
+  fails** if the check is removed. The check runs **under `_batch`**, and
+  `close()` takes the same latch around releasing the queue: a check made
+  outside it could pass and then fetch through a queue a `close()` on
+  another thread had just destroyed. So `close()` waits for a fetch in
+  flight, bounded by that fetch's timeout;
+  `test_close_waits_for_a_batch_fetch_in_flight` (smoke) is the guard.
 
 - **The topic name is cached across the batch.** `rd_kafka_topic_name` is a
   crossing per message otherwise, and a batch is nearly always one topic.
@@ -867,6 +872,24 @@ queue from `rd_kafka_queue_get_consumer` -- the same construction
   **200,001 calls for 200,000 records**. It is eager, exactly as we are, so
   that crossing is not a handicap we carry and it does not explain any gap.
   What it *is* is expensive -- see the next bullet.
+
+- **`copy_bytes` is one `memcpy`, not `List(Span)`.** The stdlib
+  constructor appends byte by byte, and every owned key, value and header
+  value goes through `copy_bytes`, so it was most of the copy cost of the
+  owned paths. Measured paired in one process, alternating old and new per
+  repeat, over two independent runs: `consume()` 0.89x then 0.93x of the
+  old cost (7/10 and 6/10 pairs faster), `consume(headers=False)` 0.87x
+  then 0.91x (6/10, 7/10). `poll_event(headers=False)` measured 0.85x then
+  1.03x -- no signal on that path, where the per-record topic `String`
+  allocation and `rd_kafka_consumer_poll` dominate. On a throttled laptop;
+  ratios only. Two things measured alongside and **not** shipped:
+  dropping `raises` from the `BorrowedMessage` accessors and the `_load_*`
+  helpers (`_DLCallable.__call__` does not raise, so it is legal) measured
+  1.17x, faster in 2/10 pairs -- noise, not a win; and `String.copy()`
+  **shares its buffer** while `List.copy()` does not, so `Message.topic`
+  copies are cheap and the poll path's extra cost is *building* a `String`
+  per record, which is an allocation and therefore not something to judge
+  on a throttled machine (see "Settle the numbers").
 
 - **The headers crossing costs ~117 ns a record even when the record has
   none, and that is librdkafka's cost, not ours.** Measured in plain C with
@@ -1063,10 +1086,16 @@ owned `Message` rather than instead of it. Five things not to undo:
   batch: they have no payload to lend, and a batch must not hold a message it
   cannot describe.
 
-- **`rd_kafka_topic_name` is resolved once per batch**, via
-  `Lib.topic_name_ptr` which does *not* copy into a `String` -- the pointer
-  belongs to the topic handle and outlives every message in the batch. The
-  owned path's `topic_name` still copies; both exist deliberately.
+- **`rd_kafka_topic_name` is resolved once per run of records sharing a
+  handle, and stored per record** (`_Lent`), via `Lib.topic_name_ptr` which
+  does *not* copy into a `String` -- the pointer belongs to the topic handle
+  and outlives every message in the batch. It used to be resolved once per
+  *batch*, from the first record, which labelled every record of a
+  multi-topic subscription with the first topic;
+  `test_a_borrowed_batch_names_each_records_own_topic` is the guard, and
+  the three older borrowed tests read one topic each, which is why none of
+  them saw it. The owned path's `topic_name` still copies; both exist
+  deliberately.
 
 - **No headers on a borrowed view.** Each one is a separate name and value
   that would have to be copied out individually, which is the cost this type
@@ -1204,6 +1233,208 @@ performance question. The lazy-container result above says it would buy less
 than it looks like anyway.
 
 
+### The last quarter: the road to v1.0
+
+Written 2026-09-05. The stated goals of the upstream scaffold are met and
+passed; what separates this package from "production-credible" is
+operational hardening, not features. This section is the whole plan, in
+execution order, and it is written so a session with no other context can
+run it. **Do the items in order, one commit per item, and run the gates
+named on each before committing.** The four gates are `pixi run lint`,
+`pixi run test`, `pixi run test-mock`, and where an item says so
+`pixi run broker-up && pixi run test-broker` and
+`pixi run -e interop test-interop`.
+
+Two things about the machine before starting. Read "Settle the numbers"
+above: check `docker inspect --format '{{.State.Health.Status}}'
+mojo-kafka-broker` says healthy, and do not quote an absolute benchmark
+number from this laptop while it is throttled. Nothing in this plan needs
+a benchmark; the paired `a:b` bench mode exists if one is wanted.
+
+Two items need Max's decision and are marked. Everything else is
+pre-approved: build it.
+
+**1. Observability: errors, fatal errors, logs, stats.** *The biggest
+gap.* Today a failure on a librdkafka background thread -- all brokers
+down, an auth rejection, a fenced producer -- reaches the application
+only if a `poll()` or `flush()` happens to report it, and there is no
+metrics hook at all. A production job cannot be run blind.
+
+- *librdkafka surface*, all set on the conf before `rd_kafka_new`, all
+  **served on the thread that polls**, which is what makes touching Mojo
+  state from them safe, exactly as the `dr_msg_cb` is:
+  `rd_kafka_conf_set_error_cb(conf, void(*)(rd_kafka_t*, int err, const
+  char* reason, void* opaque))`; `rd_kafka_conf_set_stats_cb(conf,
+  int(*)(rd_kafka_t*, char* json, size_t len, void* opaque))`, which must
+  **return 0** so librdkafka frees `json` -- copy it first; and
+  `rd_kafka_conf_set_log_cb(conf, void(*)(const rd_kafka_t*, int level,
+  const char* fac, const char* buf))`, which carries **no opaque** -- reach
+  it with `rd_kafka_opaque(rk)` -- and which is called from **arbitrary
+  threads unless `log.queue=true`**. Set `log.queue=true` whenever a log
+  hook is installed, so logs are served through the poll path like the
+  other two; for a consumer, `poll_set_consumer` already forwards the main
+  queue to the consumer queue, so `consumer_poll` and
+  `consume_batch_queue` serve all three. Bind
+  `rd_kafka_fatal_error(rk, errstr, size)` too: an `error_cb` carrying
+  `RD_KAFKA_RESP_ERR__FATAL` (-150) is a *notification*, and this call is
+  what returns the underlying error. Stats need `statistics.interval.ms`
+  on the conf; add `statistics_interval_ms: Int = 0` to both configs.
+- *API shape*: **retain, do not callback**, matching `failures()` /
+  `take_failures()`. A thin `abi("C")` handler cannot capture anything, so
+  a callback API would force every user into the `setenv` tricks the lost-
+  rebalance tests use. Add to both clients: `errors() -> List[KafkaError]`
+  and `take_errors()`, bounded to the most recent 256 with a
+  `dropped_errors() -> Int` counter; `fatal_error() -> Optional[KafkaError]`
+  reading `rd_kafka_fatal_error`; `latest_stats() -> Optional[String]`,
+  the last JSON document; and `logs()` / `take_logs()` returning a
+  `List[LogLine]` (`level: Int32`, `facility: String`, `message: String`),
+  bounded the same way, installed only when `ProducerConfig` /
+  `ConsumerConfig` has `capture_logs=True` because it forces
+  `log.queue=true`. The trampolines follow `_delivery_trampoline`
+  exactly: decode everything **before** acquiring the latch, never raise
+  under it, and the state lives in the existing heap boxes -- `_DrState`
+  for the producer and `_RebalanceState` for the consumer, since each
+  client has one conf opaque and it already points there. Do not add a
+  second opaque.
+- *Tests* (smoke, no broker, dead port `127.0.0.1:9`): a producer that
+  produces once and polls for 1500 ms has `errors()` containing a
+  `KIND_TRANSPORT` entry; a consumer built with
+  `statistics_interval_ms=100` and polled for 500 ms has `latest_stats()`
+  containing `"name"`; with `capture_logs=True` and `log_level=7`, `logs()`
+  is non-empty and every entry has a non-empty facility. Extend
+  `test_a_fatal_transaction_error_is_flagged_fatal` (mock): after the
+  injected `CLUSTER_AUTHORIZATION_FAILED`, `producer.fatal_error()` is
+  present with code 31. Assert on `errors()` never being longer than 256
+  after a 1000-error burst, and that `dropped_errors()` counts the rest.
+- *Done when* the four calls exist on both clients with docstrings, the
+  README gains a "Running in production" section naming them, and the
+  gates pass. Run `test-broker` too: the callback conf changes touch every
+  client construction.
+
+**2. The small API holes.** All cheap, all things an operator asks for
+in week one.
+
+- `Consumer.commit(offsets: List[TopicPartition], asynchronous=False)`,
+  explicit offsets through `_build_tpl` and the already-bound `Lib.commit`.
+  Offsets are the **next** offset to read, as `position()` reports; say so
+  in the docstring, it is the same trap `send_offsets_to_transaction` has.
+- `Consumer.store_offsets(offsets)` over `rd_kafka_offsets_store` (new
+  binding), which requires `enable.auto.offset.store=false`; add that as
+  `enable_auto_offset_store: Bool = True` on `ConsumerConfig`. Per-
+  partition verdicts come back in the list: use `_control`'s shape, and
+  raise on the first error the way `seek` does, since this call returns
+  nothing.
+- `Consumer.assignment()` and `Consumer.subscription()` over
+  `rd_kafka_assignment` / `rd_kafka_subscription`, both of which hand back
+  a caller-owned list: decode with `_decode_tpl`, destroy on every path.
+- `ProducerConfig.drain_timeout_ms: Int = 5000`, the wait `__deinit__`
+  makes today with a hard-coded 5000. Keep the default.
+- *Tests* (mock): commit explicit offsets on one partition, then
+  `committed()` reports them and `position()` is unchanged; `store_offsets`
+  then `commit()` commits the stored value and not the position; after
+  `subscribe(["a","b"])` and one poll, `subscription()` has both names and
+  `assignment()` has both partitions. Every assertion on a list checks
+  entry `i` is partition `i`, as `test_position_walks_every_partition`
+  does.
+
+**3. Soak and leak.** *The claim "no leak per message" has never been
+tested.* A leak in the headers walk or the `PollEvent` slot trick would
+show only after hours.
+
+- Add `integration/soak.mojo` and a **local-only** task `pixi run soak`.
+  It runs each path for a duration given on the command line (default
+  120 s each; 600 s is the number to quote) against `MockCluster`, with a
+  producer refilling the topic: `poll`, `poll_event`, `consume`,
+  `consume_events`, `consume_borrowed`, produce with three headers, and a
+  transaction loop of `begin / produce / send_offsets / commit`. Every
+  record read is checked against its key, so a decode that goes wrong
+  under load is a failure and not a leak.
+- Measure with `getrusage(RUSAGE_SELF).ru_maxrss` through libc, loaded the
+  way `_open_libc` in the smoke suite loads it for `pthread_create` -- it
+  is portable to macOS where `/proc` is not, and peak RSS is enough
+  because a leak is monotonic. Units differ: kilobytes on Linux, bytes on
+  macOS; normalise. Sample every 10 s after a 20 s warm-up; **fail** if
+  the last sample exceeds the first post-warm-up sample by more than 10%
+  and more than 16 MB. Print the table either way.
+- Also bind `rd_kafka_outq_len`-style counters that already exist and
+  print `rd_kafka_outq_len(rk)` at each sample for the producer: a queue
+  that grows without bound is the other way a long run dies.
+- Run it once under `valgrind --leak-check=full --error-exitcode=1` with
+  a 20 s duration (`apt install valgrind` if absent; skip on macOS), and
+  record the result -- pass or the exact leak -- in this file under
+  "Known bugs". librdkafka itself reports a few "still reachable" blocks
+  at exit; only "definitely lost" counts.
+- *Done when* a 600 s run of every path passes the RSS rule, the
+  valgrind result is recorded here, and the README's status section says
+  so with the date.
+
+**4. SASL and SSL.** librdkafka does all of it; what is missing is proof
+that the conda build has it and that the configuration path through
+`set()` works.
+
+- Bind `rd_kafka_conf_get` and expose `kafka.builtin_features() -> String`
+  (the `builtin.features` property: on a full build it contains `ssl`,
+  `sasl_gssapi`, `sasl_plain`, `sasl_scram`, `sasl_oauthbearer`). A
+  smoke test asserts `ssl` and `sasl_scram` are present, so a librdkafka
+  built without them fails the suite rather than the first production
+  connect.
+- Smoke test for SSL without a broker: `security.protocol=SSL` plus
+  `ssl.ca.location=/nonexistent` must fail at construction with an error
+  naming the CA file -- that proves the OpenSSL path is compiled in and
+  reached.
+- Real-broker test for SASL: add a second listener to
+  `integration/docker-compose.yml` on **9093** with
+  `SASL_PLAINTEXT` / `PLAIN`, user `mojo` password `mojo-secret`, using
+  the `apache/kafka` image's `KAFKA_*` environment (listener name map,
+  `KAFKA_SASL_ENABLED_MECHANISMS=PLAIN`, and the
+  `KAFKA_LISTENER_NAME_SASL_PLAINTEXT_PLAIN_SASL_JAAS_CONFIG` line). Keep
+  9092 plaintext so every existing test is untouched. Add
+  `test_sasl_plain_round_trip` to `test_broker.mojo`: produce and consume
+  one record through 9093 with `security.protocol`, `sasl.mechanism`,
+  `sasl.username`, `sasl.password` set through `set()`, and a second case
+  asserting a wrong password surfaces as `KIND_AUTHORIZATION` in
+  `errors()` from item 1. SCRAM needs the broker to hold credentials
+  created with `kafka-configs.sh`; PLAIN proves the plumbing and is
+  enough for v1.0. SSL against a real broker needs certificate generation
+  in compose and is **not** in this plan; say so in the README.
+- README: a "Security" section listing the four keys and the
+  `builtin_features()` check.
+
+**5. A nightly integration workflow. Needs Max's decision.** This file
+says do not add Docker to `.github/workflows/ci.yml`, and that stands:
+the PR gate stays Docker-free. The proposal is a **separate**
+`.github/workflows/integration.yml` on `ubuntu-latest` only, on
+`schedule` (nightly) and `workflow_dispatch`, not required for merging,
+that runs `broker-up`, `test-broker`, `test-interop` and item 4's SASL
+case, and `soak` with a 60 s duration. GitHub-hosted Ubuntu runners have
+Docker. This turns "nothing but you runs the Docker suites" into "they
+run every night and someone reads the badge". Ask before adding it, and
+add the badge to the README if the answer is yes.
+
+**6. Docs and the release. The version number needs Max's decision.**
+
+- README: the "Running in production" section from item 1, covering
+  shutdown order (`flush()` then drop the producer; `close()` then drop
+  the consumer, and why), what to do on `fatal_error()` (destroy and
+  rebuild the client -- librdkafka will not recover it), the thread model
+  in three sentences, `errors()` / `latest_stats()` / `logs()`, and the
+  security keys. Rewrite the status section: what has been soaked, for
+  how long, on what date, and what is still local-only.
+- `CHANGELOG.md`: move "Unreleased" under a version heading and
+  `pixi.toml`'s `version` to match. Propose `v0.3.0` as the release
+  candidate and `v1.0.0` after a soak on a real workload of Max's; ask
+  which. `.github/workflows/release.yml` already exists: read it before
+  tagging, and tag only when told to.
+- Update the "Status" bullets at the top of this section of `CLAUDE.md`
+  as each item lands, so the next session sees what is left.
+
+**Definition of done for v1.0**: items 1-4 landed with their tests; the
+soak result recorded; the README production and security sections
+written; a decision recorded on items 5 and 6; all four gates green plus
+`test-broker` and `test-interop` on the day of the tag.
+
+**Status**: nothing started.
+
 ### Candidates, none started
 
 - **A borrowed producer path.** `produce()` copies its key and value through
@@ -1220,6 +1451,20 @@ than it looks like anyway.
   `consume(headers=False)` cross-client ratio still swings 1.50-2.06x. A
   quiet machine with `--rounds 4 --repeat 9` would turn that range into a
   number.
+
+  Two things found on 2026-09-05 that make "quiet" a precondition rather
+  than a nicety. **The compose healthcheck is a port probe now**:
+  `kafka-topics.sh --list` took 32 s here, Docker killed it at the 5 s
+  timeout and started another every 10 s, the container never reported
+  healthy, and the JVM storm made every peer -- `c batch` included --
+  10x its table figure. And **a throttled CPU is not a scaled-down one**:
+  at ~0.8 GHz effective (Balanced plan) a plain C `malloc`+`free` measured
+  312 ns and a vDSO `clock_gettime` 415 ns, ~10x normal, so anything that
+  removes an allocation looks far better than it is. Check
+  `taskset -c 6` on a dependent multiply-add loop before trusting an
+  absolute number, and on such a machine compare only paired, in one
+  process, alternating variants per repeat. The stall detector cannot see
+  this: a slow machine never empties the queue.
 
 - **A borrowed path for the owned decode's two copies.** `consume()` spends
   ~146 ns a record on the key and value `malloc`+`memcpy` pair. An arena per

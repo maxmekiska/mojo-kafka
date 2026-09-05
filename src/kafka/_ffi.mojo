@@ -34,6 +34,7 @@ Five conventions keep the layers above this file safe:
 """
 
 from std.ffi import OwnedDLHandle, _DLCallable
+from std.memory import unsafe_memcpy
 from std.os import getenv
 
 
@@ -265,15 +266,25 @@ def copy_bytes(addr: Int, length: Int) raises -> Optional[List[UInt8]]:
     null field as distinct from an empty one -- that distinction is what a
     compaction tombstone is made of -- and librdkafka signals it by leaving
     the pointer NULL, so a NUL pointer must not collapse into an empty list.
+
+    One `memcpy` into an uninitialised list rather than `List(Span)`: that
+    constructor appends byte by byte, and every owned key, value and header
+    value comes through here, so it was most of the copy cost of `consume()`
+    and `poll()`. Measured paired in one process, the memcpy decode is
+    0.85-0.89x the old cost on all three owned paths -- see "Batch
+    `consume(n)`" in CLAUDE.md.
     """
     if addr == 0:
         return None
-    var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=addr)
-    return List[UInt8](
-        Span[UInt8, ImmutAnyOrigin](
-            unsafe_ptr=p, length=length if length > 0 else 0
+    var n = length if length > 0 else 0
+    var out = List[UInt8](unsafe_uninit_length=n)
+    if n > 0:
+        unsafe_memcpy(
+            dest=out.unsafe_ptr(),
+            src=Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=addr),
+            count=n,
         )
-    )
+    return out^
 
 
 def cstr(addr: Int) raises -> String:

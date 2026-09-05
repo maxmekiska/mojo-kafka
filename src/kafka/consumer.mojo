@@ -590,9 +590,12 @@ struct BorrowedMessage[origin: Origin[mut=False]](Copyable, Movable):
     def topic(self) -> Span[UInt8, Self.origin]:
         """The topic name's bytes, in librdkafka's memory.
 
-        Resolved once per distinct topic handle by the batch, not per
-        message -- `rd_kafka_topic_name` is a crossing, and a batch is nearly
-        always one topic.
+        Resolved by the batch once per **run** of records sharing a topic
+        handle, not per message -- `rd_kafka_topic_name` is a crossing, and
+        a batch is nearly always one topic. A batch over a multi-topic
+        subscription still names each record's own topic; an earlier
+        version resolved it once per batch and labelled every record with
+        the first one.
         """
         return Span[UInt8, Self.origin](
             unsafe_ptr=Pointer[UInt8, Self.origin](
@@ -627,6 +630,20 @@ struct BorrowedMessage[origin: Origin[mut=False]](Copyable, Movable):
         return _load_word(self._raw + MSG_PAYLOAD) == 0
 
 
+@fieldwise_init
+struct _Lent(Copyable, Movable):
+    """One message a `MessageBatch` owns, with the topic name it belongs to.
+
+    The name travels per record rather than per batch because a consumer
+    subscribed to more than one topic gets them mixed in one fetch, and a
+    single name on the batch labelled every record with the first one.
+    """
+
+    var raw: Int
+    var topic_addr: Int
+    var topic_len: Int
+
+
 struct MessageBatch(Sized):
     """A run of records still owned by librdkafka, lent out in place.
 
@@ -650,36 +667,24 @@ struct MessageBatch(Sized):
     # other 75 symbols cost ~26us on every `consume_borrowed()` call. See
     # `_Freer`.
     var _lib: _Freer
-    var _raws: List[Int]
-    var _topic_addr: Int
-    var _topic_len: Int
+    var _lent: List[_Lent]
     var _eof: Bool
 
-    def __init__(
-        out self,
-        var lib: _Freer,
-        var raws: List[Int],
-        topic_addr: Int,
-        topic_len: Int,
-        eof: Bool,
-    ):
+    def __init__(out self, var lib: _Freer, var lent: List[_Lent], eof: Bool):
         self._lib = lib^
-        self._raws = raws^
-        self._topic_addr = topic_addr
-        self._topic_len = topic_len
+        self._lent = lent^
         self._eof = eof
 
     def __deinit__(deinit self):
         # Destructors cannot raise, and every message here is ours.
-        for raw in self._raws:
-            if raw != 0:
-                try:
-                    self._lib.message_destroy(raw)
-                except:
-                    pass
+        for entry in self._lent:
+            try:
+                self._lib.message_destroy(entry.raw)
+            except:
+                pass
 
     def __len__(self) -> Int:
-        return len(self._raws)
+        return len(self._lent)
 
     def reached_end(self) -> Bool:
         """Whether this fetch ran off the end of a partition.
@@ -701,8 +706,9 @@ struct MessageBatch(Sized):
     def __getitem__(ref self, i: Int) -> BorrowedMessage[origin_of(self)]:
         """Lend record `i`. The result borrows this batch and cannot outlive
         it -- that is the whole safety argument, and it is checked."""
+        ref entry = self._lent[i]
         return BorrowedMessage[origin_of(self)](
-            self._raws[i], self._topic_addr, self._topic_len
+            entry.raw, entry.topic_addr, entry.topic_len
         )
 
 
@@ -713,8 +719,8 @@ struct Consumer:
     -- `poll()`, `poll_event()` and the control plane -- hold no mutable Mojo
     state, so they may be driven from more than one thread. The two calls
     that mutate are synchronised: `close()` claims its flag with a
-    compare-exchange, and `subscribe()` writes the rebalance handler slots
-    under a latch the trampoline reads them through.
+    compare-exchange, and `subscribe()` publishes each rebalance handler
+    slot as one atomic word, which is all the trampoline ever reads.
 
     `close()` is the one that mattered. It used to check a `Bool` and then
     set it, so every thread calling it could pass the check before any set
@@ -811,6 +817,10 @@ struct Consumer:
         empty -- see `consume`. The closed check is the one that would
         otherwise **fault**: `_queue` is 0 after `close()`, and
         `rd_kafka_consume_batch_queue` dereferences it without checking.
+
+        **Called with `_batch` held.** `close()` takes the same latch to
+        release the queue, so a check made outside it could pass and then
+        fetch through a queue `close()` had just destroyed.
         """
         if n <= 0 or n > MAX_BATCH:
             raise Error(
@@ -1088,7 +1098,6 @@ struct Consumer:
         `Message` out of it; decoding straight into the list it returns is
         worth ~215ns per record on its own. Keep it direct.
         """
-        self._check_batch(n, "consume")
         if not self._batch.try_acquire():
             # Refused, not queued. See the paragraph above.
             raise Error(
@@ -1099,6 +1108,7 @@ struct Consumer:
             )
         var out: List[Message]
         try:
+            self._check_batch(n, "consume")
             out = self._consume_messages_locked(n, timeout_ms, headers)
         except e:
             # Released before the raise, never under it -- see `_sync`.
@@ -1216,7 +1226,6 @@ struct Consumer:
 
         Same one-at-a-time rule as `consume()`, enforced the same way.
         """
-        self._check_batch(n, "consume_borrowed")
         if not self._batch.try_acquire():
             raise Error(
                 "consume_borrowed(): another thread is already inside"
@@ -1228,6 +1237,7 @@ struct Consumer:
 
         var batch: MessageBatch
         try:
+            self._check_batch(n, "consume_borrowed")
             batch = self._consume_borrowed_locked(n, timeout_ms)
         except e:
             self._batch.release()
@@ -1256,7 +1266,11 @@ struct Consumer:
 
         # Keep only the records with a payload to lend, destroying the rest
         # here so the batch never holds a message it cannot describe.
-        var kept = List[Int](capacity=count)
+        var kept = List[_Lent](capacity=count)
+        # The topic name is resolved once per run of records sharing a
+        # handle and stored per record: a multi-topic subscription mixes
+        # topics in one fetch, and `rd_kafka_topic_name` is a crossing.
+        var last_rkt = 0
         var topic_addr = 0
         var topic_len = 0
         var eof = False
@@ -1278,19 +1292,20 @@ struct Consumer:
                     failure = self._lib.error(err_code)
                 self._lib.message_destroy(raw)
                 continue
-            if topic_addr == 0:
-                # Once per batch, not per message: `rd_kafka_topic_name` is a
-                # crossing, and the pointer it returns belongs to the topic
-                # handle, which outlives every message in this batch.
-                topic_addr = self._lib.topic_name_ptr(_load_word(raw + MSG_RKT))
+            var rkt = _load_word(raw + MSG_RKT)
+            if rkt != last_rkt:
+                # The pointer belongs to the topic handle, which outlives
+                # every message in this batch.
+                topic_addr = self._lib.topic_name_ptr(rkt)
                 topic_len = self._lib.cstr_len(topic_addr)
-            kept.append(raw)
+                last_rkt = rkt
+            kept.append(_Lent(raw, topic_addr, topic_len))
         # Same policy as `consume_events`: an error beside good records is
         # reported through the records the caller already has; one on its own
         # has nowhere else to go.
         if failure and len(kept) == 0:
             raise Error("consume_borrowed: " + String(failure.value()))
-        return MessageBatch(_Freer(), kept^, topic_addr, topic_len, eof)
+        return MessageBatch(_Freer(), kept^, eof)
 
     def consume_events(
         mut self, n: Int, timeout_ms: Int32 = 1000
@@ -1326,8 +1341,6 @@ struct Consumer:
         # (it raises here rather than returning empty), and a closed
         # consumer would otherwise **fault** inside librdkafka rather than
         # return an error.
-        self._check_batch(n, "consume")
-
         if not self._batch.try_acquire():
             # Refused, not queued. See `consume`.
             raise Error(
@@ -1339,6 +1352,7 @@ struct Consumer:
 
         var out: List[PollEvent]
         try:
+            self._check_batch(n, "consume_events")
             out = self._consume_locked(n, timeout_ms)
         except e:
             # Released before the raise, never under it -- see `_sync`.
@@ -1833,12 +1847,27 @@ struct Consumer:
         trip, and spinning a core for the length of one is worse than the
         wrinkle it would fix -- and there is no blocking primitive in Mojo
         1.0 to wait on properly. The close is in progress either way.
+
+        A batch fetch in flight on another thread is **waited for**, not
+        raced: the consumer queue it is reading through has to be released
+        before the close, and releasing it under a running
+        `rd_kafka_consume_batch_queue` faults. The wait is bounded by that
+        fetch's `timeout_ms`, so do not close from another thread while a
+        fetch with an unbounded timeout is in flight.
         """
         var expected = Int32(0)
         if not self._closed.compare_exchange(expected, 1):
             return
-        # librdkafka requires the consumer-queue reference to go first.
+        # librdkafka requires the consumer-queue reference to go first --
+        # and a fetch on another thread may still be reading through it.
+        # `_batch` is held by every fetch for its whole duration, so
+        # taking it here is what keeps the queue alive under one. Blocking
+        # rather than `try_acquire`: refusing would leave `_closed` claimed
+        # with nothing closed. The section holds no FFI a callback could
+        # contend for; see `_consume_locked` for why that is sound here.
+        self._batch.acquire()
         self._release_queue()
+        self._batch.release()
         # Claimed before the call, so a close that fails still counts as
         # done -- retrying it would only report the same failure twice.
         self._lib.raise_if(self._lib.consumer_close(self._rk), "close")

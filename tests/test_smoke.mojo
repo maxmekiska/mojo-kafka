@@ -8,6 +8,7 @@ at the first produce in someone's pipeline.
 from std.os import getenv, setenv
 from std.atomic import Atomic
 from std.ffi import OwnedDLHandle
+from std.time import perf_counter_ns, sleep
 from std.testing import TestSuite, assert_equal, assert_true
 
 from kafka._ffi import PTR_STRIDE
@@ -1087,6 +1088,73 @@ def test_concurrent_consume_is_refused_not_serialised() raises:
     print(
         "    1 of", _THREADS, "consume() callers ran;", refused, "were refused"
     )
+
+
+def test_close_waits_for_a_batch_fetch_in_flight() raises:
+    """`close()` from another thread must not pull the consumer queue out
+    from under a running batch fetch.
+
+    librdkafka requires the queue reference to be destroyed before
+    `rd_kafka_consumer_close`, and `rd_kafka_consume_batch_queue` reads
+    through that reference for its whole timeout. `close()` used to release
+    it on nothing more than the closed flag, so a fetch on another thread
+    went on reading through a destroyed queue. Now the closed check runs
+    under the batch latch and `close()` takes the same latch, so it waits
+    for the fetch to return.
+
+    Deterministic, like the concurrent-consume case: the fetch sits in the
+    batch call for its full 1.5s against a dead port, `close()` is called
+    300ms in, and must not return before the remaining ~1.2s has passed.
+    An unsubscribed consumer's close is otherwise local and prompt, so a
+    `close()` that took under 900ms did not wait.
+    """
+    var libc = _open_libc()
+    var create = libc.get_function[Int32]("pthread_create")
+    var join = libc.get_function[Int32]("pthread_join")
+
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="close-under-fetch"
+    )
+    cfg.set("log_level", "0")
+    var consumer = Consumer(cfg)
+
+    var results = List[Int](length=1, fill=-1)
+    var gate = Atomic[DType.int64](1)
+    var work = _ConsumeWork(
+        Int(Pointer(to=consumer)),
+        Int(results.unsafe_ptr()),
+        0,
+        Int(Pointer(to=gate)),
+    )
+    var thread = List[Int](length=1, fill=0)
+    var rc = create(
+        Int(thread.unsafe_ptr()), 0, _consume_worker, Int(Pointer(to=work))
+    )
+    assert_equal(Int(rc), 0, "pthread_create failed")
+
+    sleep(0.3)
+    var started = perf_counter_ns()
+    consumer.close()
+    var waited_ms = (perf_counter_ns() - started) // 1_000_000
+    _ = join(thread[0], 0)
+    # Pinned past the join: the thread reaches both through raw addresses.
+    _ = work^
+    _ = gate^
+
+    assert_equal(results[0], 0, "the fetch did not return normally")
+    assert_true(
+        waited_ms >= 900,
+        "close() returned after "
+        + String(waited_ms)
+        + "ms without waiting for the fetch in flight",
+    )
+    var raised = False
+    try:
+        _ = consumer.consume(16, timeout_ms=100)
+    except:
+        raised = True
+    assert_true(raised, "consume() after the close reported success")
+    print("    close() waited", waited_ms, "ms for the fetch in flight")
 
 
 def main() raises:
