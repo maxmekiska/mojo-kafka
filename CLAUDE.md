@@ -1536,7 +1536,52 @@ written; a decision recorded on items 5 and 6; all four gates green plus
   case proves the OpenSSL path is *reached*: librdkafka loads
   `ssl.ca.location` inside `rd_kafka_new`, so a bad path raises at
   construction naming the file. SSL against a real broker is not set up.
-- 3, 5, 6 -- see below / not started.
+- **5. Nightly integration workflow** -- **decided 2026-09-05: not
+  added.** Max's call, asked and answered: the Docker suites stay
+  local-only and `.github/workflows/` gains nothing. "Nothing but you runs
+  the Docker suites" therefore still holds; run `test-broker` and
+  `test-interop` by hand before a release, as "Definition of done" says.
+- **6. Docs and the release** -- **decided 2026-09-05: v0.3.0**, the
+  plan's own candidate; v1.0.0 waits for a soak on a real workload of
+  Max's. Landed the same day: README status and roadmap rewritten,
+  CHANGELOG's Unreleased moved under 0.3.0, `pixi.toml` at 0.3.0. **Not
+  tagged** -- tag only when told to, and read `release.yml` first.
+- **3. Soak and leak** -- **harness landed 2026-09-05; the 600 s run and
+  the valgrind pass are a TODO**, by Max's call, and the first thing before
+  v1.0. `integration/soak.mojo`, `pixi run soak [seconds] [round] [paths]`
+  and `pixi run soak-build`; `Producer.queue_length()` over the
+  already-bound `rd_kafka_outq_len`. Every path passes at 30 s per path
+  with rounds of 5000, every record checked against its key. What was
+  learned, so the TODO does not restart from zero:
+  - **A fresh `MockCluster` per round, not per path**, because the mock
+    keeps every record in this process and one cluster for 600 s grows RSS
+    with no leak anywhere.
+  - **The consume paths use `assign()`**; a group join costs ~3 s on the
+    mock and would dominate a round. Only the transaction loop subscribes,
+    because `send_offsets_to_transaction` needs group metadata -- and it
+    must not poll-until-assigned first: the poll that completes the join
+    can return the first record, and the first draft threw it away and
+    came up exactly one short every round.
+  - **RSS grows without a leak.** With glibc's default arena policy the
+    `poll` path went 42 -> 65 MB peak over 300 s and plateaued, current
+    RSS still creeping at 400 s. With `MALLOC_ARENA_MAX=1` the same path
+    is flat within 2 MB over 120 s; pinning librdkafka in memory (it is
+    unloaded and reloaded per round otherwise) changed nothing. So it is
+    per-thread arena churn from starting ~10 librdkafka threads per round
+    -- the harness's shape, not the client's -- and the harness now calls
+    `mallopt(M_ARENA_MAX, 1)` itself at startup. A leak is unaffected by
+    the cap and would still show.
+  - **Valgrind: the conda-forge build cannot run here.** `pixi exec -s
+    valgrind` installs it without sudo, but it fails at startup because the
+    host's `ld-linux-x86-64.so.2` is stripped and `libc6-dbg` needs apt.
+    The route that was set up and not finished is a container:
+    `docker run --rm -v <repo>:<repo> -v <scratch>:<scratch> -e
+    LD_LIBRARY_PATH=<repo>/.pixi/envs/default/lib ubuntu:22.04` (the host
+    is 22.04, so glibc matches), `apt-get install valgrind libc6-dbg`, then
+    `valgrind --leak-check=full --error-exitcode=1 <scratch>/soak 20 2000`
+    on a binary from `pixi run soak-build` copied into the scratch mount.
+    The repo must be mounted at its own absolute path because the binary's
+    RUNPATH is absolute. Only "definitely lost" counts.
 
 ### Candidates, none started
 
@@ -1595,8 +1640,16 @@ None outstanding.
 
 ### Known coverage gaps
 
-**None outstanding.** Both entries that once stood here are closed, and the
-way they closed is the part worth carrying forward:
+**One outstanding, and it is a TODO rather than a defect: the soak has not
+run for 600 s and valgrind has not run at all.** The harness exists and
+passes at 30 s per path; the plan's "done when" for item 3 is the 600 s run
+of every path under the RSS rule and a valgrind pass with no "definitely
+lost" blocks, both recorded here with a date. See item 3 under "Status" in
+"The last quarter" for the arena finding and the valgrind-in-a-container
+route, so it does not restart from zero.
+
+Both entries that once stood here before it are closed, and the way they
+closed is the part worth carrying forward:
 
 - When a guard cannot be tested, the fix is usually to **remove the need for
   it**, not to write a test that passes either way. That is what happened to

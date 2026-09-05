@@ -470,20 +470,33 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the longer write-up on FF
 
 ## Status
 
-**Alpha, and honest about it.** `v0.2.0` targets **Mojo 1.0**. The FFI layer
-loads real `librdkafka` symbols, and CI builds the package, builds every
-example, and runs smoke plus full integration tests on Linux **and** macOS —
-the integration suite uses librdkafka's in-process mock broker, so it needs no
-Docker.
+**Release candidate.** `v0.3.0` targets **Mojo 1.0**. The FFI layer loads
+real `librdkafka` symbols, and CI builds the package, builds every example,
+and runs lint, the smoke suite and the full mock-broker integration suite on
+Linux **and** macOS — the mock is in-process, so CI needs no Docker.
 
-Two further suites run against a real `apache/kafka:3.7.0` in Docker: one for
-the Topic Admin API, which the mock does not implement, and one that produces
-with this client and consumes with `confluent-kafka` in both directions. A
-four-peer consume benchmark (C, `rust-rdkafka`, this package,
-`confluent-kafka`) lives beside them. All are **local** — Docker is a local
-tool in this project, not a CI dependency. See
+Three more things run **locally only**, against a real `apache/kafka:3.7.0`
+in Docker: the broker suite (Topic Admin API, `offsets_for_times`, real
+consumer-group behaviour, transactional offsets, and SASL/PLAIN through a
+second listener), the interop suite that produces with this client and
+consumes with `confluent-kafka` in both directions, and the four-peer
+consume benchmark. Docker is a local tool in this project, not a CI
+dependency — a decision recorded, not an accident. See
 [`integration/README.md`](integration/README.md) and
 [`benchmarks/README.md`](benchmarks/README.md).
+
+**Verified on 2026-09-05**, the day `v0.3.0` was cut: lint, smoke (30
+cases), mock (45), broker (11) and interop all green, on Linux.
+
+**Soaked**: partially. `pixi run soak` runs every consume path, produce with
+headers and a read-process-write transaction loop against a fresh mock
+cluster per round, checking every record against its key and watching RSS.
+Every path passes at 30 s per path, and the `poll` path is flat to within
+2 MB over 120 s once glibc's per-thread malloc arenas are capped (the
+harness does that itself; the growth without the cap is arena churn from
+starting clients per round, not a client leak). The 600 s run of every path
+and a valgrind pass have **not** been done yet; they are the first thing
+before `v1.0`.
 
 Testing your own Kafka code is a supported use case:
 
@@ -495,10 +508,6 @@ cluster.create_topic("events")
 # point ProducerConfig / ConsumerConfig at cluster.bootstrap_servers()
 _ = cluster^
 ```
-
-What changed since `v0.1.0` is worth reading before you upgrade — `v0.1.0`
-transposed the key and value of every message it produced, and both
-`AdminClient` methods crashed. See the [CHANGELOG](CHANGELOG.md).
 
 Known limitations today:
 
@@ -522,9 +531,12 @@ Known limitations today:
   to `drain_timeout_ms` (5 s by default) while they time out, and swallows
   their failures. Call `flush()` first to see the verdict and to choose the
   wait.
+- SSL against a real broker is configured through `set()` like everything
+  else but is not exercised by any suite here; SASL/PLAIN is.
 
-Use it in spikes and prototypes today. Wait for `v1.0` before betting a
-production pipeline.
+Use it in spikes, prototypes and workloads you can watch. `v1.0` follows a
+600 s soak of every path, a clean valgrind pass, and a soak on a real
+workload.
 
 ## Roadmap
 
@@ -533,62 +545,26 @@ honour and the peer the interop suite runs against, but matching it
 feature-for-feature is not the goal — much of its surface is administrative work
 people do from a CLI or Terraform.
 
-- **Landed, unreleased** — `Message.key` / `.value` as optional bytes rather
-  than `String`. This was previously filed at v0.5 as a zero-copy performance
-  item; it is a **correctness** fix — without it tombstones could not be
-  written and an empty-but-present key was unreachable — so it came first, and
-  the performance win is incidental. Also: each `librdkafka` symbol is
-  resolved once at load rather than per call. Also: producing goes through
-  `rd_kafka_produceva`, which retired the per-topic handle cache and unblocked
-  record **headers**, now carried on both sides, plus an explicit `partition`
-  on `produce()`. Also: both clients are now **thread-safe** — the producer's
-  sequence counter is atomic and its delivery-failure list is locked, and the
-  consumer's `close()` is compare-exchanged, which closed a reachable
-  deadlock. Both are verified by tests that drive eight real threads. Also: `produce()` returns a sequence token and
-  `Producer.failures()` reports every rejection against it, so a message's
-  verdict is addressable rather than a count plus the first failure string.
-  Also: a typed `KafkaErrorKind`, so queue-full backpressure can be handled
-  programmatically rather than by matching on error text. Also: the
-  **consumer control plane** — `assign()`, `seek()`, `position()`,
-  `committed()`, `pause()` / `resume()`, watermark offsets,
-  `Message.timestamp` and `offsets_for_times()`, plus `poll_event()`, which
-  tells end-of-partition apart from a poll timeout. That unblocks replay, lag
-  measurement, event-time processing and bounded drains, none of which were
-  reachable before. Also: **rebalance callbacks** —
-  `subscribe(topics, on_assign=, on_revoke=, on_lost=)`, matching
-  `confluent-kafka`'s signature — built on a real C function pointer via
-  Mojo 1.0's `abi("C")` effect. Also: `produce(timestamp=)`, completing the
-  event-time pair with `Message.timestamp`. Also: delivery reports moved from
-  librdkafka's event queue to a `dr_msg_cb`, so both callback paths in the
-  package now work the same way. Also: **transactions on the producer side** —
-  `init_transactions()` / `begin_transaction()` / `commit_transaction()` /
-  `abort_transaction()`, which return `Optional[KafkaError]` rather than
-  raising, because Mojo 1.0's `Error` is text and would discard the fatal /
-  retriable / abortable flags a transactional caller has to branch on.
-  `KafkaError.txn_action()` reduces those to the three-way decision, in
-  librdkafka's order — abort before fatal. Also: **batch and zero-copy
-  consume** — `consume(n)` returns a run of records from one FFI crossing, and
-  `consume_borrowed(n)` lends `Span`s straight into librdkafka's buffer with
-  the lifetime compiler-enforced, reaching **85-87% of C driven directly**
-  and ~2x `rust-rdkafka`'s `BorrowedMessage` (see `benchmarks/`). Also:
-  `send_offsets_to_transaction()` with `Consumer.consumer_group_metadata()`,
-  which completes **read-process-write** exactly-once: the consumer's offsets
-  commit inside the producer's transaction, so a failed transaction replays
-  the input rather than skipping it.
-- **v0.4** — open. Everything previously planned here has landed: batch
-  `consume(n)`, transactions end to end, and a zero-copy `consume_borrowed(n)`
-  that reaches 85-87% of C driven directly. The consume path was then
-  measured against four peers — C, `rust-rdkafka`, `confluent-kafka` and
-  itself — and rebuilt where the numbers said to: `consume()` is 1.7x faster,
-  `consume(headers=False)` skips a librdkafka call that costs ~117ns a record,
-  and `consume_borrowed()` no longer pays ~19µs of symbol resolution per
-  call. Since then `consume_events()` has taken another ~66-112ns a record
-  by constructing its entries in place, and `poll()` / `poll_event()` have
-  gained the same `headers=False` escape hatch, worth ~75-212ns.
-  Suggestions welcome in the issue tracker.
-- **v1.0** — API stable and production-ready. Not feature parity with
-  `confluent-kafka-python`: deliberately no ACL / consumer-group / alter-config
-  admin surface, and Schema Registry belongs in a second package.
+- **v0.3.0** — everything that was "landed, unreleased" since `v0.2.0`,
+  plus the operational hardening a production job needs: `Message.key` /
+  `.value` as optional bytes; every symbol resolved once; `produceva` with
+  record headers, explicit partitions and timestamps; both clients
+  thread-safe; per-message delivery reports and a typed `KafkaErrorKind`;
+  the consumer control plane; rebalance callbacks over a real C function
+  pointer; transactions end to end including read-process-write; batch
+  `consume(n)` and zero-copy `consume_borrowed(n)` at 85-87% of C; and, new
+  in this release, `errors()` / `fatal_error()` / `latest_stats()` /
+  `logs()` on both clients, explicit `commit(offsets)`, `store_offsets()`,
+  `assignment()` / `subscription()`, `drain_timeout_ms`,
+  `builtin_features()`, SSL reached at construction, SASL/PLAIN proven
+  against a real broker, and the soak harness. The [CHANGELOG](CHANGELOG.md)
+  has the reasoning behind each.
+- **v1.0** — API stable and production-ready. What stands between here and
+  there is operational, not features: the 600 s soak of every path, a
+  valgrind pass, and a soak on a real workload. Not feature parity with
+  `confluent-kafka-python`: deliberately no ACL / consumer-group /
+  alter-config admin surface, and Schema Registry belongs in a second
+  package.
 
 Feature requests go in the [issue tracker](https://github.com/dvirarad/mojo-kafka/issues). Comment with a 👍 to vote.
 

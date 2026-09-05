@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] — 2026-09-05
+
 ### Added
 - **Observability on both clients: `errors()` / `take_errors()` /
   `dropped_errors()`, `fatal_error()`, `latest_stats()`, and `logs()` /
@@ -55,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password surfaces in `errors()` as `KIND_AUTHORIZATION`. README gains a
   "Security" section. SSL against a real broker needs certificate
   generation in compose and is deliberately not set up.
+
+- **A soak harness**, `integration/soak.mojo` and `pixi run soak`: every
+  consume path, produce with three headers and a read-process-write
+  transaction loop, each for a given number of seconds, in rounds of a fixed
+  record count against a fresh mock cluster per round, every record checked
+  against its key, peak and current RSS sampled every 10 s. It caps glibc's
+  malloc arenas itself, because the thread churn of starting clients per
+  round otherwise grows RSS for minutes with no leak anywhere — measured,
+  and written up in CLAUDE.md. `Producer.queue_length()` over
+  `rd_kafka_outq_len` is printed beside RSS. Every path passes at 30 s per
+  path; the 600 s run and a valgrind pass are still to do before `v1.0`.
 
 - **`Consumer.poll(headers=False)` / `Consumer.poll_event(headers=False)`**
   skip the `rd_kafka_message_headers` crossing, the same escape hatch
@@ -851,6 +866,7 @@ Initial public alpha.
 > **Do not use `v0.1.0`.** It transposes the key and value of every message it
 > produces, and both `AdminClient` methods crash. See `0.2.0` above.
 
-[Unreleased]: https://github.com/dvirarad/mojo-kafka/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dvirarad/mojo-kafka/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dvirarad/mojo-kafka/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dvirarad/mojo-kafka/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dvirarad/mojo-kafka/releases/tag/v0.1.0
