@@ -341,7 +341,7 @@ read from yours.
 | `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once; `errors()` / `fatal_error()` / `latest_stats()` / `logs()` for what librdkafka's threads reported |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads, `consume(n, headers=False)` to skip the headers crossing, `reached_end()` to detect end-of-partition; `consume_borrowed(n)` for zero-copy reads; `errors()` / `fatal_error()` / `latest_stats()` / `logs()` as on the producer |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; `commit(offsets)` for explicit offsets and `store_offsets()` with `enable_auto_offset_store=False` for commit-what-you-finished; `subscription()` / `assignment()` for what the member holds; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads, `consume(n, headers=False)` to skip the headers crossing, `reached_end()` to detect end-of-partition; `consume_borrowed(n)` for zero-copy reads; `errors()` / `fatal_error()` / `latest_stats()` / `logs()` as on the producer |
 | `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
 | `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
 | `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
@@ -483,8 +483,9 @@ Known limitations today:
   consumer split a single assignment's records between them. Use one consumer
   per thread, or more members in the group.
 - Dropping a `Producer` that still holds undeliverable messages blocks for up
-  to 5s while they time out, and swallows their failures. Call `flush()`
-  first to see the verdict and to choose the wait.
+  to `drain_timeout_ms` (5 s by default) while they time out, and swallows
+  their failures. Call `flush()` first to see the verdict and to choose the
+  wait.
 
 Use it in spikes and prototypes today. Wait for `v1.0` before betting a
 production pipeline.

@@ -35,6 +35,7 @@ from kafka import (
     Rebalance,
     OFFSET_END,
     OFFSET_INVALID,
+    OFFSET_STORED,
     TIMESTAMP_CREATE_TIME,
     TXN_ABORT,
     TXN_FATAL,
@@ -2515,6 +2516,225 @@ def test_consume_reports_reaching_the_end_of_a_partition() raises:
     )
     consumer.close()
     print("    consume() reported end-of-partition through reached_end()")
+    _ = cluster^
+
+
+def test_commit_takes_explicit_offsets() raises:
+    """`commit(offsets)` commits what it is given, not the position.
+
+    The position is deliberately somewhere else -- six records read, three
+    committed -- so an implementation that ignored its argument and
+    committed the position would fail on the number. Both the synchronous
+    and the asynchronous forms are driven; the asynchronous verdict is
+    served through the poll path, so that half polls until the broker
+    agrees rather than asserting immediately.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("explicit-commit", partition_count=1)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(10):
+        _ = producer.produce(topic="explicit-commit", value="e-" + String(i))
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="explicit-commit-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+    )
+    var only: List[TopicPartition] = [
+        TopicPartition("explicit-commit", 0, OFFSET_BEGINNING)
+    ]
+    consumer.assign(only)
+    assert_equal(len(_drain(consumer, 6)), 6)
+    assert_equal(consumer.position(only)[0].offset, Int64(6))
+
+    consumer.commit([TopicPartition("explicit-commit", 0, 3)])
+    var stored = consumer.committed(only)
+    assert_equal(len(stored), 1)
+    assert_equal(stored[0].partition, Int32(0))
+    assert_equal(stored[0].offset, Int64(3), "sync commit ignored its offsets")
+    assert_equal(
+        consumer.position(only)[0].offset,
+        Int64(6),
+        "an explicit commit moved the position",
+    )
+
+    consumer.commit(
+        [TopicPartition("explicit-commit", 0, 5)], asynchronous=True
+    )
+    var deadline = perf_counter_ns() + 5_000_000_000
+    var landed = consumer.committed(only)[0].offset
+    while landed != 5 and perf_counter_ns() < deadline:
+        _ = consumer.poll(100)
+        landed = consumer.committed(only)[0].offset
+    assert_equal(landed, Int64(5), "async commit never landed")
+    assert_equal(consumer.position(only)[0].offset, Int64(6))
+
+    consumer.close()
+    print("    committed 3 then 5 while the position stayed at 6")
+    _ = cluster^
+
+
+def test_store_offsets_then_commit_commits_the_stored_value() raises:
+    """`store_offsets()` decides what `commit()` sends; the position does not.
+
+    Eight records are read and offset 2 is stored, so a commit that sent
+    the position would commit 8 and fail on the number. Two refusals are
+    asserted alongside, because both are silent in the wrong direction:
+    with `enable_auto_offset_store` left on librdkafka rejects the whole
+    call, and a partition that is not assigned comes back as a
+    per-partition error that `store_offsets()` has to raise or lose.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("stored", partition_count=2)
+
+    var producer = Producer(ProducerConfig(bootstrap_servers=bootstrap))
+    for i in range(10):
+        _ = producer.produce(
+            topic="stored", value="s-" + String(i), partition=0
+        )
+    producer.flush(10000)
+
+    var consumer = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="stored-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+            enable_auto_offset_store=False,
+        )
+    )
+    var only: List[TopicPartition] = [
+        TopicPartition("stored", 0, OFFSET_BEGINNING)
+    ]
+    consumer.assign(only)
+    assert_equal(len(_drain(consumer, 8)), 8)
+    assert_equal(consumer.position(only)[0].offset, Int64(8))
+
+    consumer.store_offsets([TopicPartition("stored", 0, 2)])
+    consumer.commit()
+    assert_equal(
+        consumer.committed(only)[0].offset,
+        Int64(2),
+        "commit() sent the position, not the stored offset",
+    )
+
+    # Partition 1 is not assigned: a per-partition error, raised.
+    var raised = False
+    try:
+        consumer.store_offsets(
+            [TopicPartition("stored", 0, 4), TopicPartition("stored", 1, 4)]
+        )
+    except e:
+        raised = True
+        assert_true(
+            String(e).find("stored[1]") >= 0,
+            "the error does not name the partition: " + String(e),
+        )
+    assert_true(raised, "storing for an unassigned partition succeeded")
+    consumer.close()
+
+    # With auto store on, the call is rejected outright.
+    var automatic = Consumer(
+        ConsumerConfig(
+            bootstrap_servers=bootstrap,
+            group_id="stored-auto-group",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+    )
+    automatic.assign(only)
+    raised = False
+    try:
+        automatic.store_offsets([TopicPartition("stored", 0, 1)])
+    except:
+        raised = True
+    assert_true(raised, "store_offsets() accepted with auto store on")
+    automatic.close()
+
+    print("    stored 2, committed 2, position 8; both refusals raised")
+    _ = cluster^
+
+
+def test_subscription_and_assignment_report_the_group_membership() raises:
+    """`subscription()` names the topics; `assignment()` the partitions held.
+
+    Two topics of three partitions each, so the assignment has six entries
+    and a wrong `rd_kafka_topic_partition_t` stride returns *something*
+    for each -- which is why every entry is checked to be the partition it
+    claims, in order within its topic, as `test_position_walks_every_
+    partition` does. Both lists are asserted empty before `subscribe()`
+    and after `close()` is not asked, because the group has to form first
+    and a job that reads `assignment()` straight after `subscribe()` gets
+    nothing -- the test polls until it does not.
+    """
+    var cluster = MockCluster()
+    var bootstrap = cluster.bootstrap_servers()
+    cluster.create_topic("member-a", partition_count=3)
+    cluster.create_topic("member-b", partition_count=3)
+
+    var consumer = Consumer(
+        ConsumerConfig(bootstrap_servers=bootstrap, group_id="member-group")
+    )
+    assert_equal(len(consumer.subscription()), 0)
+    assert_equal(len(consumer.assignment()), 0)
+
+    consumer.subscribe(["member-a", "member-b"])
+    var names = consumer.subscription()
+    assert_equal(len(names), 2, "subscription() lost a topic")
+    var saw_a = False
+    var saw_b = False
+    for entry in names:
+        assert_equal(entry.partition, Int32(-1), "a subscription names topics")
+        if entry.topic == "member-a":
+            saw_a = True
+        if entry.topic == "member-b":
+            saw_b = True
+    assert_true(saw_a and saw_b, "subscription() named the wrong topics")
+
+    var held = consumer.assignment()
+    var attempts = 0
+    while len(held) < 6 and attempts < 60:
+        attempts += 1
+        _ = consumer.poll(500)
+        held = consumer.assignment()
+    assert_equal(len(held), 6, "the group never assigned both topics")
+
+    var next_a = 0
+    var next_b = 0
+    for entry in held:
+        if entry.topic == "member-a":
+            assert_equal(
+                entry.partition, Int32(next_a), "member-a out of order"
+            )
+            next_a += 1
+        elif entry.topic == "member-b":
+            assert_equal(
+                entry.partition, Int32(next_b), "member-b out of order"
+            )
+            next_b += 1
+        else:
+            raise Error("assigned a topic never subscribed: " + entry.topic)
+        # A group assignment is made at OFFSET_STORED -- "start from the
+        # committed offset" -- and `assignment()` reports the offset the
+        # assignment was made with, not the position. -1001 here would mean
+        # the decode read the wrong field.
+        assert_equal(
+            entry.offset,
+            OFFSET_STORED,
+            "a group assignment is made at the stored offset",
+        )
+    assert_equal(next_a, 3)
+    assert_equal(next_b, 3)
+
+    consumer.close()
+    print("    subscription named 2 topics; assignment walked 3 + 3 partitions")
     _ = cluster^
 
 

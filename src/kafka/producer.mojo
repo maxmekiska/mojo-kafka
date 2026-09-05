@@ -293,9 +293,13 @@ struct Producer:
     # `last_error_kind()`, which cannot attribute a kind to a caller once
     # more than one thread is producing.
     var _last_error_kind: Atomic[DType.int32]
+    # How long `__deinit__` waits for in-flight messages. From the config,
+    # because the destructor has no argument list to take it on.
+    var _drain_timeout_ms: Int32
 
     def __init__(out self, cfg: ProducerConfig) raises:
         self._lib = Lib()
+        self._drain_timeout_ms = Int32(cfg.drain_timeout_ms)
 
         var state = List[_DrState](capacity=1)
         state.append(_DrState())
@@ -340,16 +344,17 @@ struct Producer:
         # Destructors cannot raise, and there is nothing useful to do with a
         # teardown failure anyway -- the process is already letting go.
         #
-        # The drain below is a **blocking 5s worst case**: dropping a producer
-        # that still holds undeliverable messages waits for them to time out,
-        # and their failures are then swallowed rather than raised. Call
-        # `flush()` before dropping to see the verdict and to choose the wait.
-        # The alternative -- a shorter deadline here -- would silently discard
-        # messages that were still in flight, which is the worse default for a
-        # client whose whole point is that delivery is verified.
+        # The drain below is a **blocking worst case of `drain_timeout_ms`**,
+        # 5s by default: dropping a producer that still holds undeliverable
+        # messages waits for them to time out, and their failures are then
+        # swallowed rather than raised. Call `flush()` before dropping to see
+        # the verdict and to choose the wait. A shorter default would
+        # silently discard messages that were still in flight, which is the
+        # worse default for a client whose whole point is that delivery is
+        # verified -- so the knob is on the config, and the default stays.
         if self._rk != 0:
             try:
-                _ = self._drain_until_empty(5000)
+                _ = self._drain_until_empty(self._drain_timeout_ms)
                 self._lib.destroy(self._rk)
             except:
                 pass

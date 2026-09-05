@@ -66,6 +66,7 @@ struct ProducerConfig(Copyable, Movable):
     var acks: String
     var statistics_interval_ms: Int
     var capture_logs: Bool
+    var drain_timeout_ms: Int
     var extra: Dict[String, String]
 
     def __init__(
@@ -77,12 +78,20 @@ struct ProducerConfig(Copyable, Movable):
         acks: String = "all",
         statistics_interval_ms: Int = 0,
         capture_logs: Bool = False,
+        drain_timeout_ms: Int = 5000,
     ):
         """`statistics_interval_ms` is how often `Producer.latest_stats()`
         is refreshed, and 0 -- the default -- never. `capture_logs` retains
         librdkafka's log lines for `Producer.logs()`; it is off by default
         because it forces `log.queue=true`, which stops librdkafka logging
         to stderr on its own and makes the lines the caller's to read.
+
+        `drain_timeout_ms` bounds how long **dropping** the producer waits
+        for messages still in flight -- not a librdkafka key, but the
+        argument the destructor's flush is made with. The default keeps
+        the 5 s the destructor always waited; lower it for a job that would
+        rather exit than wait, and `flush()` first if the verdict matters,
+        because the destructor cannot raise it.
         """
         self.bootstrap_servers = bootstrap_servers
         self.client_id = client_id
@@ -91,6 +100,7 @@ struct ProducerConfig(Copyable, Movable):
         self.acks = acks
         self.statistics_interval_ms = statistics_interval_ms
         self.capture_logs = capture_logs
+        self.drain_timeout_ms = drain_timeout_ms
         self.extra = Dict[String, String]()
 
     def set(mut self, key: String, value: String):
@@ -123,6 +133,7 @@ struct ConsumerConfig(Copyable, Movable):
     var client_id: String
     var auto_offset_reset: String
     var enable_auto_commit: Bool
+    var enable_auto_offset_store: Bool
     var enable_partition_eof: Bool
     var statistics_interval_ms: Int
     var capture_logs: Bool
@@ -135,6 +146,7 @@ struct ConsumerConfig(Copyable, Movable):
         client_id: String = "mojo-kafka",
         auto_offset_reset: String = "latest",
         enable_auto_commit: Bool = True,
+        enable_auto_offset_store: Bool = True,
         enable_partition_eof: Bool = False,
         statistics_interval_ms: Int = 0,
         capture_logs: Bool = False,
@@ -147,6 +159,14 @@ struct ConsumerConfig(Copyable, Movable):
         A tail-following job wants it off -- it would otherwise get an EOF
         mark every time it caught up with the log.
 
+        `enable_auto_offset_store` defaults to `True`, matching librdkafka:
+        every record `poll()` hands back is marked as consumed, and the next
+        commit -- automatic or `commit()` -- commits the position. Set it
+        `False` to take that over with `Consumer.store_offsets()`, which is
+        how a job commits only what it has finished processing rather than
+        everything it has fetched. librdkafka rejects `store_offsets()`
+        outright while this is `True`.
+
         `statistics_interval_ms` and `capture_logs` are as on
         `ProducerConfig`: the first refreshes `Consumer.latest_stats()` and
         0 never does; the second retains log lines for `Consumer.logs()` at
@@ -157,6 +177,7 @@ struct ConsumerConfig(Copyable, Movable):
         self.client_id = client_id
         self.auto_offset_reset = auto_offset_reset
         self.enable_auto_commit = enable_auto_commit
+        self.enable_auto_offset_store = enable_auto_offset_store
         self.enable_partition_eof = enable_partition_eof
         self.statistics_interval_ms = statistics_interval_ms
         self.capture_logs = capture_logs
@@ -175,6 +196,12 @@ struct ConsumerConfig(Copyable, Movable):
             (
                 "enable.auto.commit",
                 String("true") if self.enable_auto_commit else String("false"),
+            ),
+            (
+                "enable.auto.offset.store",
+                String("true") if self.enable_auto_offset_store else String(
+                    "false"
+                ),
             ),
             (
                 "enable.partition.eof",

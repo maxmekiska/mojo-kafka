@@ -1500,7 +1500,25 @@ written; a decision recorded on items 5 and 6; all four gates green plus
 
 - **1. Observability** -- landed 2026-09-05. See "Observability" under
   "Already built" for what not to undo.
-- 2-6 -- not started.
+- **2. The small API holes** -- landed 2026-09-05. Four things not to
+  undo: `commit(offsets)` and `store_offsets()` both take the **next**
+  offset to read, and their tests read `committed()` at a point where the
+  position is a different number, so an implementation that committed the
+  position fails on the number. `store_offsets()` goes through `_control`
+  and `_raise_on_partition_error`, because `rd_kafka_offsets_store` answers
+  `NO_ERROR` on *partial* success with the refusals per element -- reading
+  only the return code stores three of four partitions and reports success.
+  `assignment()` / `subscription()` are the two control-plane calls that
+  hand back a list librdkafka allocated, so `_owned_list` is the reverse of
+  `_control`'s ownership dance, written once for the same reason. And
+  `enable_auto_offset_store` defaults to `True` like librdkafka; the test
+  asserts `store_offsets()` is *refused* with it on, because with it on the
+  call silently fights the automatic store. One fact learned by the test
+  failing: **`assignment()` reports the offset each partition was assigned
+  *at*, and for a group assignment that is `OFFSET_STORED` (-1000)**, not
+  `OFFSET_INVALID` -- the first draft asserted the latter. It is not the
+  position; `position()` is.
+- 3-6 -- not started.
 
 ### Candidates, none started
 

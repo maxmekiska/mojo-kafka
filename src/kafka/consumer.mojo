@@ -1681,6 +1681,8 @@ struct Consumer:
                 self._lib.raise_if(
                     self._lib.offsets_for_times(self._rk, list, timeout_ms), op
                 )
+            elif op == "store_offsets":
+                self._lib.raise_if(self._lib.offsets_store(self._rk, list), op)
             else:
                 # `seek`, the odd one out: it hands back a
                 # `rd_kafka_error_t*` that is NULL on success -- the reversed
@@ -1865,11 +1867,131 @@ struct Consumer:
         return Watermarks(low[0], high[0])
 
     def commit(self, asynchronous: Bool = False) raises:
-        """Commit the current offsets for this consumer group."""
+        """Commit the current offsets for this consumer group.
+
+        "Current" means the **stored** offsets: with the default
+        `enable_auto_offset_store` that is the position, one past every
+        record `poll()` has handed back; with it off, whatever
+        `store_offsets()` last recorded.
+        """
         var rc = self._lib.commit(
             self._rk, 0, Int32(1) if asynchronous else Int32(0)
         )
         self._lib.raise_if(rc, "commit")
+
+    def commit(
+        self, offsets: List[TopicPartition], asynchronous: Bool = False
+    ) raises:
+        """Commit these offsets, explicitly, for this consumer's group.
+
+        **Each `offset` is the *next* record to read** -- last processed
+        plus one -- not the offset of the record just handled. That is
+        Kafka's convention for a committed offset, it is what `position()`
+        reports, and it is the same trap `send_offsets_to_transaction()`
+        has. Committing the offset of the last record processed replays
+        that record after every restart.
+
+        The partitions need not be assigned. A synchronous commit -- the
+        default -- waits for the broker's answer and raises on failure; an
+        asynchronous one returns at once and its verdict is served through
+        the poll path, so a job that never polls again never learns it.
+        Prefer synchronous at shutdown and in `on_revoke`.
+        """
+        var list = self._tpl_build(offsets)
+        var rc: Int32
+        try:
+            rc = self._lib.commit(
+                self._rk, list, Int32(1) if asynchronous else Int32(0)
+            )
+        except e:
+            self._lib.topic_partition_list_destroy(list)
+            raise e
+        self._lib.topic_partition_list_destroy(list)
+        self._lib.raise_if(rc, "commit")
+
+    def store_offsets(self, offsets: List[TopicPartition]) raises:
+        """Record what the next commit should commit, per partition.
+
+        The manual half of offset management, for a job that must not
+        commit past what it has *finished*: `poll()` may have fetched ten
+        records while the eighth is still being processed, and a commit
+        of the position would claim all ten. Store the offset you are
+        done up to, and let `commit()` -- or auto-commit -- send that.
+
+        Three librdkafka rules, and all three fail loudly here:
+
+        - **`enable_auto_offset_store=False` on the config**, or the whole
+          call is rejected -- with it on, librdkafka stores every polled
+          record itself and this would fight it.
+        - **Each `offset` is stored as given**, so pass the next record to
+          read -- last processed plus one -- exactly as `commit(offsets)`
+          takes it.
+        - **Only assigned partitions.** One that is not is a per-partition
+          error, and this raises on the first, since there is nowhere else
+          to put it -- `seek()`'s policy, for `seek()`'s reason.
+
+        Store before a `seek()`, not after; librdkafka warns that a store
+        after a seek can interfere with resuming a paused partition.
+        """
+        var done = self._control["store_offsets"](offsets)
+        self._raise_on_partition_error(done, "store_offsets")
+
+    def _owned_list[op: StaticString](self) raises -> List[TopicPartition]:
+        """Ask librdkafka for a list it allocates, decode it, destroy it.
+
+        `rd_kafka_assignment` and `rd_kafka_subscription` are the two calls
+        in the control plane that hand back a **new** list rather than
+        filling in the caller's, so the ownership dance is the reverse of
+        `_control`'s and is written once here for the same reason.
+        """
+        var list_out = Array[Int, 1](fill=0)
+        comptime if op == "assignment":
+            self._lib.raise_if(
+                self._lib.assignment(self._rk, Int(list_out.unsafe_ptr())), op
+            )
+        else:
+            self._lib.raise_if(
+                self._lib.subscription(self._rk, Int(list_out.unsafe_ptr())),
+                op,
+            )
+        var list = list_out[0]
+        if list == 0:
+            return List[TopicPartition]()
+        var out: List[TopicPartition]
+        try:
+            out = self._tpl_read(list)
+        except e:
+            self._lib.topic_partition_list_destroy(list)
+            raise e
+        self._lib.topic_partition_list_destroy(list)
+        return out^
+
+    def assignment(self) raises -> List[TopicPartition]:
+        """The partitions this consumer currently holds.
+
+        Whether they came from the group through `subscribe()` or by hand
+        through `assign()`. Empty before the first rebalance completes, and
+        empty again after a revoke -- so a job that needs to know what it
+        is reading polls until this is non-empty rather than assuming
+        `subscribe()` returned with partitions in hand.
+
+        The `offset` on each entry is the one the assignment was *made*
+        with, not where the consumer is now: `OFFSET_STORED` for a
+        partition the group handed out -- "start from the committed
+        offset" -- and whatever the caller passed for one given to
+        `assign()`. Ask `position()` for where it is.
+        """
+        return self._owned_list["assignment"]()
+
+    def subscription(self) raises -> List[TopicPartition]:
+        """The topics this consumer subscribed to, one entry each.
+
+        The names as given to `subscribe()`, with `partition` set to
+        `PARTITION_UNASSIGNED` -- a subscription names topics, and which
+        partitions of them this member holds is `assignment()`'s answer.
+        Empty for a consumer that assigned by hand.
+        """
+        return self._owned_list["subscription"]()
 
     # -- observability ------------------------------------------------------
     #

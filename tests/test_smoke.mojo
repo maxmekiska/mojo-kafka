@@ -104,6 +104,35 @@ def test_produce_accepts_an_explicit_timestamp() raises:
     print("    8-entry vu array accepted a timestamp")
 
 
+def test_drain_timeout_bounds_the_drop() raises:
+    """`drain_timeout_ms` is how long dropping a producer waits, not 5 s.
+
+    A message with a 5 s `message.timeout.ms` is enqueued at a dead port,
+    so the destructor's flush has something to wait for; with
+    `drain_timeout_ms=300` the drop must return in well under the 5 s it
+    would otherwise take. The default is asserted separately so a change
+    to it is a deliberate one.
+    """
+    assert_equal(
+        ProducerConfig(bootstrap_servers="127.0.0.1:9").drain_timeout_ms, 5000
+    )
+    var cfg = ProducerConfig(
+        bootstrap_servers="127.0.0.1:9", drain_timeout_ms=300
+    )
+    cfg.set("message.timeout.ms", "5000")
+    cfg.set("log_level", "0")
+    var started = perf_counter_ns()
+    var p = Producer(cfg)
+    _ = p.produce(topic="nowhere", value="v")
+    _ = p^
+    var took_ms = (perf_counter_ns() - started) // 1_000_000
+    assert_true(
+        took_ms < 2500,
+        "dropping took " + String(took_ms) + "ms; drain_timeout_ms ignored",
+    )
+    print("    drop returned after", took_ms, "ms with drain_timeout_ms=300")
+
+
 def test_extra_keys_recorded() raises:
     var cfg = ProducerConfig(bootstrap_servers="localhost:9092")
     cfg.set("message.max.bytes", "1000000")

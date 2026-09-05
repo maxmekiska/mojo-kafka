@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rd_kafka_set_log_queue(rk, NULL)` joins it to the main one, which is the
   call `confluent-kafka` makes too.
 
+- **The small API holes an operator hits in week one.**
+  `Consumer.commit(offsets, asynchronous=)` commits explicit offsets — the
+  *next* offset to read, as `position()` reports, the same convention
+  `send_offsets_to_transaction()` uses. `Consumer.store_offsets(offsets)`
+  over `rd_kafka_offsets_store`, with `enable_auto_offset_store` on
+  `ConsumerConfig` (default `True`, matching librdkafka), so a job can commit
+  what it has finished rather than what it has fetched; per-partition errors
+  raise on the first, as `seek()` does, since the call returns nothing.
+  `Consumer.assignment()` and `Consumer.subscription()` over the two
+  control-plane calls that hand back a caller-owned list, decoded and
+  destroyed on every path. `ProducerConfig.drain_timeout_ms` (default 5000)
+  names the wait the destructor was making with a hard-coded 5000.
+
 - **`Consumer.poll(headers=False)` / `Consumer.poll_event(headers=False)`**
   skip the `rd_kafka_message_headers` crossing, the same escape hatch
   `consume()` already had. Measured interleaved in one binary three times at

@@ -895,6 +895,9 @@ struct Lib(Movable):
     var _message_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _consumer_close: _DLCallable[Int32, ImmUntrackedOrigin]
     var _commit: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _offsets_store: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _assignment: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _subscription: _DLCallable[Int32, ImmUntrackedOrigin]
     var _assign: _DLCallable[Int32, ImmUntrackedOrigin]
     var _seek_partitions: _DLCallable[Int, ImmUntrackedOrigin]
     var _position: _DLCallable[Int32, ImmUntrackedOrigin]
@@ -1019,6 +1022,9 @@ struct Lib(Movable):
             self._box, "rd_kafka_consumer_close"
         )
         self._commit = _bind[Int32](self._box, "rd_kafka_commit")
+        self._offsets_store = _bind[Int32](self._box, "rd_kafka_offsets_store")
+        self._assignment = _bind[Int32](self._box, "rd_kafka_assignment")
+        self._subscription = _bind[Int32](self._box, "rd_kafka_subscription")
         self._assign = _bind[Int32](self._box, "rd_kafka_assign")
         # `rd_kafka_seek_partitions`, not the per-topic `rd_kafka_seek`:
         # that one is deprecated, needs a topic handle this package no
@@ -1466,6 +1472,34 @@ struct Lib(Movable):
     def commit(self, rk: Int, offsets: Int, async_: Int32) raises -> Int32:
         """Commit `offsets`, or the current assignment's when it is 0."""
         return self._commit(rk, offsets, async_)
+
+    def offsets_store(self, rk: Int, offsets: Int) raises -> Int32:
+        """`rd_kafka_offsets_store` -- set what the next commit will commit.
+
+        Requires `enable.auto.offset.store=false`, or the whole call is
+        `__INVALID_ARG`. Each element's `offset` is stored **as is** -- not
+        +1 -- and only for a partition currently assigned; the verdict per
+        partition lands in the element's `err`, with the return code
+        `NO_ERROR` on partial success and `__UNKNOWN_PARTITION` / `__STATE`
+        only when nothing could be stored.
+        """
+        return self._offsets_store(rk, offsets)
+
+    def assignment(self, rk: Int, list_out: Int) raises -> Int32:
+        """`rd_kafka_assignment` -- the partitions this consumer holds.
+
+        Writes a **newly allocated** list to `list_out`, which is the
+        caller's to destroy. Possibly empty, never NULL on success.
+        """
+        return self._assignment(rk, list_out)
+
+    def subscription(self, rk: Int, list_out: Int) raises -> Int32:
+        """`rd_kafka_subscription` -- the topics this consumer subscribed to.
+
+        Same ownership as `assignment`: a new list, the caller destroys it.
+        Entries carry the topic name with partition `RD_KAFKA_PARTITION_UA`.
+        """
+        return self._subscription(rk, list_out)
 
     # -- topic partition lists ----------------------------------------------
 
