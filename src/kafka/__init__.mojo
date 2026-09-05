@@ -22,6 +22,7 @@ from ._ffi import (
     KafkaError,
     KafkaErrorKind,
     TxnAction,
+    builtin_features,
     kind_of,
     librdkafka_version,
 )

@@ -739,7 +739,7 @@ def _bind[
     97-110 ns to 54-56 ns.
 
     Those 45-55 ns are a **warm** figure: one symbol looked up over and over,
-    with the loader's caches hot. Resolving 76 *distinct* symbols cold, which
+    with the loader's caches hot. Resolving 86 *distinct* symbols cold, which
     is what `Lib.__init__` does, measures ~260-400 ns each -- so a `Lib`
     costs ~20 us to construct against ~850 ns for the `dlopen` alone. Both
     numbers are real and neither supersedes the other; the cold one is why
@@ -778,7 +778,7 @@ struct _Freer(Movable):
     """Just enough of `Lib` to free a message: one symbol, one handle.
 
     `MessageBatch` holds one of these rather than a whole `Lib`, and the
-    difference is not small. `Lib.__init__` resolves 76 symbols, and a
+    difference is not small. `Lib.__init__` resolves 86 symbols, and a
     a cold `dlsym` here measures ~260-400 ns -- not the 45-55 ns `_bind`
     records, which is a warm per-call figure for one symbol -- so a `Lib`
     costs ~20 us to build against ~850 ns for the `dlopen` alone. `consume_borrowed()` built one **per
@@ -862,6 +862,7 @@ struct Lib(Movable):
     var _conf_new: _DLCallable[Int, ImmUntrackedOrigin]
     var _conf_destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _conf_set: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _conf_get: _DLCallable[Int32, ImmUntrackedOrigin]
     var _new: _DLCallable[Int, ImmUntrackedOrigin]
     var _destroy: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _outq_len: _DLCallable[Int32, ImmUntrackedOrigin]
@@ -953,6 +954,7 @@ struct Lib(Movable):
         self._conf_new = _bind[Int](self._box, "rd_kafka_conf_new")
         self._conf_destroy = _bind[NoneType](self._box, "rd_kafka_conf_destroy")
         self._conf_set = _bind[Int32](self._box, "rd_kafka_conf_set")
+        self._conf_get = _bind[Int32](self._box, "rd_kafka_conf_get")
         self._new = _bind[Int](self._box, "rd_kafka_new")
         self._destroy = _bind[NoneType](self._box, "rd_kafka_destroy")
         self._outq_len = _bind[Int32](self._box, "rd_kafka_outq_len")
@@ -1179,6 +1181,33 @@ struct Lib(Movable):
         if rc != 0:
             var msg = cstr(Int(errbuf.unsafe_ptr()))
             raise Error("rd_kafka_conf_set(" + name + "=" + value + "): " + msg)
+
+    def conf_get(self, conf: Int, name: String) raises -> String:
+        """Read one property back off a conf. Raises for an unknown name.
+
+        Two calls, as librdkafka documents: the first with a NULL buffer
+        asks for the length, the second fills a buffer of exactly that
+        size. `*dest_size` is the full length **including** the NUL, so
+        the buffer is sized to it and decoded straight after the call.
+        """
+        var name_c = _c_string(name)
+        var size = Array[Int, 1](fill=0)
+        var rc = self._conf_get(
+            conf, name_c.unsafe_ptr(), 0, Int(size.unsafe_ptr())
+        )
+        if rc != 0:
+            _ = name_c^
+            raise Error("rd_kafka_conf_get(" + name + "): unknown property")
+        var buf = List[UInt8](length=size[0] + 1, fill=0)
+        rc = self._conf_get(
+            conf, name_c.unsafe_ptr(), buf.unsafe_ptr(), Int(size.unsafe_ptr())
+        )
+        var value = cstr(Int(buf.unsafe_ptr())) if rc == 0 else String("")
+        _ = name_c^
+        _ = buf^
+        if rc != 0:
+            raise Error("rd_kafka_conf_get(" + name + "): unknown property")
+        return value
 
     # -- rd_kafka_t ---------------------------------------------------------
 
@@ -1915,3 +1944,27 @@ struct Lib(Movable):
 def librdkafka_version() raises -> String:
     """Version string of the librdkafka this process loaded."""
     return Lib().version()
+
+
+def builtin_features() raises -> String:
+    """What the loaded librdkafka was built with, as its `builtin.features`.
+
+    A comma-separated list -- on a full build something like
+    `gzip,snappy,ssl,sasl,regex,lz4,sasl_gssapi,sasl_plain,sasl_scram,
+    plugins,zstd,sasl_oauthbearer,http,oidc`. **Check it before the first
+    production connect**: a librdkafka built without `ssl` or the SASL
+    mechanism you need accepts `security.protocol=SASL_SSL` at configuration
+    time and fails only when it tries to connect. The smoke suite asserts
+    `ssl` and `sasl_scram` are present so the conda build cannot regress
+    quietly.
+    """
+    var lib = Lib()
+    var conf = lib.conf_new()
+    var features: String
+    try:
+        features = lib.conf_get(conf, "builtin.features")
+    except e:
+        lib.conf_destroy(conf)
+        raise e
+    lib.conf_destroy(conf)
+    return features

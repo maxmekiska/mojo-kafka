@@ -69,6 +69,17 @@ against a real broker — and that call was a segfault as recently as `v0.1.0`.
 The broker suite also covers metadata propagation timing, which the mock
 resolves instantly and a real cluster does not.
 
+The compose file opens **two listeners**: 9092 plaintext, which every
+existing test uses, and 9093 `SASL_PLAINTEXT` / `PLAIN` with user `mojo` and
+password `mojo-secret`, for the two SASL cases. Point those elsewhere with
+`MOJO_KAFKA_SASL_BOOTSTRAP=host:9093`. Setting any `KAFKA_*` variable makes
+the `apache/kafka` image discard its default `server.properties`, so the
+compose file carries the whole single-node KRaft configuration; the SASL
+listener is named `SASLPLAIN` because the image maps `_` in a variable name
+to `.`, and a listener name containing an underscore would need the
+double-underscore escape. SSL against a real broker needs certificate
+generation and is not set up here.
+
 ## Interop suite — against `confluent-kafka`
 
 ```bash

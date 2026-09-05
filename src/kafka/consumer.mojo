@@ -683,7 +683,7 @@ struct MessageBatch(Sized):
     """
 
     # A `_Freer`, not a `Lib`: this type only ever frees, and resolving the
-    # other 75 symbols cost ~26us on every `consume_borrowed()` call. See
+    # other 85 symbols cost ~26us on every `consume_borrowed()` call. See
     # `_Freer`.
     var _lib: _Freer
     var _lent: List[_Lent]

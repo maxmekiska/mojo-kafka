@@ -29,6 +29,7 @@ from std.testing import TestSuite, assert_equal, assert_true
 from std.time import perf_counter_ns, sleep
 
 from kafka import (
+    KIND_AUTHORIZATION,
     OFFSET_BEGINNING,
     OFFSET_END,
     OFFSET_INVALID,
@@ -37,6 +38,7 @@ from kafka import (
     AdminClient,
     Consumer,
     ConsumerConfig,
+    Message,
     Producer,
     ProducerConfig,
     TopicPartition,
@@ -46,6 +48,27 @@ from kafka import (
 def bootstrap() -> String:
     var override = getenv("MOJO_KAFKA_BOOTSTRAP")
     return override if override != "" else String("localhost:9092")
+
+
+def sasl_bootstrap() -> String:
+    """The SASL_PLAINTEXT listener compose opens on 9093."""
+    var override = getenv("MOJO_KAFKA_SASL_BOOTSTRAP")
+    return override if override != "" else String("localhost:9093")
+
+
+def sasl_keys(password: String) -> List[Tuple[String, String]]:
+    """The four keys a SASL/PLAIN client needs, all through `set()`.
+
+    Not a test case. The mechanism and user match the listener in
+    `docker-compose.yml`; the password is the caller's so a wrong one can
+    be tried.
+    """
+    return [
+        ("security.protocol", String("SASL_PLAINTEXT")),
+        ("sasl.mechanism", String("PLAIN")),
+        ("sasl.username", String("mojo")),
+        ("sasl.password", password),
+    ]
 
 
 def unique_topic() -> String:
@@ -597,6 +620,93 @@ def test_transactional_offsets_are_visible_to_the_group() raises:
     )
     consumer.close()
     print("    committed: group advanced to 3, so the input is not replayed")
+
+
+def test_sasl_plain_round_trip() raises:
+    """One record produced and consumed through the SASL/PLAIN listener.
+
+    librdkafka does all of SASL; what this proves is that the conda build
+    has it compiled in and that the four keys reach it through `set()`
+    unchanged. The topic is created over the plaintext listener because
+    the admin client is not what is under test. PLAIN is enough to prove
+    the plumbing; SCRAM would need credentials created on the broker with
+    `kafka-configs.sh` and buys nothing this does not.
+    """
+    var topic = unique_topic()
+    var admin = AdminClient(bootstrap_servers=bootstrap())
+    admin.create_topic(topic, num_partitions=1, replication_factor=1)
+    _ = wait_for_topics(admin, [topic])
+
+    var pcfg = ProducerConfig(bootstrap_servers=sasl_bootstrap())
+    for pair in sasl_keys("mojo-secret"):
+        pcfg.set(pair[0], pair[1])
+    var producer = Producer(pcfg)
+    _ = producer.produce(topic=topic, key="sasl", value="through 9093")
+    producer.flush(15000)
+    assert_equal(len(producer.failures()), 0, "SASL produce was rejected")
+    assert_equal(len(producer.errors()), 0, "SASL produce reported an error")
+
+    var ccfg = ConsumerConfig(
+        bootstrap_servers=sasl_bootstrap(),
+        group_id=topic + "-sasl",
+        auto_offset_reset="earliest",
+    )
+    for pair in sasl_keys("mojo-secret"):
+        ccfg.set(pair[0], pair[1])
+    var consumer = Consumer(ccfg)
+    consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING)])
+    var got = Optional[Message](None)
+    for _attempt in range(30):
+        got = consumer.poll(1000)
+        if got:
+            break
+    assert_true(Bool(got), "no record came back through SASL/PLAIN")
+    assert_equal(got.value().key_text(), "sasl")
+    assert_equal(got.value().value_text(), "through 9093")
+    assert_equal(len(consumer.errors()), 0, "SASL consume reported an error")
+    consumer.close()
+    print("    SASL/PLAIN: one record round-tripped through 9093")
+
+
+def test_sasl_wrong_password_is_reported_as_authorization() raises:
+    """A rejected credential lands in `errors()` as `KIND_AUTHORIZATION`.
+
+    The half an operator actually meets. The broker refuses the handshake,
+    librdkafka retries in the background, and nothing raises -- a produce
+    merely times out later. `errors()` from item 1 of the v1.0 plan is
+    where the reason surfaces, and it has to be branchable, which is what
+    the kind is for.
+    """
+    var pcfg = ProducerConfig(bootstrap_servers=sasl_bootstrap())
+    for pair in sasl_keys("not-the-secret"):
+        pcfg.set(pair[0], pair[1])
+    pcfg.set("message.timeout.ms", "3000")
+    pcfg.set("log_level", "0")
+    var producer = Producer(pcfg)
+    _ = producer.produce(topic="mojo-kafka-it-sasl-refused", value="v")
+
+    var deadline = perf_counter_ns() + 15_000_000_000
+    var found = False
+    var seen = List[String]()
+    while perf_counter_ns() < deadline and not found:
+        _ = producer.poll(200)
+        for err in producer.errors():
+            if err.kind() == KIND_AUTHORIZATION:
+                found = True
+                seen.append(String(err))
+    if not found:
+        for err in producer.errors():
+            seen.append(String(err))
+    var summary = String("")
+    for line in seen:
+        summary += line + "; "
+    assert_true(found, "no KIND_AUTHORIZATION error was reported: " + summary)
+    try:
+        producer.flush(3000)
+    except:
+        pass
+    _ = producer.take_failures()
+    print("    wrong password:", seen[0])
 
 
 def _txn_config(txn_id: String) raises -> ProducerConfig:

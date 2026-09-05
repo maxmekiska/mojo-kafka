@@ -39,6 +39,7 @@ from kafka import (
     ProducerConfig,
     KafkaError,
     TopicPartition,
+    builtin_features,
     kind_of,
     librdkafka_version,
 )
@@ -49,6 +50,64 @@ def test_librdkafka_loadable() raises:
     var v = librdkafka_version()
     assert_true(len(v.codepoints()) > 0, "empty librdkafka version string")
     print("    librdkafka", v)
+
+
+def test_librdkafka_was_built_with_ssl_and_sasl() raises:
+    """The loaded librdkafka must carry `ssl` and `sasl_scram`.
+
+    Everything under `security.protocol` is librdkafka's, and a build
+    without a feature accepts the configuration and fails at the first
+    connect. This is the check that turns that into a suite failure: a
+    conda-forge `librdkafka` built without OpenSSL or Cyrus SASL fails here
+    rather than in production. `builtin.features` is read through
+    `rd_kafka_conf_get` on a fresh conf.
+    """
+    var features = builtin_features()
+    print("    builtin.features:", features)
+    var have = features.split(",")
+    var ssl = False
+    var scram = False
+    var plain = False
+    for feature in have:
+        if feature == "ssl":
+            ssl = True
+        if feature == "sasl_scram":
+            scram = True
+        if feature == "sasl_plain":
+            plain = True
+    assert_true(ssl, "librdkafka was built without ssl: " + features)
+    assert_true(scram, "librdkafka was built without sasl_scram: " + features)
+    assert_true(plain, "librdkafka was built without sasl_plain: " + features)
+
+
+def test_ssl_is_reached_at_construction() raises:
+    """`security.protocol=SSL` with a CA file that does not exist must fail
+    when the client is built, naming the file.
+
+    That is the proof the OpenSSL path is compiled in and taken: librdkafka
+    loads the CA at `rd_kafka_new`, so a build without SSL, or a
+    configuration path that dropped the key, would construct cleanly and
+    fail only on connect. The error text has to name the file so an
+    operator sees *which* key was wrong, not just that one was.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("security.protocol", "SSL")
+    cfg.set("ssl.ca.location", "/nonexistent/ca.pem")
+    cfg.set("log_level", "0")
+    var raised = False
+    try:
+        var p = Producer(cfg)
+        _ = p.poll(0)
+    except e:
+        raised = True
+        var text = String(e)
+        assert_true(
+            text.find("/nonexistent/ca.pem") >= 0
+            or text.find("ssl.ca.location") >= 0,
+            "the error does not name the CA file: " + text,
+        )
+        print("    SSL refused at construction:", text)
+    assert_true(raised, "a missing CA file was accepted at construction")
 
 
 def test_producer_config_defaults() raises:

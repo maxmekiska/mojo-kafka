@@ -319,6 +319,42 @@ commits under `enable.auto.commit`; a consumer that is merely dropped is
 closed by its destructor, which cannot raise and so cannot tell you the
 leave failed. Both are safe to call more than once and from any thread.
 
+### Security
+
+librdkafka does all of SSL and SASL; this package adds nothing to it and
+takes nothing away. The four keys reach it through `set()`, verbatim:
+
+```mojo
+var cfg = ConsumerConfig(bootstrap_servers="broker:9093", group_id="jobs")
+cfg.set("security.protocol", "SASL_SSL")        # or SSL, SASL_PLAINTEXT
+cfg.set("sasl.mechanism", "SCRAM-SHA-512")      # or PLAIN, GSSAPI, OAUTHBEARER
+cfg.set("sasl.username", "mojo")
+cfg.set("sasl.password", secret)
+cfg.set("ssl.ca.location", "/etc/ssl/certs/ca.pem")   # if the CA is private
+```
+
+Two checks are worth making before the first production connect, and
+both are in the smoke suite so the conda build cannot regress quietly:
+
+- **`builtin_features()`** reports what the loaded librdkafka was built
+  with. A build without `ssl`, or without the `sasl_*` mechanism you need,
+  accepts the configuration and fails only on connect. The suite asserts
+  `ssl`, `sasl_plain` and `sasl_scram` are present.
+- **A bad CA path fails at construction**, not on connect: librdkafka loads
+  `ssl.ca.location` inside `rd_kafka_new`, so `Producer(cfg)` raises with
+  the path in the message. A wrong password is different -- the broker
+  refuses the handshake, librdkafka retries in the background, and the
+  reason lands in `errors()` as `KIND_AUTHORIZATION` rather than raising
+  anywhere, which is the case to watch for.
+
+What is proven against a real broker is **SASL/PLAIN over plaintext**: the
+compose file opens a second listener on 9093 with user `mojo`, and two
+cases in the broker suite round-trip a record through it and assert a
+wrong password surfaces as `KIND_AUTHORIZATION`. SCRAM needs credentials
+created on the broker with `kafka-configs.sh`, and SSL against a real
+broker needs certificate generation in compose; neither is in this
+repository's suites, and PLAIN is what proves the configuration path works.
+
 ### Threads, in three sentences
 
 `Producer` is safe to share across threads — `produce()`, `poll()`,

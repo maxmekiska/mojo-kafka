@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destroyed on every path. `ProducerConfig.drain_timeout_ms` (default 5000)
   names the wait the destructor was making with a hard-coded 5000.
 
+- **SASL and SSL, proven rather than assumed.** `kafka.builtin_features()`
+  over `rd_kafka_conf_get` reports what the loaded librdkafka was built
+  with, and the smoke suite asserts `ssl`, `sasl_plain` and `sasl_scram`
+  are in it, so a build without them fails the suite rather than the first
+  production connect. A second smoke case proves the OpenSSL path is
+  reached at construction: `security.protocol=SSL` with a CA file that does
+  not exist raises from `Producer(cfg)` naming the file. The compose broker
+  gained a `SASL_PLAINTEXT` / `PLAIN` listener on 9093 (user `mojo`), and
+  the broker suite round-trips a record through it and asserts a wrong
+  password surfaces in `errors()` as `KIND_AUTHORIZATION`. README gains a
+  "Security" section. SSL against a real broker needs certificate
+  generation in compose and is deliberately not set up.
+
 - **`Consumer.poll(headers=False)` / `Consumer.poll_event(headers=False)`**
   skip the `rd_kafka_message_headers` crossing, the same escape hatch
   `consume()` already had. Measured interleaved in one binary three times at

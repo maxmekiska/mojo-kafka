@@ -7,16 +7,48 @@
 # The mock-broker suite (`pixi run test-mock`) needs none of this.
 #
 # KAFKA_VERSION overrides the image tag (default 3.7.0).
+#
+# Two listeners. 9092 is plaintext and every existing test uses it; 9093 is
+# SASL_PLAINTEXT with the PLAIN mechanism, user `mojo` password
+# `mojo-secret`, for the two SASL cases in test_broker.mojo. The controller
+# moved to 9094 to make room. SSL is deliberately absent: it needs
+# certificate generation in compose and is not in the v1.0 plan.
 
 services:
   kafka:
     image: apache/kafka:${KAFKA_VERSION:-3.7.0}
     container_name: mojo-kafka-broker
     ports:
-      # Must stay 9092:9092. The image advertises localhost:9092, and clients
-      # use the advertised address for produce/fetch — a different host port
-      # bootstraps fine and then times out.
+      # Must stay 9092:9092 and 9093:9093. The image advertises
+      # localhost:<port>, and clients use the advertised address for
+      # produce/fetch — a different host port bootstraps fine and then
+      # times out.
       - "9092:9092"
+      - "9093:9093"
+    environment:
+      # Setting any KAFKA_* variable replaces the image's whole default
+      # server.properties, so this is the entire single-node KRaft config,
+      # copied from the image's default and extended with the SASL listener.
+      #
+      # The listener is named SASLPLAIN rather than SASL_PLAINTEXT on
+      # purpose: the image maps KAFKA_FOO_BAR to foo.bar, `__` to `_` and
+      # `___` to `-`, so a listener name with an underscore in it would need
+      # KAFKA_LISTENER_NAME_SASL__PLAINTEXT_... and is easy to get wrong.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9094
+      KAFKA_LISTENERS: PLAINTEXT://:9092,SASLPLAIN://:9093,CONTROLLER://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,SASLPLAIN://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASLPLAIN:SASL_PLAINTEXT
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_SASLPLAIN_PLAIN_SASL_JAAS_CONFIG: 'org.apache.kafka.common.security.plain.PlainLoginModule required user_mojo="mojo-secret";'
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
     healthcheck:
       # A port probe, not `kafka-topics.sh --list`. That spawns a JVM per
       # check, which on a slow machine outlives the timeout; Docker then

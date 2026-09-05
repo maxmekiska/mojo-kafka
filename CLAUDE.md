@@ -258,7 +258,7 @@ purpose — they are cold, and binding them eagerly would make *every* client
 fail to construct against a librdkafka built without the mock broker.
 
 Those 45-55 ns are a **warm** figure — one symbol resolved over and over. The
-cold cost of resolving 76 *distinct* symbols, which is what `Lib.__init__`
+cold cost of resolving 86 *distinct* symbols, which is what `Lib.__init__`
 actually does, is ~260-400 ns each: a `Lib` costs **~20 µs** to construct,
 against ~850 ns for the `dlopen` alone. Both numbers are real and neither
 supersedes the other. The cold one is why `_Freer` exists — see the
@@ -925,7 +925,7 @@ queue from `rd_kafka_queue_get_consumer` -- the same construction
   `consume()` is also what makes one buffer enough.
 
 - **`MessageBatch` holds a `_Freer`, not a `Lib`, and the difference is
-  ~19.4 us per `consume_borrowed()` call.** A `Lib` resolves 76 symbols and
+  ~19.4 us per `consume_borrowed()` call.** A `Lib` resolves 86 symbols and
   `dlsym` measures ~350 ns each here, so constructing one costs ~20 us
   against ~850 ns for the `dlopen` alone -- and it was being built **per
   fetch**. That is 19 ns a record at a batch of 1000 and 1.9 us a record at
@@ -1518,7 +1518,25 @@ written; a decision recorded on items 5 and 6; all four gates green plus
   *at*, and for a group assignment that is `OFFSET_STORED` (-1000)**, not
   `OFFSET_INVALID` -- the first draft asserted the latter. It is not the
   position; `position()` is.
-- 3-6 -- not started.
+- **4. SASL and SSL** -- landed 2026-09-05. `builtin_features()` over
+  `rd_kafka_conf_get` (two calls: NULL buffer for the length, then the
+  fill); the smoke suite asserts `ssl`, `sasl_plain` and `sasl_scram`.
+  Three things not to undo. **The compose listener is named `SASLPLAIN`,
+  not `SASL_PLAINTEXT`**: the `apache/kafka` image maps `KAFKA_FOO_BAR` to
+  `foo.bar`, `__` to `_` and `___` to `-`, so a listener name with an
+  underscore needs the double-underscore escape in
+  `KAFKA_LISTENER_NAME_..._PLAIN_SASL_JAAS_CONFIG` and is easy to get wrong;
+  a name without one sidesteps the rule. **Setting any `KAFKA_*` variable
+  discards the image's default `server.properties`**, so the compose file
+  carries the whole single-node KRaft configuration, copied from the
+  image's default (read out of a running container) with the controller
+  moved to 9094. And **a wrong SASL password arrives as librdkafka's
+  `__AUTHENTICATION` (-169)**, already `KIND_AUTHORIZATION` -- measured
+  against the real broker, so `kind_of` needed no new code. The SSL smoke
+  case proves the OpenSSL path is *reached*: librdkafka loads
+  `ssl.ca.location` inside `rd_kafka_new`, so a bad path raises at
+  construction naming the file. SSL against a real broker is not set up.
+- 3, 5, 6 -- see below / not started.
 
 ### Candidates, none started
 
