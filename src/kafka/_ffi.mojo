@@ -204,6 +204,25 @@ comptime RebalanceCallback = def(Int, Int32, Int, Int) thin abi("C") -> None
 comptime DeliveryCallback = def(Int, Int, Int) thin abi("C") -> None
 
 
+# The three observability callbacks, all set on the conf before
+# `rd_kafka_new` and all served on **the thread that polls** -- which is what
+# makes touching Mojo state from them safe, exactly as it is for the two
+# above. See `telemetry.mojo` for the trampolines.
+#
+#     void (*error_cb)(rd_kafka_t *, int err, const char *reason, void *opaque)
+#     int  (*stats_cb)(rd_kafka_t *, char *json, size_t len, void *opaque)
+#     void (*log_cb)(const rd_kafka_t *, int level, const char *fac,
+#                    const char *buf)
+#
+# `stats_cb` **returns** an int: 0 tells librdkafka to free `json`, so the
+# trampoline copies first and returns 0. `log_cb` carries **no opaque**, and
+# is called from arbitrary threads unless `log.queue=true` -- both facts are
+# dealt with in `_log_trampoline`.
+comptime ErrorCallback = def(Int, Int32, Int, Int) thin abi("C") -> None
+comptime StatsCallback = def(Int, Int, Int, Int) thin abi("C") -> Int32
+comptime LogCallback = def(Int, Int32, Int, Int) thin abi("C") -> None
+
+
 # --- reading foreign memory -------------------------------------------------
 
 
@@ -791,6 +810,38 @@ struct _Freer(Movable):
         _ = self._message_destroy(msg)
 
 
+struct _OpaqueReader(Movable):
+    """Just enough of `Lib` to find a client's opaque from inside a log line.
+
+    librdkafka's `log_cb` is the one callback that carries **no opaque**:
+    its arguments are the client handle, a level, a facility and the text.
+    The only route back to the client's state is `rd_kafka_opaque(rk)`, and
+    a thin `abi("C")` callback captures nothing -- not even the `Lib` that
+    could make that call. So the log trampoline opens this instead: one
+    handle, one symbol, the shape `_Freer` has for the same reason.
+
+    That costs a `dlopen` (a refcount bump, ~850 ns) and one cold `dlsym`
+    (~350 ns) per log line. A log line is a rare event next to a record, and
+    the hook is opt-in (`capture_logs=True`), so the price is paid only by a
+    caller who asked for it and only when librdkafka has something to say.
+    """
+
+    var _box: List[OwnedDLHandle]
+    var _opaque: _DLCallable[Int, ImmUntrackedOrigin]
+
+    def __init__(out self) raises:
+        var box = List[OwnedDLHandle](capacity=1)
+        box.append(_open_librdkafka())
+        self._box = box^
+        self._opaque = _bind[Int](self._box, "rd_kafka_opaque")
+
+    def opaque(self, rk: Int) raises -> Int:
+        """The `void *` handed to `rd_kafka_conf_set_opaque`; 0 if none."""
+        if rk == 0:
+            return 0
+        return self._opaque(rk)
+
+
 struct Lib(Movable):
     """An open handle on librdkafka plus typed wrappers over its symbols.
 
@@ -856,6 +907,11 @@ struct Lib(Movable):
     var _message_timestamp: _DLCallable[Int64, ImmUntrackedOrigin]
     var _conf_set_rebalance_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
     var _conf_set_dr_msg_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _conf_set_error_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _conf_set_stats_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _conf_set_log_cb: _DLCallable[NoneType, ImmUntrackedOrigin]
+    var _set_log_queue: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _fatal_error: _DLCallable[Int32, ImmUntrackedOrigin]
     var _poll: _DLCallable[Int32, ImmUntrackedOrigin]
     var _flush: _DLCallable[Int32, ImmUntrackedOrigin]
     var _conf_set_opaque: _DLCallable[NoneType, ImmUntrackedOrigin]
@@ -998,6 +1054,17 @@ struct Lib(Movable):
         self._conf_set_dr_msg_cb = _bind[NoneType](
             self._box, "rd_kafka_conf_set_dr_msg_cb"
         )
+        self._conf_set_error_cb = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_error_cb"
+        )
+        self._conf_set_stats_cb = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_stats_cb"
+        )
+        self._conf_set_log_cb = _bind[NoneType](
+            self._box, "rd_kafka_conf_set_log_cb"
+        )
+        self._set_log_queue = _bind[Int32](self._box, "rd_kafka_set_log_queue")
+        self._fatal_error = _bind[Int32](self._box, "rd_kafka_fatal_error")
         self._poll = _bind[Int32](self._box, "rd_kafka_poll")
         self._flush = _bind[Int32](self._box, "rd_kafka_flush")
         self._conf_set_opaque = _bind[NoneType](
@@ -1571,6 +1638,77 @@ struct Lib(Movable):
         route from inside one back to Mojo state.
         """
         _ = self._conf_set_opaque(conf, opaque)
+
+    # -- observability ------------------------------------------------------
+    #
+    # Errors, statistics and logs from librdkafka's background threads. Set
+    # on the conf like the two callbacks above, and served the same way: on
+    # whichever thread calls `poll` / `flush` / `consumer_poll`. Without an
+    # `error_cb` those errors are merely logged, and a job whose brokers went
+    # away finds out only if a `poll()` happens to report it.
+
+    def conf_set_error_cb(self, conf: Int, callback: ErrorCallback) raises:
+        """Install the C error callback.
+
+        Fires for every error librdkafka would otherwise log -- brokers down,
+        authentication rejected -- and once with `RD_KAFKA_RESP_ERR__FATAL`
+        when a fatal error is raised, after which `fatal_error` has the
+        underlying one. See `_error_trampoline` in `telemetry.mojo`.
+        """
+        _ = self._conf_set_error_cb(conf, callback)
+
+    def conf_set_stats_cb(self, conf: Int, callback: StatsCallback) raises:
+        """Install the C statistics callback.
+
+        Fires every `statistics.interval.ms` with a JSON document; a 0
+        interval, the default, never fires it. The callback **must return
+        0** so librdkafka frees the document -- see `_stats_trampoline`.
+        """
+        _ = self._conf_set_stats_cb(conf, callback)
+
+    def conf_set_log_cb(self, conf: Int, callback: LogCallback) raises:
+        """Install the C log callback.
+
+        **Only with `log.queue=true` on the same conf.** Without it librdkafka
+        calls the logger from its internal threads, and a callback that
+        touches Mojo state from there is a data race. With it, log lines are
+        queued and served through the poll path like every other callback
+        here. `ConsumerConfig` / `ProducerConfig` set both together under
+        `capture_logs`.
+        """
+        _ = self._conf_set_log_cb(conf, callback)
+
+    def set_log_queue(self, rk: Int, queue: Int) raises -> Int32:
+        """Forward the client's log queue onto `queue`; 0 means the main one.
+
+        **`log.queue=true` on its own delivers nothing.** It parks every log
+        line on a standalone queue that no poll serves, and this call is
+        what joins that queue to the poll path -- forwarding is transitive,
+        so a consumer's main queue, itself forwarded by `poll_set_consumer`,
+        carries the lines on to `consumer_poll`. `confluent-kafka` makes
+        exactly this call after `rd_kafka_new` when a logger is set. Returns
+        `__NOT_CONFIGURED` if `log.queue` was not set.
+        """
+        return self._set_log_queue(rk, queue)
+
+    def fatal_error(self, rk: Int) raises -> Optional[KafkaError]:
+        """`rd_kafka_fatal_error` -- the error that made `rk` unusable.
+
+        `None` while none has been raised. The `error_cb` only *notifies*,
+        with the generic `__FATAL` code; this is what returns the underlying
+        one. The buffer is decoded straight after the call -- see
+        `new_client` for the lifetime trap that makes the order matter.
+        """
+        var errbuf = Array[UInt8, 512](fill=0)
+        var code = self._fatal_error(rk, errbuf.unsafe_ptr(), 512)
+        var why = cstr(Int(errbuf.unsafe_ptr())) if code != 0 else String("")
+        _ = errbuf^
+        if code == RD_KAFKA_RESP_ERR_NO_ERROR:
+            return None
+        # Flagged fatal by construction: this call answers only for a fatal
+        # error, so the flag is a fact here and not the absent opinion a
+        # bare code carries elsewhere.
+        return KafkaError(code, why, is_fatal=True)
 
     def incremental_assign(self, rk: Int, list: Int) raises -> Int:
         """Add partitions to the assignment -- COOPERATIVE protocol only.

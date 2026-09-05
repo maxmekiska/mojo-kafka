@@ -50,3 +50,4 @@ from .partition import (
     Watermarks,
 )
 from .producer import PARTITION_UNASSIGNED, DeliveryReport, Producer
+from .telemetry import LogLine

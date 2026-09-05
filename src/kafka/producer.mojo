@@ -29,6 +29,14 @@ from .config import ProducerConfig
 from .group import ConsumerGroupMetadata
 from .partition import TopicPartition, _build_tpl
 from .header import Header
+from .telemetry import (
+    LogLine,
+    _Observed,
+    _Telemetry,
+    _error_trampoline,
+    _log_trampoline,
+    _stats_trampoline,
+)
 
 # Let librdkafka choose the partition with the topic's partitioner, which is
 # what `produce()` does unless a caller names one. Re-exported under a less
@@ -123,28 +131,39 @@ struct _Field(Copyable, Movable):
         return self.pointer if self.pointer != 0 else placeholder
 
 
-struct _DrState(Movable):
-    """What the delivery-report callback can reach.
+struct _DrState(Movable, _Observed):
+    """What the producer's C callbacks can reach.
 
     Lives in a one-element `List` on the `Producer`, so its address survives
     anything that moves the producer -- the same heap box `Lib` uses for its
-    handle, and `Consumer` for its rebalance state.
+    handle, and `Consumer` for its rebalance state. It is the one opaque the
+    producer hands to `rd_kafka_conf_set_opaque`, so everything a callback
+    needs lives here: the delivery-report state, and the `_Telemetry` the
+    error, statistics and log callbacks write.
 
     `lock` guards `failures` and nothing else. librdkafka runs the callback
     on whichever thread called `poll` / `flush`, so two threads producing and
     draining are two unsynchronised writers to that list; the lock is what
-    makes them one. Not `Copyable`: an `Atomic` cannot be copied, and copying
-    a lock would be meaningless anyway.
+    makes them one. `telemetry` carries its own latch. Not `Copyable`: an
+    `Atomic` cannot be copied, and copying a lock would be meaningless
+    anyway.
     """
 
     var lib: Int
     var lock: _Latch
     var failures: List[DeliveryReport]
+    var telemetry: _Telemetry
 
     def __init__(out self):
         self.lib = 0
         self.lock = _Latch()
         self.failures = List[DeliveryReport]()
+        self.telemetry = _Telemetry()
+
+    def telemetry_ptr(self) -> Pointer[_Telemetry, MutAnyOrigin]:
+        return Pointer[_Telemetry, MutAnyOrigin](
+            unsafe_from_address=Int(Pointer(to=self.telemetry))
+        )
 
 
 def _delivery_trampoline(rk: Int, msg: Int, opaque: Int) abi("C"):
@@ -285,6 +304,15 @@ struct Producer:
         var conf = cfg._build(self._lib)
         try:
             self._lib.conf_set_dr_msg_cb(conf, _delivery_trampoline)
+            # The error and statistics hooks go on every producer: the
+            # first costs nothing until something fails, the second nothing
+            # until `statistics_interval_ms` is set. The log hook is opt-in
+            # because it forces `log.queue=true` -- `_build` set that key
+            # under the same flag, so the two cannot come apart.
+            self._lib.conf_set_error_cb(conf, _error_trampoline[_DrState])
+            self._lib.conf_set_stats_cb(conf, _stats_trampoline[_DrState])
+            if cfg.capture_logs:
+                self._lib.conf_set_log_cb(conf, _log_trampoline[_DrState])
             self._lib.conf_set_opaque(conf, Int(self._dr.unsafe_ptr()))
         except e:
             self._lib.conf_destroy(conf)
@@ -292,6 +320,12 @@ struct Producer:
         # rd_kafka_new adopts conf on success and _build/new_client
         # between them free it on every failure path.
         self._rk = self._lib.new_client(RD_KAFKA_PRODUCER, conf)
+        if cfg.capture_logs:
+            # `log.queue=true` parks the lines on a queue nothing serves
+            # until it is forwarded to the main one -- see `set_log_queue`.
+            self._lib.raise_if(
+                self._lib.set_log_queue(self._rk, 0), "set_log_queue"
+            )
         # Sequences start at 1, not 0. The opaque travels as a `void *` and
         # comes back as `_private`, where 0 is indistinguishable from a
         # message produced without one.
@@ -639,6 +673,82 @@ struct Producer:
         state.failures.clear()
         state.lock.release()
         return taken^
+
+    # -- observability --------------------------------------------------------
+    #
+    # What librdkafka's background threads had to say, retained rather than
+    # called back -- see `telemetry.mojo` for why. All of it arrives through
+    # `poll()` / `flush()`, so a producer that is never polled reports
+    # nothing here; that is the same rule delivery reports follow.
+
+    def errors(self) -> List[KafkaError]:
+        """Every error librdkafka has reported and nothing has acknowledged,
+        oldest first. Does not acknowledge them.
+
+        These are the errors that would otherwise only be logged: a broker
+        gone away (`KIND_TRANSPORT`), an authentication rejection
+        (`KIND_AUTHORIZATION`), and -- once -- a `KIND_FATAL` notification,
+        after which `fatal_error()` has the underlying one. librdkafka
+        recovers from the non-fatal ones by itself, so they are informational
+        until they are not; a job that sees the same `KIND_TRANSPORT` for
+        minutes is one whose brokers are not coming back.
+
+        Bounded to the most recent 256; `dropped_errors()` counts the rest.
+        """
+        return self._state()[unsafe_offset=0].telemetry.snapshot_errors()
+
+    def take_errors(self) -> List[KafkaError]:
+        """Acknowledge every retained error, returning what was there."""
+        return self._state()[unsafe_offset=0].telemetry.take_errors()
+
+    def dropped_errors(self) -> Int:
+        """How many errors were discarded, oldest first, because more than
+        256 arrived without `take_errors()` being called. Cumulative."""
+        return self._state()[unsafe_offset=0].telemetry.errors_dropped()
+
+    def fatal_error(self) raises -> Optional[KafkaError]:
+        """The error that made this producer unusable, if one has.
+
+        `None` is the normal answer. Anything else means librdkafka has
+        given up on this instance -- a fenced transactional producer, an
+        idempotence guarantee it could not keep -- and **will not recover
+        it**: every later call fails with `__FATAL`. The only remedy is to
+        drop the producer and construct a new one. The `error_cb` announces
+        this with a generic `KIND_FATAL` entry in `errors()`; this is where
+        the real code and reason are.
+        """
+        return self._lib.fatal_error(self._rk)
+
+    def latest_stats(self) -> Optional[String]:
+        """The most recent statistics document, as librdkafka's JSON.
+
+        Refreshed every `statistics_interval_ms` on the config, and `None`
+        until the first one lands -- or forever, at the default interval of
+        0. The schema is librdkafka's `STATISTICS.md`: `msg_cnt` and
+        `txmsgs` for a producer, per-broker `rtt` and `outbuf_cnt`, and a
+        `name` that identifies the client. Parse it or ship it whole to
+        whatever reads your metrics.
+        """
+        return self._state()[unsafe_offset=0].telemetry.latest_stats()
+
+    def logs(self) -> List[LogLine]:
+        """Every log line retained since the last `take_logs()`, oldest
+        first. Empty unless the config had `capture_logs=True`.
+
+        Bounded to the most recent 256; `dropped_logs()` counts the rest.
+        What gets logged at all is librdkafka's `log_level` property, set
+        through `ProducerConfig.set("log_level", "7")`.
+        """
+        return self._state()[unsafe_offset=0].telemetry.snapshot_logs()
+
+    def take_logs(self) -> List[LogLine]:
+        """Acknowledge every retained log line, returning what was there."""
+        return self._state()[unsafe_offset=0].telemetry.take_logs()
+
+    def dropped_logs(self) -> Int:
+        """How many log lines were discarded because more than 256 arrived
+        without `take_logs()` being called. Cumulative."""
+        return self._state()[unsafe_offset=0].telemetry.logs_dropped()
 
     # -- producing ------------------------------------------------------------
 

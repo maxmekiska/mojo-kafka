@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Observability on both clients: `errors()` / `take_errors()` /
+  `dropped_errors()`, `fatal_error()`, `latest_stats()`, and `logs()` /
+  `take_logs()` / `dropped_logs()`.** Errors from librdkafka's background
+  threads — brokers down, authentication rejected, a fenced producer — used
+  to reach the application only if a `poll()` or `flush()` happened to
+  report one, and there was no metrics hook at all. The three librdkafka
+  callbacks (`error_cb`, `stats_cb`, `log_cb`) are now installed on every
+  client and **retain** what arrives rather than calling back, matching
+  `failures()` / `take_failures()`: a Mojo handler reached from C captures
+  nothing, so a callback API would have pushed every user into `setenv`
+  tricks. Bounded to the most recent 256 with a counter for what was
+  dropped. `fatal_error()` reads `rd_kafka_fatal_error`, the one call that
+  returns the *underlying* error after the callback's generic `KIND_FATAL`
+  notification. New config fields: `statistics_interval_ms` (default 0,
+  never) and `capture_logs` (default off, because it forces
+  `log.queue=true`). New public type `LogLine`.
+
+  One trap found on the way and written down: `log.queue=true` on its own
+  delivers nothing — it parks lines on a queue no poll serves until
+  `rd_kafka_set_log_queue(rk, NULL)` joins it to the main one, which is the
+  call `confluent-kafka` makes too.
+
 - **`Consumer.poll(headers=False)` / `Consumer.poll_event(headers=False)`**
   skip the `rd_kafka_message_headers` crossing, the same escape hatch
   `consume()` already had. Measured interleaved in one binary three times at

@@ -27,6 +27,7 @@ from kafka import (
     API_KEY_ADD_OFFSETS_TO_TXN,
     API_KEY_ADD_PARTITIONS_TO_TXN,
     API_KEY_INIT_PRODUCER_ID,
+    KIND_FATAL,
     OFFSET_BEGINNING,
     RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
     RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
@@ -1516,6 +1517,27 @@ def test_a_fatal_transaction_error_is_flagged_fatal() raises:
         "expected TXN_FATAL, got " + String(err.txn_action()),
     )
     print("    fatal:", err, "->", err.txn_action())
+
+    # The same verdict, read off the instance rather than the call. This is
+    # what a job that was not the one making the transactional call sees:
+    # `fatal_error()` carries the underlying code, and the error callback
+    # has announced it with a generic `KIND_FATAL` entry.
+    var fatal = producer.fatal_error()
+    assert_true(Bool(fatal), "fatal_error() is empty after a fatal error")
+    assert_equal(
+        fatal.value().code,
+        RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED,
+        "fatal_error() carries the wrong code: " + String(fatal.value()),
+    )
+    assert_true(fatal.value().is_fatal, "fatal_error() is not flagged fatal")
+    assert_true(fatal.value().message != "", "fatal_error() carries no reason")
+    _ = producer.poll(200)
+    var announced = False
+    for reported in producer.errors():
+        if reported.kind() == KIND_FATAL:
+            announced = True
+    assert_true(announced, "the error callback did not announce the fatal")
+    print("    fatal_error():", fatal.value())
     _ = cluster^
 
 

@@ -11,7 +11,7 @@ from std.ffi import OwnedDLHandle
 from std.time import perf_counter_ns, sleep
 from std.testing import TestSuite, assert_equal, assert_true
 
-from kafka._ffi import PTR_STRIDE
+from kafka._ffi import PTR_STRIDE, RD_KAFKA_RESP_ERR__TRANSPORT, _c_string
 from kafka.consumer import MAX_BATCH
 from kafka.consumer import (
     Rebalance,
@@ -19,6 +19,8 @@ from kafka.consumer import (
     _handler_from_word,
     _handler_word,
 )
+from kafka.producer import _DrState
+from kafka.telemetry import RETAINED, _error_trampoline
 from kafka import (
     KIND_AUTHORIZATION,
     KIND_FATAL,
@@ -1155,6 +1157,200 @@ def test_close_waits_for_a_batch_fetch_in_flight() raises:
         raised = True
     assert_true(raised, "consume() after the close reported success")
     print("    close() waited", waited_ms, "ms for the fetch in flight")
+
+
+# --- observability -----------------------------------------------------------
+#
+# Errors, statistics and logs from librdkafka's background threads, retained
+# on the client. Nothing listens on port 9, which is what makes the first
+# two deterministic: connecting fails at once and librdkafka says so.
+
+
+def test_a_dead_broker_is_reported_through_errors() raises:
+    """A broker that is not there must show up in `errors()`.
+
+    Before the error callback existed, a producer whose brokers had gone
+    away found out only if a `flush()` happened to time out -- and a job
+    that produced nothing for a while never found out at all. Connection
+    refused is a `__TRANSPORT` error, which librdkafka reports through the
+    callback once per distinct failure, and one poll is enough to serve it.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("message.timeout.ms", "300")
+    cfg.set("log_level", "0")
+    var p = Producer(cfg)
+    _ = p.produce(topic="nowhere", value="v")
+    var deadline = perf_counter_ns() + 1_500_000_000
+    while perf_counter_ns() < deadline and len(p.errors()) == 0:
+        _ = p.poll(100)
+
+    var seen = p.errors()
+    assert_true(len(seen) > 0, "a dead broker produced no error")
+    var transport = 0
+    for err in seen:
+        if err.kind() == KIND_TRANSPORT:
+            transport += 1
+        assert_true(
+            err.message != "", "an error with no reason: " + String(err)
+        )
+    assert_true(
+        transport > 0,
+        "no KIND_TRANSPORT among " + String(len(seen)) + " errors",
+    )
+    assert_true(not p.fatal_error(), "a refused connection is not fatal")
+    assert_equal(p.dropped_errors(), 0)
+
+    # `take_errors()` acknowledges; `errors()` does not.
+    var taken = p.take_errors()
+    assert_equal(len(taken), len(seen))
+    assert_equal(len(p.errors()), 0, "take_errors() did not clear")
+    print("    dead broker:", seen[0])
+    _ = p.take_failures()
+
+
+def test_statistics_arrive_at_the_configured_interval() raises:
+    """`statistics_interval_ms` on either config feeds `latest_stats()`.
+
+    The document is emitted on a timer whether or not a broker answers, so
+    a dead port is enough. Both clients are asserted on because they reach
+    the callback through different queues -- the consumer's is forwarded by
+    `poll_set_consumer` -- and a forwarding mistake would silence exactly
+    one of them.
+    """
+    var ccfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9",
+        group_id="stats",
+        statistics_interval_ms=100,
+    )
+    ccfg.set("log_level", "0")
+    var consumer = Consumer(ccfg)
+    assert_true(not consumer.latest_stats(), "stats before the first tick")
+    var deadline = perf_counter_ns() + 2_000_000_000
+    while perf_counter_ns() < deadline and not consumer.latest_stats():
+        _ = consumer.poll(100)
+    var stats = consumer.latest_stats()
+    assert_true(Bool(stats), "no statistics document arrived on the consumer")
+    assert_true(
+        '"name"' in stats.value(),
+        "not a statistics document: " + stats.value()[byte=0:80],
+    )
+    assert_true(
+        '"type": "consumer"' in stats.value(),
+        "the consumer's document does not say it is one",
+    )
+    consumer.close()
+
+    var pcfg = ProducerConfig(
+        bootstrap_servers="127.0.0.1:9", statistics_interval_ms=100
+    )
+    pcfg.set("log_level", "0")
+    var producer = Producer(pcfg)
+    deadline = perf_counter_ns() + 2_000_000_000
+    while perf_counter_ns() < deadline and not producer.latest_stats():
+        _ = producer.poll(100)
+    var pstats = producer.latest_stats()
+    assert_true(Bool(pstats), "no statistics document arrived on the producer")
+    assert_true(
+        '"type": "producer"' in pstats.value(),
+        "the producer's document does not say it is one",
+    )
+    print(
+        "    statistics:",
+        stats.value().byte_length(),
+        "bytes for the consumer",
+    )
+
+
+def test_captured_logs_carry_a_facility() raises:
+    """`capture_logs=True` retains librdkafka's log lines; off, nothing is.
+
+    `log_level=7` turns on debug lines so a dead port generates plenty
+    within a few hundred milliseconds. Every line librdkafka writes has a
+    facility -- `CONNECT`, `FAIL`, `BROKERFAIL` -- so an empty one means
+    the C string was decoded from the wrong argument.
+
+    The off case matters as much: the log hook forces `log.queue=true`, so
+    a consumer that did not ask must not have it installed.
+    """
+    var cfg = ConsumerConfig(
+        bootstrap_servers="127.0.0.1:9", group_id="logs", capture_logs=True
+    )
+    cfg.set("log_level", "7")
+    var consumer = Consumer(cfg)
+    var deadline = perf_counter_ns() + 2_000_000_000
+    while perf_counter_ns() < deadline and len(consumer.logs()) == 0:
+        _ = consumer.poll(100)
+    var lines = consumer.logs()
+    assert_true(len(lines) > 0, "no log lines were captured")
+    for line in lines:
+        assert_true(
+            line.facility != "", "a log line with no facility: " + String(line)
+        )
+        assert_true(line.message != "", "a log line with no text")
+        assert_true(
+            line.level >= 0 and line.level <= 7,
+            "not a syslog level: " + String(line.level),
+        )
+    assert_true(len(lines) <= RETAINED, "logs() exceeded its bound")
+    var taken = consumer.take_logs()
+    assert_true(len(taken) >= len(lines), "take_logs() returned fewer")
+    assert_equal(len(consumer.logs()), 0, "take_logs() did not clear")
+    consumer.close()
+
+    var quiet = ConsumerConfig(bootstrap_servers="127.0.0.1:9", group_id="q")
+    quiet.set("log_level", "0")
+    var silent = Consumer(quiet)
+    _ = silent.poll(200)
+    assert_equal(len(silent.logs()), 0, "logs captured without capture_logs")
+    silent.close()
+    print("    captured", len(lines), "log lines; first:", lines[0])
+
+
+def test_retained_errors_are_bounded_and_the_rest_counted() raises:
+    """A flapping broker must not grow `errors()` without bound.
+
+    A thousand errors are driven straight through the C trampoline -- the
+    same function librdkafka would call, with the producer's own opaque --
+    because a dead port yields one transport error per reconnect and a real
+    burst would take minutes. The producer is never polled here, so nothing
+    but the burst reaches the list and the counts are exact.
+
+    Asserts on which entries survive, not just how many: the bound has to
+    drop the *oldest*, or a job reading `errors()` after a storm sees the
+    first minute of it and not the last.
+    """
+    var cfg = ProducerConfig(bootstrap_servers="127.0.0.1:9")
+    cfg.set("log_level", "0")
+    var p = Producer(cfg)
+    var opaque = Int(p._dr.unsafe_ptr())
+
+    var burst = 1000
+    for i in range(burst):
+        var reason = _c_string("burst-" + String(i))
+        _error_trampoline[_DrState](
+            0, RD_KAFKA_RESP_ERR__TRANSPORT, Int(reason.unsafe_ptr()), opaque
+        )
+        _ = reason^
+
+    var kept = p.errors()
+    assert_equal(len(kept), RETAINED, "errors() is not bounded at 256")
+    assert_equal(p.dropped_errors(), burst - RETAINED)
+    assert_equal(kept[0].message, "burst-" + String(burst - RETAINED))
+    assert_equal(kept[RETAINED - 1].message, "burst-" + String(burst - 1))
+    assert_true(kept[0].kind() == KIND_TRANSPORT)
+
+    _ = p.take_errors()
+    assert_equal(len(p.errors()), 0)
+    # The counter is cumulative: acknowledging does not reset it.
+    assert_equal(p.dropped_errors(), burst - RETAINED)
+    print(
+        "    kept",
+        RETAINED,
+        "of",
+        burst,
+        "errors, dropped",
+        p.dropped_errors(),
+    )
 
 
 def main() raises:

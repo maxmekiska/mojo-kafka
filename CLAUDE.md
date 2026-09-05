@@ -1059,6 +1059,69 @@ topic the mock does not have comes back **abortable**, not "unknown topic".
 Create the input topic in these tests even though nothing produces to it
 through the mock.
 
+### Observability: errors, fatal errors, stats, logs
+
+Item 1 of "The last quarter", landed 2026-09-05. `errors()` /
+`take_errors()` / `dropped_errors()`, `fatal_error()`, `latest_stats()`,
+`logs()` / `take_logs()` / `dropped_logs()` on both clients, over
+`rd_kafka_conf_set_error_cb`, `_stats_cb` and `_log_cb`, plus
+`rd_kafka_fatal_error`. `telemetry.mojo` holds the state and the
+trampolines. Seven things not to undo:
+
+- **Retain, do not call back.** Same reasoning as `failures()`: a thin
+  handler captures nothing, so a callback API forces the caller into
+  `setenv`. Bounded to `RETAINED` (256), **oldest dropped**, and the
+  `dropped_*` counters are cumulative -- `take_*` does not reset them.
+  `test_retained_errors_are_bounded_and_the_rest_counted` asserts on
+  *which* entries survive, not just how many.
+
+- **One opaque per client, and the trampolines are parameterised on the
+  box type.** `_error_trampoline[_DrState]` and
+  `_error_trampoline[_RebalanceState]` are each a plain one-word C function
+  pointer -- probed, then verified against librdkafka. The `_Observed`
+  trait is what lets one body serve both boxes. The alternative, a
+  `_Telemetry` at a known offset in each box, would rest on a Mojo struct
+  layout this package never reasons about. Do not add a second opaque.
+
+- **`log.queue=true` alone delivers nothing.** It parks lines on a
+  standalone queue no poll serves; `rd_kafka_set_log_queue(rk, NULL)` after
+  `rd_kafka_new` is what joins it to the main queue, and forwarding is
+  transitive, so a consumer's `poll_set_consumer` forwarding carries the
+  lines on to `consumer_poll`. `confluent-kafka` makes the same call. The
+  first draft here set the property and installed the callback and the log
+  test was empty. `capture_logs` on a config sets the property and both
+  clients install the callback *and* make the call under that one flag, so
+  the three cannot come apart.
+
+- **`log_cb` carries no opaque and `rk` may be NULL.** The trampoline finds
+  its client through `rd_kafka_opaque(rk)`, which needs a resolved symbol a
+  thin callback cannot hold, so `_OpaqueReader` opens one per line (~1.2 us:
+  a refcount `dlopen` and a cold `dlsym`). Acceptable for an opt-in hook
+  fed by a rare event. librdkafka logs from `rd_kafka_conf_set` validation
+  with no client at all; those lines are dropped rather than dereferenced.
+
+- **`stats_cb` returns 0**, which tells librdkafka to free the document, so
+  the trampoline copies first. Returning 1 would make it ours to free with
+  a `free()` this package has no binding for.
+
+- **The error callback needs no `Lib`.** `reason` is librdkafka's own
+  description and says more than `err2str` would, so the `KafkaError` is
+  built from it directly and the trampoline makes no FFI call at all --
+  which also keeps it trivially inside `_sync`'s first rule.
+
+- **`fatal_error()` returns a `KafkaError` with `is_fatal=True`** set by
+  construction. That is not the "absent opinion" a bare code carries
+  elsewhere: this call answers only for a fatal error, so the flag is a
+  fact. The error callback's `__FATAL` notification is retained too, so
+  `errors()` shows *that* the client died even after `fatal_error()` has
+  been read. `test_a_fatal_transaction_error_is_flagged_fatal` (mock) now
+  asserts on both, with the underlying code 31 from `fatal_error()`.
+
+Installing `error_cb` on every client has one visible side effect worth
+knowing: librdkafka no longer prints those errors to stderr on its own,
+because they have somewhere to go. The `FAIL` log lines still print; the
+duplicate `ERROR` line does not.
+
 ### Borrowed message views
 
 `Consumer.consume_borrowed(n)` returns a `MessageBatch` that still owns
@@ -1433,7 +1496,11 @@ soak result recorded; the README production and security sections
 written; a decision recorded on items 5 and 6; all four gates green plus
 `test-broker` and `test-interop` on the day of the tag.
 
-**Status**: nothing started.
+**Status**:
+
+- **1. Observability** -- landed 2026-09-05. See "Observability" under
+  "Already built" for what not to undo.
+- 2-6 -- not started.
 
 ### Candidates, none started
 

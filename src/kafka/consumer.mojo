@@ -44,6 +44,14 @@ from .partition import (
     Watermarks,
     _build_tpl,
 )
+from .telemetry import (
+    LogLine,
+    _Observed,
+    _Telemetry,
+    _error_trampoline,
+    _log_trampoline,
+    _stats_trampoline,
+)
 
 # rd_kafka_timestamp_type_t, re-exported so `Message.timestamp_type` can be
 # compared against something with a name.
@@ -370,9 +378,13 @@ def _handler_from_word(word: Int) raises -> RebalanceHandler:
     return out
 
 
-struct _RebalanceState(Movable):
-    """What the C callback can see. Lives in a one-element `List` on the
-    `Consumer`, so its address survives anything that moves the consumer.
+struct _RebalanceState(Movable, _Observed):
+    """What the consumer's C callbacks can see. Lives in a one-element
+    `List` on the `Consumer`, so its address survives anything that moves
+    the consumer. It is the one opaque the consumer hands to
+    `rd_kafka_conf_set_opaque`, which is why the `_Telemetry` the error,
+    statistics and log callbacks write lives here beside the rebalance
+    slots rather than behind a second opaque.
 
     `handled` is read back after the handler returns to decide whether the
     default assignment still has to be applied. It is written through its
@@ -416,6 +428,7 @@ struct _RebalanceState(Movable):
     var on_assign: Atomic[DType.int64]
     var on_revoke: Atomic[DType.int64]
     var on_lost: Atomic[DType.int64]
+    var telemetry: _Telemetry
 
     def __init__(out self):
         self.lib = 0
@@ -423,6 +436,12 @@ struct _RebalanceState(Movable):
         self.on_assign = Atomic[DType.int64](0)
         self.on_revoke = Atomic[DType.int64](0)
         self.on_lost = Atomic[DType.int64](0)
+        self.telemetry = _Telemetry()
+
+    def telemetry_ptr(self) -> Pointer[_Telemetry, MutAnyOrigin]:
+        return Pointer[_Telemetry, MutAnyOrigin](
+            unsafe_from_address=Int(Pointer(to=self.telemetry))
+        )
 
     def _publish(
         mut self,
@@ -776,6 +795,20 @@ struct Consumer:
         var conf = cfg._build(self._lib)
         try:
             self._lib.conf_set_rebalance_cb(conf, _rebalance_trampoline)
+            # Same three hooks as the producer, same reasoning -- see there.
+            # `poll_set_consumer` below forwards the main queue onto the
+            # consumer queue, so `poll()`, `poll_event()` and every batch
+            # call serve all of them.
+            self._lib.conf_set_error_cb(
+                conf, _error_trampoline[_RebalanceState]
+            )
+            self._lib.conf_set_stats_cb(
+                conf, _stats_trampoline[_RebalanceState]
+            )
+            if cfg.capture_logs:
+                self._lib.conf_set_log_cb(
+                    conf, _log_trampoline[_RebalanceState]
+                )
             self._lib.conf_set_opaque(conf, Int(self._rebalance.unsafe_ptr()))
         except e:
             self._lib.conf_destroy(conf)
@@ -783,6 +816,13 @@ struct Consumer:
 
         self._rk = self._lib.new_client(RD_KAFKA_CONSUMER, conf)
         _ = self._lib.poll_set_consumer(self._rk)
+        if cfg.capture_logs:
+            # Onto the main queue, which `poll_set_consumer` has just
+            # forwarded onto the consumer queue; forwarding is transitive,
+            # so `poll()` and the batch calls serve the lines from here.
+            self._lib.raise_if(
+                self._lib.set_log_queue(self._rk, 0), "set_log_queue"
+            )
         self._closed = Atomic[DType.int32](0)
         # Recorded now rather than in `__init__`'s field list because it is
         # the address of a field of `self`, which is only final once the
@@ -1830,6 +1870,83 @@ struct Consumer:
             self._rk, 0, Int32(1) if asynchronous else Int32(0)
         )
         self._lib.raise_if(rc, "commit")
+
+    # -- observability ------------------------------------------------------
+    #
+    # The consumer's half of what `telemetry.mojo` describes. Everything here
+    # arrives through the poll path -- `poll()`, `poll_event()`, `consume()`
+    # and its siblings all serve it -- so a consumer that is not being polled
+    # reports nothing, exactly as it receives nothing.
+
+    def _telemetry(self) -> Pointer[_Telemetry, MutAnyOrigin]:
+        """The callback box's `_Telemetry`, reached the way the callbacks
+        reach it -- see `Producer._state` for why this aliasing is the
+        same one the C side already does and not a new one."""
+        return Pointer[_RebalanceState, MutAnyOrigin](
+            unsafe_from_address=Int(self._rebalance.unsafe_ptr())
+        )[unsafe_offset=0].telemetry_ptr()
+
+    def errors(self) -> List[KafkaError]:
+        """Every error librdkafka has reported and nothing has acknowledged,
+        oldest first. Does not acknowledge them.
+
+        The errors that would otherwise only be logged: brokers gone away
+        (`KIND_TRANSPORT`), a group or topic this client may not read
+        (`KIND_AUTHORIZATION`), an unknown topic in the subscription, and
+        -- once -- a `KIND_FATAL` notification, after which `fatal_error()`
+        has the underlying one. Bounded to the most recent 256;
+        `dropped_errors()` counts the rest.
+        """
+        return self._telemetry()[unsafe_offset=0].snapshot_errors()
+
+    def take_errors(self) -> List[KafkaError]:
+        """Acknowledge every retained error, returning what was there."""
+        return self._telemetry()[unsafe_offset=0].take_errors()
+
+    def dropped_errors(self) -> Int:
+        """How many errors were discarded, oldest first, because more than
+        256 arrived without `take_errors()` being called. Cumulative."""
+        return self._telemetry()[unsafe_offset=0].errors_dropped()
+
+    def fatal_error(self) raises -> Optional[KafkaError]:
+        """The error that made this consumer unusable, if one has.
+
+        `None` is the normal answer. A consumer raises a fatal error far
+        more rarely than a producer -- librdkafka reserves it for a group
+        it can no longer be a member of -- but the remedy is the same: the
+        instance will not recover, `close()` it and construct a new one.
+        """
+        return self._lib.fatal_error(self._rk)
+
+    def latest_stats(self) -> Optional[String]:
+        """The most recent statistics document, as librdkafka's JSON.
+
+        Refreshed every `statistics_interval_ms` on the config and `None`
+        until the first one lands -- or forever at the default of 0. For a
+        consumer the useful parts are per-partition under `topics`:
+        `consumer_lag`, `fetchq_cnt`, `stored_offset` and `committed_offset`
+        -- lag without a `position()` / `query_watermark_offsets()` pair.
+        """
+        return self._telemetry()[unsafe_offset=0].latest_stats()
+
+    def logs(self) -> List[LogLine]:
+        """Every log line retained since the last `take_logs()`, oldest
+        first. Empty unless the config had `capture_logs=True`.
+
+        Bounded to the most recent 256; `dropped_logs()` counts the rest.
+        What gets logged at all is librdkafka's `log_level` property, set
+        through `ConsumerConfig.set("log_level", "7")`.
+        """
+        return self._telemetry()[unsafe_offset=0].snapshot_logs()
+
+    def take_logs(self) -> List[LogLine]:
+        """Acknowledge every retained log line, returning what was there."""
+        return self._telemetry()[unsafe_offset=0].take_logs()
+
+    def dropped_logs(self) -> Int:
+        """How many log lines were discarded because more than 256 arrived
+        without `take_logs()` being called. Cumulative."""
+        return self._telemetry()[unsafe_offset=0].logs_dropped()
 
     def close(mut self) raises:
         """Leave the group cleanly. Safe to call more than once, from any

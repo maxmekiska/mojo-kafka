@@ -38,6 +38,25 @@ def _build_conf(
     return conf
 
 
+def _observability(
+    statistics_interval_ms: Int, capture_logs: Bool
+) -> List[Tuple[String, String]]:
+    """The conf keys behind `statistics_interval_ms` and `capture_logs`.
+
+    Shared by both config types because the rule is the same on both:
+    statistics need an interval to fire at all, and a log hook needs
+    `log.queue=true` or librdkafka calls it from its own threads, where a
+    Mojo callback has no safe thing to do. `capture_logs` sets the key and
+    installs the callback together so neither can happen without the other.
+    """
+    var out: List[Tuple[String, String]] = [
+        ("statistics.interval.ms", String(statistics_interval_ms)),
+    ]
+    if capture_logs:
+        out.append((String("log.queue"), String("true")))
+    return out^
+
+
 @fieldwise_init
 struct ProducerConfig(Copyable, Movable):
     var bootstrap_servers: String
@@ -45,6 +64,8 @@ struct ProducerConfig(Copyable, Movable):
     var compression_type: String
     var linger_ms: Int
     var acks: String
+    var statistics_interval_ms: Int
+    var capture_logs: Bool
     var extra: Dict[String, String]
 
     def __init__(
@@ -54,12 +75,22 @@ struct ProducerConfig(Copyable, Movable):
         compression_type: String = "none",
         linger_ms: Int = 0,
         acks: String = "all",
+        statistics_interval_ms: Int = 0,
+        capture_logs: Bool = False,
     ):
+        """`statistics_interval_ms` is how often `Producer.latest_stats()`
+        is refreshed, and 0 -- the default -- never. `capture_logs` retains
+        librdkafka's log lines for `Producer.logs()`; it is off by default
+        because it forces `log.queue=true`, which stops librdkafka logging
+        to stderr on its own and makes the lines the caller's to read.
+        """
         self.bootstrap_servers = bootstrap_servers
         self.client_id = client_id
         self.compression_type = compression_type
         self.linger_ms = linger_ms
         self.acks = acks
+        self.statistics_interval_ms = statistics_interval_ms
+        self.capture_logs = capture_logs
         self.extra = Dict[String, String]()
 
     def set(mut self, key: String, value: String):
@@ -72,17 +103,17 @@ struct ProducerConfig(Copyable, Movable):
         self.extra[key] = value
 
     def _build(self, lib: Lib) raises -> Int:
-        return _build_conf(
-            lib,
-            [
-                ("bootstrap.servers", self.bootstrap_servers),
-                ("client.id", self.client_id),
-                ("compression.type", self.compression_type),
-                ("linger.ms", String(self.linger_ms)),
-                ("acks", self.acks),
-            ],
-            self.extra,
+        var named: List[Tuple[String, String]] = [
+            ("bootstrap.servers", self.bootstrap_servers),
+            ("client.id", self.client_id),
+            ("compression.type", self.compression_type),
+            ("linger.ms", String(self.linger_ms)),
+            ("acks", self.acks),
+        ]
+        named.extend(
+            _observability(self.statistics_interval_ms, self.capture_logs)
         )
+        return _build_conf(lib, named, self.extra)
 
 
 @fieldwise_init
@@ -93,6 +124,8 @@ struct ConsumerConfig(Copyable, Movable):
     var auto_offset_reset: String
     var enable_auto_commit: Bool
     var enable_partition_eof: Bool
+    var statistics_interval_ms: Int
+    var capture_logs: Bool
     var extra: Dict[String, String]
 
     def __init__(
@@ -103,6 +136,8 @@ struct ConsumerConfig(Copyable, Movable):
         auto_offset_reset: String = "latest",
         enable_auto_commit: Bool = True,
         enable_partition_eof: Bool = False,
+        statistics_interval_ms: Int = 0,
+        capture_logs: Bool = False,
     ):
         """`enable_partition_eof` defaults to `False`, matching librdkafka.
 
@@ -111,6 +146,11 @@ struct ConsumerConfig(Copyable, Movable):
         without it "caught up" is indistinguishable from "nothing arrived".
         A tail-following job wants it off -- it would otherwise get an EOF
         mark every time it caught up with the log.
+
+        `statistics_interval_ms` and `capture_logs` are as on
+        `ProducerConfig`: the first refreshes `Consumer.latest_stats()` and
+        0 never does; the second retains log lines for `Consumer.logs()` at
+        the price of `log.queue=true`.
         """
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
@@ -118,6 +158,8 @@ struct ConsumerConfig(Copyable, Movable):
         self.auto_offset_reset = auto_offset_reset
         self.enable_auto_commit = enable_auto_commit
         self.enable_partition_eof = enable_partition_eof
+        self.statistics_interval_ms = statistics_interval_ms
+        self.capture_logs = capture_logs
         self.extra = Dict[String, String]()
 
     def set(mut self, key: String, value: String):
@@ -125,25 +167,23 @@ struct ConsumerConfig(Copyable, Movable):
         self.extra[key] = value
 
     def _build(self, lib: Lib) raises -> Int:
-        return _build_conf(
-            lib,
-            [
-                ("bootstrap.servers", self.bootstrap_servers),
-                ("group.id", self.group_id),
-                ("client.id", self.client_id),
-                ("auto.offset.reset", self.auto_offset_reset),
-                (
-                    "enable.auto.commit",
-                    String("true") if self.enable_auto_commit else String(
-                        "false"
-                    ),
+        var named: List[Tuple[String, String]] = [
+            ("bootstrap.servers", self.bootstrap_servers),
+            ("group.id", self.group_id),
+            ("client.id", self.client_id),
+            ("auto.offset.reset", self.auto_offset_reset),
+            (
+                "enable.auto.commit",
+                String("true") if self.enable_auto_commit else String("false"),
+            ),
+            (
+                "enable.partition.eof",
+                String("true") if self.enable_partition_eof else String(
+                    "false"
                 ),
-                (
-                    "enable.partition.eof",
-                    String("true") if self.enable_partition_eof else String(
-                        "false"
-                    ),
-                ),
-            ],
-            self.extra,
+            ),
+        ]
+        named.extend(
+            _observability(self.statistics_interval_ms, self.capture_logs)
         )
+        return _build_conf(lib, named, self.extra)

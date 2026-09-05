@@ -253,14 +253,95 @@ librdkafka's receive buffer, and reduces them eight lanes at a time with SIMD
 over those same borrowed bytes. That is the half a Python client cannot do —
 there, every record crosses back into the interpreter before you touch it.
 
+## Running in production
+
+A stream job that cannot see its own client fails silently. Everything in
+this section exists so it does not.
+
+### Errors, fatal errors, statistics, logs
+
+librdkafka does most of its work on background threads, and what goes wrong
+there — brokers gone away, an authentication rejection, a fenced producer —
+reaches the application only through callbacks. Both clients install those
+callbacks at construction and **retain** what arrives, so the job reads it
+when it likes rather than having to hand over a handler:
+
+```mojo
+var down = producer.errors()          # most recent 256, oldest first
+for err in producer.take_errors():    # take_* acknowledges; the plain
+    if err.kind() == KIND_TRANSPORT:  #   accessor does not
+        alert("broker unreachable: " + String(err))
+if producer.dropped_errors() > 0:     # more than 256 arrived unread
+    ...
+```
+
+- **`errors()` / `take_errors()` / `dropped_errors()`** on both clients. The
+  errors librdkafka would otherwise only log. It recovers from most of them
+  by itself, so one `KIND_TRANSPORT` is informational; the same one for
+  minutes is a broker that is not coming back. Bounded to the most recent
+  256, and the counter says how many older ones were dropped.
+- **`fatal_error()`**. `None` normally. Otherwise librdkafka has given up on
+  this instance — a transactional producer fenced by a newer one with the
+  same `transactional.id`, an idempotence guarantee it could not keep — and
+  **will not recover it**: every later call fails. Drop the client and
+  construct a new one; do not retry into it. The error callback announces
+  this with one `KIND_FATAL` entry in `errors()`, so a job that watches
+  `errors()` sees it there first.
+- **`latest_stats()`** with `statistics_interval_ms=` on either config. The
+  last statistics document librdkafka emitted, as its JSON (`STATISTICS.md`
+  has the schema): per-broker round-trip times and queue depths, per-
+  partition `consumer_lag`, `stored_offset` and `committed_offset` for a
+  consumer, `msg_cnt` and `txmsgs` for a producer. Ship it whole to whatever
+  reads your metrics, or parse the two fields you want. `None` at the
+  default interval of 0.
+- **`logs()` / `take_logs()` / `dropped_logs()`** with `capture_logs=True`
+  on either config. librdkafka's own log lines as `LogLine` values —
+  `level`, `facility`, `message` — bounded like errors. What is logged at
+  all is the `log_level` property (`cfg.set("log_level", "7")` for debug).
+  Off by default because it forces `log.queue=true`, which stops librdkafka
+  writing to stderr and makes the lines yours to read.
+
+**All of it arrives through the poll path** — `poll()` / `flush()` on the
+producer, `poll()` / `poll_event()` / `consume()` and its siblings on the
+consumer — because that is where librdkafka serves callbacks. A client that
+is not being polled reports nothing, exactly as it receives nothing. A
+producer that has nothing to send should still `poll(0)` on a timer.
+
+### Shutting down
+
+`flush()` the producer, then drop it: `flush()` raises if anything was
+rejected, which the destructor cannot. Dropping a producer that still holds
+undeliverable messages blocks for up to 5 s while they time out and swallows
+their failures — so the flush is where you find out.
+
+`close()` the consumer, then drop it. `close()` leaves the group cleanly and
+commits under `enable.auto.commit`; a consumer that is merely dropped is
+closed by its destructor, which cannot raise and so cannot tell you the
+leave failed. Both are safe to call more than once and from any thread.
+
+### Threads, in three sentences
+
+`Producer` is safe to share across threads — `produce()`, `poll()`,
+`flush()` and every accessor above may be called concurrently — with one
+exception, `last_error_kind()`, which is a single slot and cannot be
+attributed to a caller once two threads produce; branch on
+`DeliveryReport.kind()` instead. `Consumer` is safe to share too, but is not
+a work-sharing primitive: two threads polling one consumer split a single
+assignment's records between them, and `consume()` **refuses** a second
+concurrent caller rather than serialising it, because librdkafka calls that
+undefined behaviour. Every callback in the package — delivery reports,
+rebalances, errors, statistics, logs — runs on whichever thread is polling,
+never on a librdkafka thread, which is what makes the retained state safe to
+read from yours.
+
 ## API surface
 
 | Symbol | What it does |
 |---|---|
-| `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once |
+| `Producer` / `ProducerConfig` | Produce messages, with optional `headers` and explicit `partition`; `produce_bytes()` for binary; `flush()` / `poll()` drain delivery reports and raise on rejection; `failures()` / `take_failures()` name which messages were rejected; `init_transactions()` / `begin_transaction()` / `commit_transaction()` / `abort_transaction()` / `send_offsets_to_transaction()` for exactly-once; `errors()` / `fatal_error()` / `latest_stats()` / `logs()` for what librdkafka's threads reported |
 | `DeliveryReport` | One rejection: the `sequence` `produce()` returned, plus topic, partition, offset and error |
 | `PARTITION_UNASSIGNED` | The `partition=` default — leaves the choice to the topic's partitioner |
-| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads, `consume(n, headers=False)` to skip the headers crossing, `reached_end()` to detect end-of-partition; `consume_borrowed(n)` for zero-copy reads |
+| `Consumer` / `ConsumerConfig` | Subscribe, poll for messages, commit offsets, close; manual `assign()` / `unassign()`, `seek()`, `position()`, `committed()`, `pause()` / `resume()`, `query_watermark_offsets()` / `get_watermark_offsets()`, `offsets_for_times()`, `poll_event()`, and `consumer_group_metadata()` for exactly-once; `consume(n)` / `consume_events(n)` for batch reads, `consume(n, headers=False)` to skip the headers crossing, `reached_end()` to detect end-of-partition; `consume_borrowed(n)` for zero-copy reads; `errors()` / `fatal_error()` / `latest_stats()` / `logs()` as on the producer |
 | `TopicPartition` | One partition at an offset — what the control plane speaks in; `has_error()` / `kind()` for the per-partition verdict |
 | `OFFSET_BEGINNING` / `OFFSET_END` / `OFFSET_STORED` / `OFFSET_INVALID` | Offset sentinels, for `assign()` and `seek()` |
 | `Watermarks` | A partition's `low` and `high` offsets; lag is `high - position` |
@@ -271,6 +352,7 @@ there, every record crosses back into the interpreter before you touch it.
 | `Header` | One record header: `name`, plus an `Optional` byte `value` and `value_text()` |
 | `KafkaError` | An `librdkafka` error code + human description; `kind()` for the branchable category, `is_fatal` / `is_retriable` / `txn_requires_abort` for a transactional one |
 | `KafkaErrorKind` | Eight tags — `KIND_QUEUE_FULL`, `KIND_TIMED_OUT`, … — for handling rather than reporting |
+| `LogLine` | One librdkafka log line — `level`, `facility`, `message` — from `logs()` / `take_logs()` with `capture_logs=True` |
 | `ConsumerGroupMetadata` | A consumer's group identity, from `Consumer.consumer_group_metadata()` — the bridge that lets a transaction commit that consumer's offsets |
 | `TxnAction` | What a failed transactional call needs: `TXN_ABORT`, `TXN_RETRY` or `TXN_FATAL`, from `KafkaError.txn_action()` |
 | `MessageBatch` / `BorrowedMessage` | A batch still owned by librdkafka, lending `Span`s into its buffer — zero copy, with the lifetime compiler-enforced |
